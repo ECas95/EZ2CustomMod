@@ -1,0 +1,74 @@
+#include "config.h"
+#include <windows.h>
+#include <algorithm>
+
+static ModConfig g_cfg;
+
+static bool readBool(const char* section, const char* key, bool def, const std::string& ini) {
+    char buf[16] = {};
+    GetPrivateProfileStringA(section, key, def ? "1" : "0", buf, sizeof(buf), ini.c_str());
+    return _stricmp(buf, "1") == 0 || _stricmp(buf, "true") == 0 || _stricmp(buf, "yes") == 0 || _stricmp(buf, "on") == 0;
+}
+
+static std::string readString(const char* section, const char* key, const char* def, const std::string& ini) {
+    char buf[MAX_PATH] = {};
+    GetPrivateProfileStringA(section, key, def, buf, sizeof(buf), ini.c_str());
+    return std::string(buf);
+}
+
+static int readInt(const char* section, const char* key, int def, const std::string& ini) {
+    return GetPrivateProfileIntA(section, key, def, ini.c_str());
+}
+
+std::string GetExeDirectory() {
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    char* slash = strrchr(path, '\\');
+    if (slash) *slash = '\0';
+    return std::string(path);
+}
+
+std::string JoinPath(const std::string& a, const std::string& b) {
+    if (a.empty()) return b;
+    if (a.back() == '\\' || a.back() == '/') return a + b;
+    return a + "\\" + b;
+}
+
+ModConfig LoadConfig() {
+    ModConfig cfg;
+    std::string ini = JoinPath(GetExeDirectory(), "BMSMod.ini");
+    cfg.coreEnable = readBool("Core", "Enable", true, ini);
+    cfg.enableLog = readBool("Debug", "EnableLog", true, ini);
+    cfg.traceGameLog = readBool("Debug", "TraceGameLog", false, ini);
+    cfg.traceFileApi = readBool("Debug", "TraceFileApi", false, ini);
+    cfg.traceBmsScan = readBool("Debug", "TraceBMSScan", false, ini);
+    cfg.traceJudge = readBool("Debug", "TraceJudge", false, ini);
+    cfg.enableFunctionTrace = readBool("Debug", "EnableFunctionTrace", true, ini);
+    cfg.altEnter = readBool("Video", "AltEnter", true, ini);
+    cfg.borderlessOnly = readBool("Video", "BorderlessOnly", true, ini);
+    cfg.showInjectedMessageBox = readBool("Debug", "ShowInjectedMessageBox", false, ini);
+    cfg.showProgressPopup = readBool("Debug", "ShowProgressPopup", true, ini);
+    cfg.captureExistingWindow = readBool("Video", "CaptureExistingWindow", true, ini);
+    cfg.enableBmsData = readBool("CustomSongs", "EnableBMSData", true, ini);
+    cfg.bmsRoot = readString("CustomSongs", "Root", "BMSData", ini);
+    cfg.cacheRoot = readString("CustomSongs", "CacheRoot", "CustomCache", ini);
+    cfg.pageSize = readInt("CustomSongs", "PageSize", 400, ini);
+    cfg.enableSongSelectInject = readBool("CustomSongs", "EnableSongSelectInject", true, ini);
+    cfg.bridgeMode = readBool("CustomSongs", "BridgeMode", true, ini);
+    cfg.modifyOriginalFiles = readBool("CustomSongs", "ModifyOriginalFiles", false, ini);
+    cfg.useNativeSongBinAsBase = readBool("CustomSongs", "UseNativeSongBinAsBase", true, ini);
+    cfg.useNativeStageIniAsBase = readBool("CustomSongs", "UseNativeStageIniAsBase", true, ini);
+    cfg.flatSongFolder = readBool("CustomSongs", "FlatSongFolder", true, ini);
+    cfg.recursiveSongAssets = readBool("CustomSongs", "RecursiveSongAssets", false, ini);
+    cfg.inferAssetsFromBMS = readBool("CustomSongs", "InferAssetsFromBMS", true, ini);
+    cfg.inferMetadataFromBMS = readBool("CustomSongs", "InferMetadataFromBMS", true, ini);
+    cfg.generateCacheManifest = readBool("CustomSongs", "GenerateCacheManifest", true, ini);
+    cfg.redirectCustomToNative = readBool("CustomSongs", "RedirectCustomToNative", false, ini);
+    cfg.redirectNativeId = readString("CustomSongs", "RedirectNativeId", "babydance", ini);
+    cfg.pinCustomAtTop = readBool("CustomSongs", "PinCustomAtTop", false, ini);
+    cfg.forceSelectCustom = readBool("CustomSongs", "ForceSelectCustom", false, ini);
+    return cfg;
+}
+
+const ModConfig& Config() { return g_cfg; }
+void SetConfig(const ModConfig& cfg) { g_cfg = cfg; }
