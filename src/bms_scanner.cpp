@@ -19,9 +19,13 @@
 #include <cctype>
 #include <cstring>
 #include <cstdint>
+#include <cstddef>
 #include <utility>
 #include <map>
 #include <memory>
+#include <array>
+#include <cstdlib>
+#include <cmath>
 
 static std::vector<CustomBmsSong> g_songs;
 static std::string g_activeMode;
@@ -398,6 +402,8 @@ static int bmsChannelToEzTrackMode(int ch, bool sevenKey) {
 }
 // 5-key wrapper kept for the existing call sites; 5-key has no 6th/7th key so sevenKey=false.
 static bool g_curModeSevenKey = false;
+static std::string g_curGenerateMode = "5keyOnly";
+static bool g_curAutoGenerate = false;
 static int bmsChannelToEzTrack5Key(int ch) { return bmsChannelToEzTrackMode(ch, g_curModeSevenKey); }
 
 static int bmsEventToEzTrack5Key(const ParsedBmsEvent& e) {
@@ -559,6 +565,36 @@ static std::vector<unsigned char> encryptFnexRuntimeKey(const unsigned char* dat
     return tmp;
 }
 
+
+static std::vector<unsigned char> decryptFnexRuntimeKey(const unsigned char* encrypted, size_t n, size_t keyRva) {
+    std::vector<unsigned char> tmp(n, 0), plain(n, 0);
+    if (!encrypted || !n) return plain;
+    std::reverse_copy(encrypted, encrypted + n, tmp.begin());
+    const unsigned char* key = reinterpret_cast<const unsigned char*>(GetModuleHandleA(NULL)) + keyRva;
+    size_t off = 0;
+    int keyIndex = 0;
+    bool wideBlock = false;
+    while (off < n) {
+        size_t len;
+        if (n < off + 8) len = n - off;
+        else {
+            len = wideBlock ? 16 : 8;
+            if (n < off + len) len = n - off;
+            wideBlock = !wideBlock;
+        }
+        for (size_t u = 0; u < len; ++u) {
+            int k = keyIndex + static_cast<int>(len) - static_cast<int>(u) - 1;
+            if (k > 0x1ff) k -= 0x200;
+            plain[off + u] = static_cast<unsigned char>(tmp[off + len - 1 - u] - key[k * 4]);
+        }
+        keyIndex += static_cast<int>(len);
+        if (keyIndex > 0x1ff) keyIndex -= 0x200;
+        if (len > 8) off = (off - 8) + len;
+        off += 8;
+    }
+    return plain;
+}
+
 static bool writeEncryptedFileRuntime(const std::string& path, const unsigned char* data, size_t size, size_t keyRva) {
     std::vector<unsigned char> enc = encryptFnexRuntimeKey(data, size, keyRva);
     FILE* f = fopen(path.c_str(), "wb");
@@ -575,6 +611,619 @@ static bool writeEncryptedTextFileRuntime(const std::string& path, const std::st
 static bool writeEncryptedEziFile(const std::string& path, const std::string& plain) {
     return writeEncryptedTextFileRuntime(path, plain, 0x0a7cb0);
 }
+
+
+// ---- Native-chart statistical model + procedural mode generator ---------------------
+// The model is intentionally lightweight and deterministic: native FNEX charts teach the
+// timing distribution and density of scratch/pedal/second-side notes, while the source BMS
+// supplies the actual keysounds. No external ML runtime or model file is required.
+struct NativeModeModel {
+    std::string mode;
+    uint32_t charts = 0;
+    uint64_t notes = 0;
+    uint64_t scratchNotes = 0;
+    uint64_t pedalNotes = 0;
+    uint64_t secondSideNotes = 0;
+    uint64_t longNotes = 0;
+    uint64_t scratchLongNotes = 0;
+    uint64_t pedalLongNotes = 0;
+    uint64_t scratchChordNotes = 0;
+    uint64_t pedalChordNotes = 0;
+    uint64_t scratchGapSum = 0;
+    uint64_t scratchGapCount = 0;
+    uint64_t pedalGapSum = 0;
+    uint64_t pedalGapCount = 0;
+    std::array<uint64_t, 16> scratchPhase{};
+    std::array<uint64_t, 16> pedalPhase{};
+    // Per-track usage lets the generator discover the actual FNEX lane layout for each mode
+    // instead of assuming that scratch/pedal/P2 always occupy the same numeric tracks.
+    std::array<uint64_t, 64> primaryTrackNotes{};
+    std::array<uint64_t, 64> secondTrackNotes{};
+    std::array<uint64_t, 64> scratchTrackNotes{};
+    std::array<uint64_t, 64> pedalTrackNotes{};
+};
+
+static std::map<std::string, NativeModeModel> g_nativeModeModels;
+static bool g_nativeModeModelsReady = false;
+
+static uint16_t modelReadU16(const unsigned char* p) {
+    uint16_t v = 0; std::memcpy(&v, p, sizeof(v)); return v;
+}
+static uint32_t modelReadU32(const unsigned char* p) {
+    uint32_t v = 0; std::memcpy(&v, p, sizeof(v)); return v;
+}
+
+static bool readWholeFileForModel(const std::string& path, std::vector<unsigned char>& out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    long size = std::ftell(f);
+    std::rewind(f);
+    if (size <= 0 || size > 64 * 1024 * 1024) { std::fclose(f); return false; }
+    out.resize(static_cast<size_t>(size));
+    bool ok = std::fread(out.data(), 1, out.size(), f) == out.size();
+    std::fclose(f);
+    return ok;
+}
+
+static std::string inferNativeModeFromPath(const std::string& raw) {
+    std::string p = lowerCopy(raw);
+    std::replace(p.begin(), p.end(), '/', '\\');
+    if (p.find("5keyonly") != std::string::npos || p.find("5konly") != std::string::npos) return "5keyOnly";
+    if (p.find("7streetmix") != std::string::npos || p.find("7keymix") != std::string::npos) return "7keyMix";
+    if (p.find("clubmix") != std::string::npos) return "clubMix";
+    if (p.find("spacemix") != std::string::npos) return "spaceMix";
+    if (p.find("rubymix") != std::string::npos) return "rubyMix";
+    if (p.find("catch1p") != std::string::npos || p.find("ez2catch") != std::string::npos) return "ez2Catch";
+    if (p.find("scratchmix") != std::string::npos || p.find("turntable") != std::string::npos) return "turnTable";
+    if (p.find("cv2mix") != std::string::npos) return "cv2Mix";
+    if (p.find("5keymix") != std::string::npos || p.find("streetmix") != std::string::npos) return "5keyMix";
+    return std::string();
+}
+
+// Native FNEX charts store lane = the EZTR BLOCK INDEX (0..63); the u16 at +0x04 is always 0 and the
+// name string is empty (verified by decrypting real SOUND\*.ez). So role is classified by block number,
+// using the same lane map our own EZ writer emits: 10/20=scratch, 11/19=pedal, 12-18=P2 keys, 3-9=keys.
+static int nativeTrackRole(int track) {
+    if (track == 10 || track == 20) return 1;
+    if (track == 11 || track == 19 || track == 21) return 2;
+    if (track >= 12 && track <= 18) return 3;
+    if (track >= 3 && track <= 9) return 0;
+    return -1;
+}
+
+static bool accumulateNativeEzModel(const std::string& mode, const std::vector<unsigned char>& ez) {
+    if (ez.size() < 0x96 || std::memcmp(ez.data(), "EZFF", 4) != 0 || modelReadU16(ez.data() + 0x8c) != 64)
+        return false;
+
+    struct NativeNote { uint32_t tick; uint16_t len; int role; int track; };
+    std::vector<NativeNote> notes;
+    std::vector<uint32_t> scratchTicks, pedalTicks;
+    size_t off = 0x96;
+    for (int block = 0; block < 64; ++block) {
+        if (off + 0x4e > ez.size() || std::memcmp(ez.data() + off, "EZTR", 4) != 0) return false;
+        int track = block; // native lane number IS the block index; +0x04 field is unused (always 0)
+        uint32_t bytes = modelReadU32(ez.data() + off + 0x4a);
+        int role = nativeTrackRole(track);
+        off += 0x4e;
+        if (bytes % 13 != 0 || off + bytes > ez.size()) return false;
+        for (uint32_t i = 0; i < bytes / 13; ++i, off += 13) {
+            if (ez[off + 4] != 1 || role < 0) continue;
+            NativeNote n{modelReadU32(ez.data() + off), modelReadU16(ez.data() + off + 10), role, track};
+            notes.push_back(n);
+            if (role == 1) scratchTicks.push_back(n.tick);
+            if (role == 2) pedalTicks.push_back(n.tick);
+        }
+    }
+    if (off != ez.size() || notes.empty()) return false;
+
+    std::map<uint32_t, uint32_t> chordSize;
+    for (const auto& n : notes) ++chordSize[n.tick];
+    NativeModeModel& model = g_nativeModeModels[mode];
+    model.mode = mode;
+    ++model.charts;
+    for (const auto& n : notes) {
+        ++model.notes;
+        if (n.len > 6) ++model.longNotes;
+        int phase = static_cast<int>((n.tick % 48u) * 16u / 48u);
+        if (phase < 0) phase = 0;
+        if (phase > 15) phase = 15;
+        if (n.role == 1) {
+            ++model.scratchNotes;
+            if (n.track >= 0 && n.track < 64) ++model.scratchTrackNotes[n.track];
+            if (n.len > 6) ++model.scratchLongNotes;
+            if (chordSize[n.tick] > 1) ++model.scratchChordNotes;
+            ++model.scratchPhase[phase];
+        } else if (n.role == 2) {
+            ++model.pedalNotes;
+            if (n.track >= 0 && n.track < 64) ++model.pedalTrackNotes[n.track];
+            if (n.len > 6) ++model.pedalLongNotes;
+            if (chordSize[n.tick] > 1) ++model.pedalChordNotes;
+            ++model.pedalPhase[phase];
+        } else if (n.role == 3) {
+            ++model.secondSideNotes;
+            if (n.track >= 0 && n.track < 64) ++model.secondTrackNotes[n.track];
+        } else if (n.role == 0 && n.track >= 0 && n.track < 64) {
+            ++model.primaryTrackNotes[n.track];
+        }
+    }
+    std::sort(scratchTicks.begin(), scratchTicks.end());
+    scratchTicks.erase(std::unique(scratchTicks.begin(), scratchTicks.end()), scratchTicks.end());
+    for (size_t i = 1; i < scratchTicks.size(); ++i) {
+        model.scratchGapSum += scratchTicks[i] - scratchTicks[i - 1];
+        ++model.scratchGapCount;
+    }
+    std::sort(pedalTicks.begin(), pedalTicks.end());
+    pedalTicks.erase(std::unique(pedalTicks.begin(), pedalTicks.end()), pedalTicks.end());
+    for (size_t i = 1; i < pedalTicks.size(); ++i) {
+        model.pedalGapSum += pedalTicks[i] - pedalTicks[i - 1];
+        ++model.pedalGapCount;
+    }
+    return true;
+}
+
+static void scanNativeModelDirectory(const std::string& dir, int depth,
+                                     std::map<std::string, int>& counts,
+                                     std::set<std::string>& seenStems) {
+    if (depth > 6) return;
+    WIN32_FIND_DATAA fd{};
+    HANDLE h = FindFirstFileA(JoinPath(dir, "*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!std::strcmp(fd.cFileName, ".") || !std::strcmp(fd.cFileName, "..")) continue;
+        std::string path = JoinPath(dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            scanNativeModelDirectory(path, depth + 1, counts, seenStems);
+            continue;
+        }
+        std::string low = lowerCopy(path);
+        bool isEs = endsWith(low, ".es"), isEz = endsWith(low, ".ez");
+        if (!isEs && !isEz) continue;
+        std::string mode = inferNativeModeFromPath(path);
+        if (mode.empty() || counts[mode] >= Config().nativeModelMaxChartsPerMode) continue;
+        std::string stem = low.substr(0, low.size() - (isEs ? 3 : 3));
+        if (seenStems.find(stem) != seenStems.end()) continue;
+        if (isEz) {
+            std::string es = path.substr(0, path.size() - 3) + ".es";
+            if (GetFileAttributesA(es.c_str()) != INVALID_FILE_ATTRIBUTES) continue; // prefer plaintext sibling
+        }
+        std::vector<unsigned char> bytes;
+        if (!readWholeFileForModel(path, bytes)) continue;
+        if (std::memcmp(bytes.data(), "EZFF", 4) != 0 && isEz)
+            bytes = decryptFnexRuntimeKey(bytes.data(), bytes.size(), 0x0a74b0);
+        if (!accumulateNativeEzModel(mode, bytes)) continue;
+        seenStems.insert(stem);
+        ++counts[mode];
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static double modelRatio(uint64_t value, uint64_t total, double fallback, double lo, double hi) {
+    if (!total) return fallback;
+    double r = static_cast<double>(value) / static_cast<double>(total);
+    if (r < lo) r = lo;
+    if (r > hi) r = hi;
+    return r;
+}
+
+static std::vector<int> modelTracksByUsage(const std::array<uint64_t,64>& usage, size_t limit = 64) {
+    std::vector<std::pair<uint64_t,int>> ranked;
+    for (int track = 0; track < 64; ++track)
+        if (usage[track]) ranked.push_back({usage[track], track});
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        return a.first != b.first ? a.first > b.first : a.second < b.second;
+    });
+    std::vector<int> out;
+    for (const auto& item : ranked) {
+        if (out.size() >= limit) break;
+        out.push_back(item.second);
+    }
+    return out;
+}
+
+static int modelDominantTrack(const std::array<uint64_t,64>& usage, int fallback, int excluded = -1) {
+    int best = fallback;
+    uint64_t bestCount = 0;
+    for (int track = 0; track < 64; ++track) {
+        if (track == excluded) continue;
+        if (usage[track] > bestCount) { bestCount = usage[track]; best = track; }
+    }
+    return best;
+}
+
+static void writeNativeModelReport(const std::string& root) {
+    std::string dir = JoinPath(GetExeDirectory(), "logs");
+    CreateDirectoryA(dir.c_str(), nullptr);
+    std::string path = JoinPath(dir, "EZ2NativeChartModel.txt");
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    std::fprintf(f, "Native chart model root=%s\r\n", root.c_str());
+    for (const auto& kv : g_nativeModeModels) {
+        const NativeModeModel& m = kv.second;
+        double scratch = m.notes ? 100.0 * m.scratchNotes / m.notes : 0.0;
+        double pedal = m.notes ? 100.0 * m.pedalNotes / m.notes : 0.0;
+        double p2 = m.notes ? 100.0 * m.secondSideNotes / m.notes : 0.0;
+        double sg = m.scratchGapCount ? static_cast<double>(m.scratchGapSum) / m.scratchGapCount : 0.0;
+        double pg = m.pedalGapCount ? static_cast<double>(m.pedalGapSum) / m.pedalGapCount : 0.0;
+        std::vector<int> scratchTracks = modelTracksByUsage(m.scratchTrackNotes, 2);
+        std::vector<int> pedalTracks = modelTracksByUsage(m.pedalTrackNotes, 2);
+        std::fprintf(f, "%s charts=%lu notes=%llu scratch=%.3f%% pedal=%.3f%% secondSide=%.3f%% scratchGap=%.2f pedalGap=%.2f tracks[scratch=%d,%d pedal=%d,%d]\r\n",
+            m.mode.c_str(), static_cast<unsigned long>(m.charts), static_cast<unsigned long long>(m.notes),
+            scratch, pedal, p2, sg, pg,
+            scratchTracks.empty() ? -1 : scratchTracks[0], scratchTracks.size() < 2 ? -1 : scratchTracks[1],
+            pedalTracks.empty() ? -1 : pedalTracks[0], pedalTracks.size() < 2 ? -1 : pedalTracks[1]);
+    }
+    std::fclose(f);
+}
+
+static void LearnNativeModeModels() {
+    if (g_nativeModeModelsReady) return;
+    g_nativeModeModelsReady = true;
+    if (!Config().learnNativeCharts) {
+        LogLine("[autochart-model] native learning disabled");
+        return;
+    }
+    std::string root = JoinPath(GetExeDirectory(), Config().nativeChartRoot);
+    DWORD attr = GetFileAttributesA(root.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        LogLine("[autochart-model] native root missing '%s'; fallback profiles active", root.c_str());
+        return;
+    }
+    DWORD started = GetTickCount();
+    std::map<std::string, int> counts;
+    std::set<std::string> seen;
+    scanNativeModelDirectory(root, 0, counts, seen);
+    writeNativeModelReport(root);
+    for (const auto& kv : g_nativeModeModels) {
+        const NativeModeModel& m = kv.second;
+        LogLine("[autochart-model] mode='%s' charts=%lu notes=%llu scratch=%llu pedal=%llu p2=%llu",
+            m.mode.c_str(), static_cast<unsigned long>(m.charts), static_cast<unsigned long long>(m.notes),
+            static_cast<unsigned long long>(m.scratchNotes), static_cast<unsigned long long>(m.pedalNotes),
+            static_cast<unsigned long long>(m.secondSideNotes));
+    }
+    LogLine("[autochart-model] learned modes=%lu charts=%lu scanMs=%lu root='%s'",
+        static_cast<unsigned long>(g_nativeModeModels.size()), static_cast<unsigned long>(seen.size()),
+        static_cast<unsigned long>(GetTickCount() - started), root.c_str());
+}
+
+struct AutoModeProfile {
+    std::vector<int> primaryKeys;
+    std::vector<int> secondaryKeys;
+    int scratchTrack = -1;
+    int scratchTrack2 = -1;
+    int pedalTrack1 = -1;
+    int pedalTrack2 = -1;
+    double scratchShare = 0.0;
+    double pedalShare = 0.0;
+    bool turntableOnly = false;
+    bool catchApproximation = false;
+};
+
+static AutoModeProfile profileForMode(const std::string& rawMode) {
+    std::string mode = NormalizeModeName(rawMode);
+    AutoModeProfile p;
+    if (mode == "5keyOnly") p.primaryKeys = {3,4,5,6,7};
+    else if (mode == "5keyMix") {
+        p.primaryKeys = {3,4,5,6,7}; p.scratchTrack = 10; p.pedalTrack1 = 11;
+        p.scratchShare = 0.085; p.pedalShare = 0.030;
+    } else if (mode == "7keyMix") {
+        p.primaryKeys = {3,4,5,6,7,8,9}; p.scratchTrack = 10; p.pedalTrack1 = 11;
+        p.scratchShare = 0.070; p.pedalShare = 0.025;
+    } else if (mode == "clubMix") {
+        p.primaryKeys = {3,4,5,6,7}; p.secondaryKeys = {12,13,14,15,16};
+        p.scratchTrack = 10; p.scratchTrack2 = 20; p.pedalTrack1 = 11; p.pedalTrack2 = 19;
+        p.scratchShare = 0.050; p.pedalShare = 0.035;
+    } else if (mode == "spaceMix") {
+        p.primaryKeys = {3,4,5,6,7,8,9}; p.secondaryKeys = {12,13,14,15,16,17,18};
+        p.scratchTrack = 10; p.scratchTrack2 = 20; p.pedalTrack1 = 11; p.pedalTrack2 = 19;
+        p.scratchShare = 0.040; p.pedalShare = 0.025;
+    } else if (mode == "rubyMix") {
+        p.primaryKeys = {3,4,5,6};
+    } else if (mode == "ez2Catch") {
+        p.primaryKeys = {3,4,5,6,7}; p.catchApproximation = true;
+    } else if (mode == "turnTable") {
+        p.scratchTrack = 10; p.pedalTrack1 = 11; p.scratchShare = 1.0;
+        p.pedalShare = 0.025; p.turntableOnly = true;
+    } else if (mode == "cv2Mix") {
+        p.primaryKeys = {3,4,5,6,7,8,9}; p.scratchTrack = 10; p.pedalTrack1 = 11;
+        p.scratchShare = 0.060; p.pedalShare = 0.025;
+    } else p.primaryKeys = {3,4,5,6,7};
+    return p;
+}
+
+static uint32_t autoHash(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t x = a * 0x9E3779B9u ^ b * 0x85EBCA6Bu ^ c * 0xC2B2AE35u;
+    x ^= x >> 16; x *= 0x7FEB352Du; x ^= x >> 15; x *= 0x846CA68Bu; x ^= x >> 16;
+    return x;
+}
+
+static double autoPhaseScore(const std::array<uint64_t,16>* phases, uint32_t tick, bool pedal) {
+    int bucket = static_cast<int>((tick % 48u) * 16u / 48u);
+    if (bucket < 0) bucket = 0;
+    if (bucket > 15) bucket = 15;
+    if (phases) {
+        uint64_t maximum = 0;
+        for (uint64_t v : *phases) if (v > maximum) maximum = v;
+        if (maximum) return 0.25 + 1.75 * static_cast<double>((*phases)[bucket]) / maximum;
+    }
+    // Fallback favors beats and eighth notes, with pedals more strongly tied to beat starts.
+    uint32_t phase = tick % 48u;
+    if (phase == 0) return pedal ? 2.2 : 1.8;
+    if (phase == 24) return pedal ? 1.0 : 1.5;
+    if (phase == 12 || phase == 36) return pedal ? 0.45 : 1.1;
+    return 0.35;
+}
+
+static double autoSampleScore(const ParsedBmsForEz& bms, int wav, bool pedal) {
+    std::string name;
+    for (const auto& pair : bms.wavMap) if (pair.first == wav) { name = lowerCopy(pair.second); break; }
+    if (name.empty()) return 0.0;
+    double score = 0.0;
+    const char* bassWords[] = {"kick","bass","bd","sub","low","pedal"};
+    const char* scratchWords[] = {"scratch","scr","turn","vinyl","fx","hit","perc","noise"};
+    for (const char* w : bassWords) if (name.find(w) != std::string::npos) score += pedal ? 2.4 : 1.3;
+    for (const char* w : scratchWords) if (name.find(w) != std::string::npos) score += pedal ? 0.3 : 2.0;
+    return score;
+}
+
+struct AutoNotePack { EzRawEventOut event; int sourceTrack; };
+struct AutoTickGroup { uint32_t tick; std::vector<AutoNotePack> notes; };
+
+static std::set<uint32_t> selectAutoSpecialTicks(const std::vector<AutoTickGroup>& groups,
+                                                  size_t desired, uint32_t minGap,
+                                                  const std::array<uint64_t,16>* phases,
+                                                  const ParsedBmsForEz& bms, bool pedal,
+                                                  uint32_t seed, const std::set<uint32_t>& forbidden) {
+    struct Candidate { uint32_t tick; double score; };
+    std::vector<Candidate> candidates;
+    candidates.reserve(groups.size());
+    for (const auto& group : groups) {
+        if (forbidden.find(group.tick) != forbidden.end() || group.notes.empty()) continue;
+        double bestSample = 0.0;
+        bool hasLong = false;
+        for (const auto& n : group.notes) {
+            bestSample = std::max(bestSample, autoSampleScore(bms, n.event.wav, pedal));
+            if (n.event.len > 6) hasLong = true;
+        }
+        double chord = group.notes.size() > 1 ? 0.9 : 0.0;
+        double score = autoPhaseScore(phases, group.tick, pedal) + bestSample + chord;
+        if (hasLong) score += pedal ? 0.6 : -0.15;
+        score += static_cast<double>(autoHash(group.tick, seed, static_cast<uint32_t>(group.notes[0].event.wav)) & 0xffffu) / 65535.0;
+        candidates.push_back({group.tick, score});
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        return a.score != b.score ? a.score > b.score : a.tick < b.tick;
+    });
+    std::set<uint32_t> selected;
+    for (const auto& c : candidates) {
+        if (selected.size() >= desired) break;
+        bool tooClose = false; // ponytail: 'near' is a reserved MinGW keyword (near/far ptr qualifier)
+        auto it = selected.lower_bound(c.tick);
+        if (it != selected.end() && *it - c.tick < minGap) tooClose = true;
+        if (it != selected.begin()) { auto prev = it; --prev; if (c.tick - *prev < minGap) tooClose = true; }
+        if (!tooClose) selected.insert(c.tick);
+    }
+    return selected;
+}
+
+static int chooseAutoLane(const std::vector<int>& candidates, uint32_t tick, int sourceTrack,
+                          const std::set<int>& usedAtTick, const std::array<uint32_t,64>& blockedUntil,
+                          const std::array<uint64_t,64>& laneUse, int lastLane, uint32_t seed) {
+    int best = -1;
+    uint64_t bestCost = ~uint64_t(0);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        int lane = candidates[i];
+        if (lane < 0 || lane >= 64 || usedAtTick.find(lane) != usedAtTick.end()) continue;
+        if (blockedUntil[lane] > tick) continue;
+        uint64_t cost = laneUse[lane] * 32u;
+        if (lane == lastLane) cost += 48u;
+        int sourcePos = sourceTrack >= 3 && sourceTrack <= 9 ? sourceTrack - 3 : 0;
+        int targetPos = static_cast<int>(i);
+        cost += static_cast<uint64_t>(std::abs(sourcePos - targetPos) * 3);
+        cost += autoHash(tick, static_cast<uint32_t>(lane), seed) & 7u;
+        if (cost < bestCost) { bestCost = cost; best = lane; }
+    }
+    return best;
+}
+
+static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
+                                    const ParsedBmsForEz& bms, const std::string& rawMode,
+                                    const std::string& identity) {
+    if (!Config().autoGenerateModes || !g_curAutoGenerate) return;
+    std::string mode = NormalizeModeName(rawMode);
+    if (mode.empty() || mode == "5keyOnly") return;
+    AutoModeProfile profile = profileForMode(mode);
+
+    std::map<uint32_t, std::vector<AutoNotePack>> grouped;
+    size_t playableCount = 0;
+    for (int track = 3; track <= 21; ++track) {
+        std::vector<EzRawEventOut> keep;
+        keep.reserve(byTrack[track].size());
+        for (const auto& event : byTrack[track]) {
+            if (event.type == 1) {
+                grouped[event.tick].push_back({event, track});
+                ++playableCount;
+            } else keep.push_back(event);
+        }
+        byTrack[track].swap(keep);
+    }
+    if (!playableCount) return;
+
+    std::vector<AutoTickGroup> groups;
+    groups.reserve(grouped.size());
+    for (auto& kv : grouped) groups.push_back({kv.first, std::move(kv.second)});
+
+    const NativeModeModel* model = nullptr;
+    auto mit = g_nativeModeModels.find(mode);
+    if (mit != g_nativeModeModels.end() && mit->second.charts >= 4 && mit->second.notes) model = &mit->second;
+    if (model) {
+        // Native track names/usage are authoritative. Keep profile fallbacks only when the model
+        // did not observe the corresponding controller in enough source charts.
+        if (profile.scratchTrack >= 0) {
+            profile.scratchTrack = modelDominantTrack(model->scratchTrackNotes, profile.scratchTrack);
+            if (profile.scratchTrack2 >= 0)
+                profile.scratchTrack2 = modelDominantTrack(model->scratchTrackNotes, profile.scratchTrack2, profile.scratchTrack);
+        }
+        if (profile.pedalTrack1 >= 0) {
+            profile.pedalTrack1 = modelDominantTrack(model->pedalTrackNotes, profile.pedalTrack1);
+            if (profile.pedalTrack2 >= 0)
+                profile.pedalTrack2 = modelDominantTrack(model->pedalTrackNotes, profile.pedalTrack2, profile.pedalTrack1);
+        }
+        std::vector<int> learnedPrimary = modelTracksByUsage(model->primaryTrackNotes, profile.primaryKeys.size());
+        std::vector<int> learnedSecond = modelTracksByUsage(model->secondTrackNotes, profile.secondaryKeys.size());
+        if (learnedPrimary.size() == profile.primaryKeys.size()) {
+            std::sort(learnedPrimary.begin(), learnedPrimary.end()); // preserve physical left-to-right order
+            profile.primaryKeys = learnedPrimary;
+        }
+        if (!profile.secondaryKeys.empty() && learnedSecond.size() == profile.secondaryKeys.size()) {
+            std::sort(learnedSecond.begin(), learnedSecond.end());
+            profile.secondaryKeys = learnedSecond;
+        }
+    }
+    double intensity = static_cast<double>(Config().autoGenerateIntensity) / 100.0;
+    double scratchShare = profile.scratchShare;
+    double pedalShare = profile.pedalShare;
+    if (model) {
+        if (profile.scratchTrack >= 0 && !profile.turntableOnly)
+            scratchShare = modelRatio(model->scratchNotes, model->notes, scratchShare, 0.010, 0.22);
+        if (profile.pedalTrack1 >= 0)
+            pedalShare = modelRatio(model->pedalNotes, model->notes, pedalShare, 0.005, 0.14);
+    }
+    scratchShare *= intensity;
+    pedalShare *= intensity;
+    if (profile.turntableOnly) scratchShare = 1.0;
+    if (scratchShare > 0.35 && !profile.turntableOnly) scratchShare = 0.35;
+    if (pedalShare > 0.20) pedalShare = 0.20;
+    double secondSideShare = profile.secondaryKeys.empty() ? 0.0 : 0.50;
+    if (model && !profile.secondaryKeys.empty()) {
+        uint64_t ordinary = model->notes > model->scratchNotes + model->pedalNotes ?
+            model->notes - model->scratchNotes - model->pedalNotes : model->notes;
+        secondSideShare = modelRatio(model->secondSideNotes, ordinary, secondSideShare, 0.15, 0.80);
+    }
+
+    uint32_t scratchGap = model && model->scratchGapCount ?
+        static_cast<uint32_t>(model->scratchGapSum / model->scratchGapCount) : 24u;
+    uint32_t pedalGap = model && model->pedalGapCount ?
+        static_cast<uint32_t>(model->pedalGapSum / model->pedalGapCount) : 48u;
+    if (scratchGap < 6) scratchGap = 6;
+    if (scratchGap > 192) scratchGap = 192;
+    if (pedalGap < 12) pedalGap = 12;
+    if (pedalGap > 384) pedalGap = 384;
+
+    uint32_t seed = static_cast<uint32_t>(Config().autoGenerateSeed);
+    for (char c : identity) seed = seed * 33u + static_cast<unsigned char>(c);
+    size_t scratchDesired = profile.scratchTrack >= 0 ? static_cast<size_t>(playableCount * scratchShare + 0.5) : 0;
+    size_t pedalDesired = profile.pedalTrack1 >= 0 ? static_cast<size_t>(playableCount * pedalShare + 0.5) : 0;
+    if (profile.turntableOnly) scratchDesired = groups.size();
+    const std::array<uint64_t,16>* scratchPhases = model ? &model->scratchPhase : nullptr;
+    const std::array<uint64_t,16>* pedalPhases = model ? &model->pedalPhase : nullptr;
+    std::set<uint32_t> none;
+    std::set<uint32_t> scratchTicks = selectAutoSpecialTicks(groups, scratchDesired, scratchGap,
+        scratchPhases, bms, false, seed ^ 0x5A17u, none);
+    std::set<uint32_t> pedalTicks = selectAutoSpecialTicks(groups, pedalDesired, pedalGap,
+        pedalPhases, bms, true, seed ^ 0xBEEFu, scratchTicks);
+
+    std::array<uint32_t,64> blockedUntil{};
+    std::array<uint64_t,64> laneUse{};
+    int lastLane = -1;
+    size_t scratchMade = 0, pedalMade = 0, p2Made = 0, overflowAudio = 0;
+    for (auto& group : groups) {
+        std::set<int> used;
+        std::vector<AutoNotePack> remaining = group.notes;
+        auto moveBestTo = [&](int target, bool pedal) -> bool {
+            if (target < 0 || target >= 64 || blockedUntil[target] > group.tick || remaining.empty()) return false;
+            size_t best = 0;
+            double bestScore = -1e9;
+            for (size_t i = 0; i < remaining.size(); ++i) {
+                double score = autoSampleScore(bms, remaining[i].event.wav, pedal);
+                if (remaining[i].event.len > 6) score += pedal ? 0.8 : -0.1;
+                score += static_cast<double>(autoHash(group.tick, remaining[i].event.wav, seed + static_cast<uint32_t>(i)) & 0xffu) / 1024.0;
+                if (score > bestScore) { bestScore = score; best = i; }
+            }
+            EzRawEventOut event = remaining[best].event;
+            remaining.erase(remaining.begin() + static_cast<ptrdiff_t>(best));
+            event.track = target;
+            byTrack[target].push_back(event);
+            used.insert(target); ++laneUse[target];
+            if (event.len > 6) blockedUntil[target] = std::max(blockedUntil[target], event.tick + static_cast<uint32_t>(event.len));
+            lastLane = target;
+            return true;
+        };
+
+        if (pedalTicks.find(group.tick) != pedalTicks.end()) {
+            int pedalTarget = profile.pedalTrack1;
+            if (profile.pedalTrack2 >= 0 && ((group.tick / 192u) & 1u)) pedalTarget = profile.pedalTrack2;
+            if (moveBestTo(pedalTarget, true)) ++pedalMade;
+        }
+        if (scratchTicks.find(group.tick) != scratchTicks.end() && !remaining.empty()) {
+            int scratchTarget = profile.scratchTrack;
+            if (profile.scratchTrack2 >= 0 && ((group.tick / 192u) & 1u)) scratchTarget = profile.scratchTrack2;
+            if (moveBestTo(scratchTarget, false)) ++scratchMade;
+        }
+
+        if (profile.turntableOnly) {
+            // TurnTable has one gameplay lane. Simultaneous excess keysounds remain audible on BG lanes.
+            if (!remaining.empty() && used.find(profile.scratchTrack) == used.end() &&
+                blockedUntil[profile.scratchTrack] <= group.tick) {
+                EzRawEventOut event = remaining.front().event;
+                remaining.erase(remaining.begin());
+                event.track = profile.scratchTrack;
+                byTrack[profile.scratchTrack].push_back(event);
+                ++laneUse[profile.scratchTrack]; ++scratchMade;
+                if (event.len > 6) blockedUntil[profile.scratchTrack] = event.tick + static_cast<uint32_t>(event.len);
+            }
+            for (auto& n : remaining) {
+                int bg = 22 + (n.event.wav % 10);
+                n.event.track = bg; byTrack[bg].push_back(n.event); ++overflowAudio;
+            }
+            continue;
+        }
+
+        bool preferSecond = false;
+        if (!profile.secondaryKeys.empty()) {
+            uint32_t roll = autoHash(group.tick / 24u, seed ^ 0x2F2Fu, static_cast<uint32_t>(group.notes.size())) & 0xffffu;
+            preferSecond = static_cast<double>(roll) / 65535.0 < secondSideShare;
+            // Phrase alternation remains a weak tie-breaker so both hands do not look like pure noise.
+            if (((group.tick / 192u) & 1u) != 0u && secondSideShare >= 0.35) preferSecond = true;
+        }
+        std::vector<int> laneCandidates;
+        if (preferSecond) {
+            laneCandidates.insert(laneCandidates.end(), profile.secondaryKeys.begin(), profile.secondaryKeys.end());
+            laneCandidates.insert(laneCandidates.end(), profile.primaryKeys.begin(), profile.primaryKeys.end());
+        } else {
+            laneCandidates.insert(laneCandidates.end(), profile.primaryKeys.begin(), profile.primaryKeys.end());
+            laneCandidates.insert(laneCandidates.end(), profile.secondaryKeys.begin(), profile.secondaryKeys.end());
+        }
+        for (auto& note : remaining) {
+            int lane = chooseAutoLane(laneCandidates, group.tick, note.sourceTrack, used,
+                                      blockedUntil, laneUse, lastLane, seed);
+            if (lane < 0) {
+                int bg = 22 + (note.event.wav % 10);
+                note.event.track = bg; byTrack[bg].push_back(note.event); ++overflowAudio;
+                continue;
+            }
+            note.event.track = lane;
+            byTrack[lane].push_back(note.event);
+            used.insert(lane); ++laneUse[lane];
+            if (lane >= 12 && lane <= 18) ++p2Made;
+            if (note.event.len > 6)
+                blockedUntil[lane] = std::max(blockedUntil[lane], note.event.tick + static_cast<uint32_t>(note.event.len));
+            lastLane = lane;
+        }
+    }
+    for (int track = 0; track < 64; ++track)
+        std::stable_sort(byTrack[track].begin(), byTrack[track].end(), [](const EzRawEventOut& a, const EzRawEventOut& b) {
+            return a.tick != b.tick ? a.tick < b.tick : a.wav < b.wav;
+        });
+    LogLine("[autochart] id='%s' mode='%s' modelCharts=%lu notes=%lu scratch=%lu pedal=%lu p2=%lu overflowAudio=%lu shares=%.3f/%.3f/%.3f tracks=%d,%d,%d,%d%s",
+        identity.c_str(), mode.c_str(), static_cast<unsigned long>(model ? model->charts : 0),
+        static_cast<unsigned long>(playableCount), static_cast<unsigned long>(scratchMade),
+        static_cast<unsigned long>(pedalMade), static_cast<unsigned long>(p2Made),
+        static_cast<unsigned long>(overflowAudio), scratchShare, pedalShare, secondSideShare,
+        profile.scratchTrack, profile.scratchTrack2, profile.pedalTrack1, profile.pedalTrack2,
+        profile.catchApproximation ? " catchApproximation=1" : "");
+}
+
 
 static bool copyFileSimple(const std::string& src, const std::string& dst) {
     FILE* in = fopen(src.c_str(), "rb");
@@ -1053,6 +1702,10 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
         events.swap(normalized);
     }
 
+    // Virtual target-mode charts are redistributed only after long notes have been normalized into
+    // single events. This guarantees both LN endpoints stay on the same generated control lane.
+    ApplyModeAutoGeneration(byTrack, bms, g_curGenerateMode, baseName);
+
     // End of chart = the last tick REACHED by any note, counting a long note's tail (tick+len), not just
     // its head. The earlier totalTicks only saw note heads (tick+192), so a chart ending on a held long
     // declared itself over mid-hold → forced result before the release. Recompute from resolved events,
@@ -1102,6 +1755,7 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
         else if (t == 11) lstrcpynA(lname, "(1P)Pedal", sizeof(lname));
         else if (t >= 12 && t <= 18) wsprintfA(lname, "(2P)Line %d", t - 11); // club/space P2 lanes
         else if (t == 19) lstrcpynA(lname, "(2P)Pedal", sizeof(lname));
+        else if (t == 20) lstrcpynA(lname, "(2P)Scratch", sizeof(lname));
         else if (t >= 22 && t <= 31) wsprintfA(lname, "BG %d", t - 21);
         else lstrcpynA(lname, "Dummy", sizeof(lname));
         putFixedString(lh, 0x06, 0x40, lname);
@@ -1503,6 +2157,8 @@ static void GeneratePlayableCacheV10(const CustomBmsSong& song, bool materialize
     // still charts-as-lanes here (playable, but the "catch" gameplay uses X-position, not lanes —
     // ponytail: good enough to appear/play; faithful catch positions would need a separate encoder).
     g_curModeSevenKey = modeIsSevenKey(song.mode);
+    g_curGenerateMode = song.mode;
+    g_curAutoGenerate = song.autoGenerated;
     std::vector<CustomBmsChart> charts = song.chartMeta;
     charts.erase(std::remove_if(charts.begin(), charts.end(), [](const CustomBmsChart& c){ return c.slot < 0 || c.slot >= 4; }), charts.end());
     std::sort(charts.begin(), charts.end(), [](const CustomBmsChart& a, const CustomBmsChart& b){
@@ -1875,6 +2531,8 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
 
     std::string chartPath = JoinPath(song->songDir, chart->file);
     g_curModeSevenKey = modeIsSevenKey(song->mode);
+    g_curGenerateMode = song->mode;
+    g_curAutoGenerate = song->autoGenerated;
     std::vector<unsigned char> ez;
     std::string report;
     if (!generateEzFromBms(chartPath, std::string(), song->id, &report, &ez)) {
@@ -2875,6 +3533,98 @@ static void SaveIdMap() {
     fclose(f);
 }
 
+
+static std::vector<std::string> configuredAutoTargetModes() {
+    std::vector<std::string> out;
+    std::string token;
+    auto flush = [&]() {
+        while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) token.erase(token.begin());
+        while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.pop_back();
+        std::string mode = NormalizeModeName(token);
+        if (!mode.empty()) {
+            bool exists = false;
+            for (const auto& x : out) if (_stricmp(x.c_str(), mode.c_str()) == 0) { exists = true; break; }
+            if (!exists) out.push_back(mode);
+        }
+        token.clear();
+    };
+    for (char c : Config().autoGenerateTargetModes) {
+        if (c == ',' || c == ';' || c == '|') flush();
+        else token.push_back(c);
+    }
+    flush();
+    return out;
+}
+
+static int autoModeLevelBonus(const std::string& mode) {
+    std::string m = NormalizeModeName(mode);
+    if (m == "5keyMix" || m == "turnTable") return 1;
+    if (m == "7keyMix" || m == "cv2Mix") return 2;
+    if (m == "clubMix") return 3;
+    if (m == "spaceMix") return 4;
+    return 0;
+}
+
+static bool catalogHasEquivalentSong(const std::string& mode, const CustomBmsSong& source) {
+    for (const auto& existing : g_songs) {
+        if (_stricmp(existing.mode.c_str(), mode.c_str()) != 0) continue;
+        if (_stricmp(existing.category.c_str(), source.category.c_str()) != 0) continue;
+        if (_stricmp(existing.title.c_str(), source.title.c_str()) == 0 &&
+            _stricmp(existing.artist.c_str(), source.artist.c_str()) == 0) return true;
+    }
+    return false;
+}
+
+static void ExpandAutoGeneratedModes() {
+    if (!Config().autoGenerateModes) return;
+    std::string sourceMode = NormalizeModeName(Config().autoGenerateSourceMode);
+    if (sourceMode.empty()) sourceMode = "5keyOnly";
+    std::vector<std::string> targets = configuredAutoTargetModes();
+    if (targets.empty()) return;
+
+    std::vector<CustomBmsSong> sources;
+    for (const auto& song : g_songs)
+        if (_stricmp(song.mode.c_str(), sourceMode.c_str()) == 0 && !song.autoGenerated) sources.push_back(song);
+    if (sources.empty()) {
+        LogLine("[autochart] no source songs for mode='%s'; no virtual modes generated", sourceMode.c_str());
+        return;
+    }
+
+    std::vector<CustomBmsSong> generated;
+    for (const auto& source : sources) {
+        std::string folder = fileNameOnlyLocal(source.songDir);
+        for (const auto& target : targets) {
+            if (_stricmp(target.c_str(), sourceMode.c_str()) == 0) continue;
+            if (catalogHasEquivalentSong(target, source)) continue; // explicit target-mode chart wins
+            CustomBmsSong song = source;
+            song.mode = target;
+            song.modeFolder = target;
+            song.autoGenerated = true;
+            song.sourceMode = sourceMode;
+            uint32_t idn = GetStableSongId("autogen/" + target + "/" + sourceMode + "/" + source.category + "/" + folder);
+            char idbuf[32] = {};
+            wsprintfA(idbuf, "bms%06lu", static_cast<unsigned long>(idn));
+            song.id = idbuf;
+            int bonus = autoModeLevelBonus(target);
+            int* levels[] = {&song.levelNM, &song.levelHD, &song.levelSHD, &song.levelEX};
+            for (int* level : levels) if (*level > 0) { *level += bonus; if (*level > 18) *level = 18; }
+            song.cacheDir = JoinPath(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), target), song.id);
+            if (!g_directBmsEnabled) {
+                BuildCacheManifest(song);
+                GeneratePlayableCacheV10(song, /*materializeAudio=*/false);
+            }
+            generated.push_back(song);
+            LogLine("[autochart] virtual song id='%s' sourceId='%s' sourceMode='%s' targetMode='%s' title='%s' category='%s'",
+                song.id.c_str(), source.id.c_str(), sourceMode.c_str(), target.c_str(), song.title.c_str(), song.category.c_str());
+        }
+    }
+    g_songs.insert(g_songs.end(), generated.begin(), generated.end());
+    LogLine("[autochart] expanded sourceSongs=%lu targets=%lu generated=%lu totalCatalog=%lu",
+        static_cast<unsigned long>(sources.size()), static_cast<unsigned long>(targets.size()),
+        static_cast<unsigned long>(generated.size()), static_cast<unsigned long>(g_songs.size()));
+}
+
+
 static void scanFlatSongFolder(const std::string& mode, const std::string& modeFolder, const std::string& category, const std::string& songDir, const std::string& folderName) {
     WIN32_FIND_DATAA fd{};
     HANDLE h = FindFirstFileA(JoinPath(songDir, "*").c_str(), &fd);
@@ -3068,6 +3818,7 @@ void ScanBMSData() {
     DWORD scanStart = GetTickCount();
     std::string root = JoinPath(GetExeDirectory(), Config().bmsRoot);
     CreateDirectoryA(root.c_str(), nullptr);
+    LearnNativeModeModels();
     g_scanTotal = CountSongFolders(root);  // for the popup progress bar
     if (Config().traceBmsScan) LogLine("[bms] scan root='%s' layout='mode/category/song(flat)' songFolders=%d", root.c_str(), g_scanTotal);
 
@@ -3095,6 +3846,7 @@ void ScanBMSData() {
         FindClose(hCat);
     } while (FindNextFileA(hMode, &modeFd));
     FindClose(hMode);
+    ExpandAutoGeneratedModes();
     LogCatalogOrderCheck();
     // Category labels/splashes are the only generated UI artifacts left. They are shared
     // per category (not per song) and keep the current native wheel integration readable.

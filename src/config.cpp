@@ -67,6 +67,20 @@ ModConfig LoadConfig() {
     cfg.redirectNativeId = readString("CustomSongs", "RedirectNativeId", "babydance", ini);
     cfg.pinCustomAtTop = readBool("CustomSongs", "PinCustomAtTop", false, ini);
     cfg.forceSelectCustom = readBool("CustomSongs", "ForceSelectCustom", false, ini);
+
+    cfg.autoGenerateModes = readBool("AutoChart", "Enable", true, ini);
+    cfg.autoGenerateSourceMode = readString("AutoChart", "SourceMode", "5keyMix", ini);
+    cfg.autoGenerateTargetModes = readString("AutoChart", "TargetModes",
+        "7keyMix,clubMix,spaceMix,rubyMix,ez2Catch,turnTable,cv2Mix", ini);
+    cfg.autoGenerateIntensity = readInt("AutoChart", "Intensity", 100, ini);
+    if (cfg.autoGenerateIntensity < 0) cfg.autoGenerateIntensity = 0;
+    if (cfg.autoGenerateIntensity > 200) cfg.autoGenerateIntensity = 200;
+    cfg.autoGenerateSeed = readInt("AutoChart", "Seed", 1337, ini);
+    cfg.learnNativeCharts = readBool("AutoChart", "LearnNativeCharts", true, ini);
+    cfg.nativeChartRoot = readString("AutoChart", "NativeChartRoot", "SOUND", ini);
+    cfg.nativeModelMaxChartsPerMode = readInt("AutoChart", "NativeModelMaxChartsPerMode", 192, ini);
+    if (cfg.nativeModelMaxChartsPerMode < 8) cfg.nativeModelMaxChartsPerMode = 8;
+    if (cfg.nativeModelMaxChartsPerMode > 2048) cfg.nativeModelMaxChartsPerMode = 2048;
     return cfg;
 }
 

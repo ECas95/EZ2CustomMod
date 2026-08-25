@@ -415,8 +415,10 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
     // so the loader gets a valid texture. (Disabling this is what reintroduced the crash.)
     std::string lowerPath = LowerAscii(p);
     std::vector<std::string> cats;
+    std::string categoryMode = GetActiveMode();
+    if (categoryMode.empty()) categoryMode = "5keyOnly";
     if (lowerPath.find("category_") != std::string::npos || lowerPath.find("version_") != std::string::npos)
-        cats = GetCustomBmsCategoriesForMode("5keyMix");
+        cats = GetCustomBmsCategoriesForMode(categoryMode);
     if (lowerPath.find("category_") != std::string::npos) {
         for (size_t i = 0; i < cats.size(); ++i) {
             char abm[32] = {}, bmp[32] = {};
@@ -426,7 +428,7 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
                               (lowerPath.find(LowerAscii(bmp)) != std::string::npos ? bmp : "");
             if (req.empty()) continue;
             std::string out = JoinPath(JoinPath(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot),
-                                       "5keyMix"), "_categories"), req);
+                                       categoryMode), "_categories"), req);
             if (LocalFileExists(out)) {
                 LogLine("[category] redirect slot=%d name='%s' -> '%s'", 47 + (int)i, cats[i].c_str(), out.c_str());
                 return out;
@@ -450,7 +452,7 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
             // cache file is capitalized Version_NN.abm; request match is case-insensitive
             char cachefn[32] = {}; wsprintfA(cachefn, "Version_%02d.abm", nn);
             std::string out = JoinPath(JoinPath(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot),
-                                       "5keyMix"), "_versions"), cachefn);
+                                       categoryMode), "_versions"), cachefn);
             if (LocalFileExists(out)) {
                 LogLine("[version] redirect nn=%d cat='%s' -> '%s'", nn, cats[i].c_str(), out.c_str());
                 return out;
@@ -1641,7 +1643,12 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
     LogLine("[init] base=%p exeDir='%s'", GetModuleHandleA(nullptr), GetExeDirectory().c_str());
         LogLine("[config] bridgeMode=%d redirectCustomToNative=%d pinCustomAtTop=%d forceSelectCustom=%d bmsRoot='%s' cacheRoot='%s'", Config().bridgeMode?1:0, Config().redirectCustomToNative?1:0, Config().pinCustomAtTop?1:0, Config().forceSelectCustom?1:0, Config().bmsRoot.c_str(), Config().cacheRoot.c_str());
-        LogLine("[version] EZ2CustomMod_v35_4_0_audio_bga_ffmpeg_pipe");
+        LogLine("[autochart-config] enable=%d source='%s' targets='%s' intensity=%d seed=%d learnNative=%d nativeRoot='%s' maxCharts=%d",
+                Config().autoGenerateModes ? 1 : 0, Config().autoGenerateSourceMode.c_str(),
+                Config().autoGenerateTargetModes.c_str(), Config().autoGenerateIntensity,
+                Config().autoGenerateSeed, Config().learnNativeCharts ? 1 : 0,
+                Config().nativeChartRoot.c_str(), Config().nativeModelMaxChartsPerMode);
+        LogLine("[version] EZ2CustomMod_v36_0_0_native_autochart");
         LogLine("[log] reset_on_start=1");
 
     // FUN_00402880 logger. RVA 0x2880. Original is logger stub in this executable.

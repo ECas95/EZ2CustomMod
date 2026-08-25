@@ -265,6 +265,19 @@ static std::vector<std::string> UniqueCustomCategories(const std::vector<CustomB
     return cats;
 }
 
+static std::vector<std::string> CustomCategoriesForModeOrLargest(const std::string& preferred) {
+    std::vector<std::string> best;
+    std::string mode = NormalizeModeName(preferred);
+    if (!mode.empty()) best = GetCustomBmsCategoriesForMode(mode);
+    if (!best.empty()) return best;
+    const char* modes[] = {"5keyOnly","5keyMix","7keyMix","clubMix","spaceMix","rubyMix","ez2Catch","turnTable","cv2Mix"};
+    for (const char* candidate : modes) {
+        std::vector<std::string> cur = GetCustomBmsCategoriesForMode(candidate);
+        if (cur.size() > best.size()) best.swap(cur);
+    }
+    return best;
+}
+
 static void WriteVirtualCategoryDiagnostics(const std::vector<CustomBmsSong>& songs) {
     // Leave a human-readable record in each CustomCache folder so the Stage.ini overlay
     // can be verified even though the real Stage.ini is never modified.
@@ -517,13 +530,26 @@ static void EnsureCategoryTablesRelocated() {
             (unsigned long)c, (unsigned long)i, ok ? 1 : 0, (unsigned long)shift);
 }
 
+static void RefreshRelocatedNativeCategoryTables() {
+    if (!g_catCountBuf || !g_catIdBuf) return;
+    // Native categories 0..46 can change per mode, so re-sync them from the live native globals (using
+    // the same CatShift() base the one-shot relocation copied from). Slots 47+ are custom categories,
+    // OWNED by InjectCustomSongsIntoSongSelect which runs right after — do NOT zero them here, or the
+    // second SongSelect build (mode switch) wipes every custom category to count 0 → the game's filter
+    // divides by that count on category change → STATUS_INTEGER_DIVIDE_BY_ZERO (0xc0000094).
+    uint32_t shift = CatShift();
+    std::memcpy(reinterpret_cast<void*>(g_catCountBuf), reinterpret_cast<void*>(kCatCountTableBase + shift), 47u * 4u);
+    std::memcpy(reinterpret_cast<void*>(g_catIdBuf), reinterpret_cast<void*>(kCatNameTableBase + shift),
+                47u * kCatNameStride * kCatNameSize);
+}
+
 // One-shot: append custom songs to the master array and populate the native category
 // tables so the game's own filter lists them under their custom category. After this the
 // mod never touches visible[] — the native filter rebuilds it correctly on every entry.
 static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uint32_t categoryParam) {
     (void)categoryParam;
     if (!Config().enableSongSelectInject || !Config().enableBmsData) return;
-    if (_stricmp(GetActiveMode().c_str(), "5keyMix") != 0) return;
+    if (GetActiveMode().empty()) return;
     std::vector<CustomBmsSong> allSongs = GetCustomBmsSongsForActiveMode();
     if (allSongs.empty()) {
         static unsigned long emptyLogged = 0;
@@ -646,7 +672,8 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     };
 
     EnsureCategoryTablesRelocated(); // move category tables off the native globals before writing customs
-    std::vector<std::string> categories = GetCustomBmsCategoriesForMode("5keyMix");
+    RefreshRelocatedNativeCategoryTables();
+    std::vector<std::string> categories = CustomCategoriesForModeOrLargest(GetActiveMode());
     g_lazySongnameObject = ecx;
     g_lazySongnames.assign(categories.size(), {});
     g_lazySongnameLoaded.assign(categories.size(), 0);
@@ -794,7 +821,7 @@ static void LoadCustomCategorySongnames(uint32_t ecx, uint32_t categoryParam) {
         if (SafeRead32(item.masterEntry + 0x004)) ++loaded;
     }
     g_lazySongnameLoaded[categoryIndex] = 1;
-    std::vector<std::string> categories = GetCustomBmsCategoriesForMode("5keyMix");
+    std::vector<std::string> categories = CustomCategoriesForModeOrLargest(GetActiveMode());
     const char* name = categoryIndex < categories.size() ? categories[categoryIndex].c_str() : "?";
     LogLine("[assets-lazy] category=%lu name='%s' requested=%lu loaded=%lu loadMs=%lu categoryCache=1",
             (unsigned long)categoryParam, name,
@@ -1152,7 +1179,7 @@ static bool InstallSongCapacityPatches(uint32_t newCap) {
 static void RemoveCustomCategoryPatches();
 
 static bool InstallCustomCategoryPatches() {
-    std::vector<std::string> categories = GetCustomBmsCategoriesForMode("5keyMix");
+    std::vector<std::string> categories = CustomCategoriesForModeOrLargest(std::string());
     g_customCategoryCount = (uint32_t)std::min<size_t>(categories.size(), 80);
     if (g_customCategoryCount == 0) return true;
     static const unsigned char top5Prologue[] = {0x83, 0xEC, 0x10, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x14};
@@ -1267,7 +1294,12 @@ void InstallTraceHooks() {
         // into our own VirtualAlloc buffer (the pool block can't grow) — the remaining big fix.
         // Object is now our own 8MB buffer (PatchObjectAllocSites), so master[] is no longer capped
         // by the ~2MB pool block — aim high. Category overrun handled by EnsureCategoryTablesRelocated.
-        uint32_t custom = (uint32_t)GetCustomBmsSongs().size();
+        uint32_t custom = 0;
+        const char* capacityModes[] = {"5keyOnly","5keyMix","7keyMix","clubMix","spaceMix","rubyMix","ez2Catch","turnTable","cv2Mix"};
+        for (const char* mode : capacityModes) {
+            uint32_t count = static_cast<uint32_t>(GetCustomBmsSongsForMode(mode).size());
+            if (count > custom) custom = count;
+        }
         uint32_t newCap = 436u + custom + 64u;
         if (newCap < 700u)    newCap = 700u;
         if (newCap > 60000u)  newCap = 60000u; // 64MB object inflate holds ~70k master entries (LAA=4GB)
