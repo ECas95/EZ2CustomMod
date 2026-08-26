@@ -270,7 +270,7 @@ static std::vector<std::string> CustomCategoriesForModeOrLargest(const std::stri
     std::string mode = NormalizeModeName(preferred);
     if (!mode.empty()) best = GetCustomBmsCategoriesForMode(mode);
     if (!best.empty()) return best;
-    const char* modes[] = {"5keyOnly","5keyMix","7keyMix","clubMix","spaceMix","rubyMix","ez2Catch","turnTable","cv2Mix"};
+    const char* modes[] = {"5keyOnly","5keyMix","streetMix","7keyMix","clubMix","spaceMix","rubyMix","ez2Catch","turnTable","cv2Mix"};
     for (const char* candidate : modes) {
         std::vector<std::string> cur = GetCustomBmsCategoriesForMode(candidate);
         if (cur.size() > best.size()) best.swap(cur);
@@ -310,6 +310,7 @@ static void InjectCustomStageCategories(uint32_t ecx, const std::vector<CustomBm
     // use channel_normal/channel_secret and different arrays.
     const std::string mode = GetActiveMode();
     if (_stricmp(mode.c_str(), "5keyMix") != 0 && _stricmp(mode.c_str(), "5keyOnly") != 0 &&
+        _stricmp(mode.c_str(), "streetMix") != 0 &&
         _stricmp(mode.c_str(), "7keyMix") != 0 && _stricmp(mode.c_str(), "clubMix") != 0 &&
         _stricmp(mode.c_str(), "spaceMix") != 0 && _stricmp(mode.c_str(), "rubyMix") != 0 &&
         _stricmp(mode.c_str(), "ez2Catch") != 0 && _stricmp(mode.c_str(), "turnTable") != 0 &&
@@ -553,7 +554,17 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     std::vector<CustomBmsSong> allSongs = GetCustomBmsSongsForActiveMode();
     if (allSongs.empty()) {
         static unsigned long emptyLogged = 0;
-        if (emptyLogged++ < 5) LogLine("[custom] no BMSData songs for activeMode='%s'", GetActiveMode().c_str());
+        if (emptyLogged++ < 5) {
+            LogLine("[custom] no BMSData songs for activeMode='%s'", GetActiveMode().c_str());
+            // InstallCustomCategoryPatches extends the wheel to 47+N categories GLOBALLY, not per mode.
+            // With no songs here those slots stay navigable, resolve to 0 visible entries, and the game
+            // divides by that count (0xc0000094 at 0x441911, seen entering SpaceMix). Autogen normally
+            // populates every target mode — if it did not, say so instead of arming a silent crash.
+            if (g_customCategoryCount)
+                LogLine("[custom] WARNING: wheel still advertises %lu custom categories in this mode; they resolve"
+                        " to 0 songs and the game divides by that count (0xc0000094). Add this mode to"
+                        " [AutoChart] TargetModes so autogen populates it.", (unsigned long)g_customCategoryCount);
+        }
         return;
     }
     if (!ecx || !CanReadPtr(reinterpret_cast<void*>(ecx), 0x90)) return;
@@ -717,10 +728,14 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     if (perCat > kSafePerCat) perCat = kSafePerCat;
     for (size_t ci = 0; ci < categories.size() && (47 + ci) < 256; ++ci) {
         const uint32_t cat = 47 + (uint32_t)ci;
-        uint32_t k = 0;
+        uint32_t k = 0, available = 0;
         for (const auto& song : allSongs) {
             if (_stricmp(song.category.c_str(), categories[ci].c_str()) != 0) continue;
-            if (slot >= kCapacity || k >= perCat) break;
+            // Count every match even past the limit: dropping songs silently is how a growing
+            // library loses entries with no error anywhere. `continue`, not `break`, so `available`
+            // is the true total and the truncation below can be reported.
+            ++available;
+            if (slot >= kCapacity || k >= perCat) continue;
             // 1) master[slot]: id + level floats only (entry zero-init by the game). versionNN =
             // 19+categoryIndex so the version splash matches the category (Version_NN.abm via redirect).
             uint32_t entry = masterBase + slot * kEntrySize;
@@ -739,6 +754,12 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
             SafeWriteBytes(CatCountTable() + cat * 4, &k, 4);
             LogLine("[category] %s native-table cat=%lu name='%s' songs=%lu",
                     phase, (unsigned long)cat, categories[ci].c_str(), (unsigned long)k);
+            if (available > k)
+                LogLine("[category] WARNING cat=%lu name='%s' TRUNCATED %lu -> %lu songs: %lu dropped."
+                        " Per-category ceiling is %lu (the filter's %lu-entry display array)."
+                        " Split this folder under BMSData\\<mode>\\ into more categories to keep them all.",
+                        (unsigned long)cat, categories[ci].c_str(), (unsigned long)available, (unsigned long)k,
+                        (unsigned long)(available - k), (unsigned long)perCat, (unsigned long)kSafePerCat);
         } else {
             LogLine("[category] %s SKIP empty cat=%lu name='%s' (capacity full at master=%lu/%lu)",
                     phase, (unsigned long)cat, categories[ci].c_str(), (unsigned long)slot, (unsigned long)kCapacity);
@@ -1295,7 +1316,7 @@ void InstallTraceHooks() {
         // Object is now our own 8MB buffer (PatchObjectAllocSites), so master[] is no longer capped
         // by the ~2MB pool block — aim high. Category overrun handled by EnsureCategoryTablesRelocated.
         uint32_t custom = 0;
-        const char* capacityModes[] = {"5keyOnly","5keyMix","7keyMix","clubMix","spaceMix","rubyMix","ez2Catch","turnTable","cv2Mix"};
+        const char* capacityModes[] = {"5keyOnly","5keyMix","streetMix","7keyMix","clubMix","spaceMix","rubyMix","ez2Catch","turnTable","cv2Mix"};
         for (const char* mode : capacityModes) {
             uint32_t count = static_cast<uint32_t>(GetCustomBmsSongsForMode(mode).size());
             if (count > custom) custom = count;

@@ -94,7 +94,14 @@ static std::string trim(std::string s) {
 std::string NormalizeModeName(const std::string& raw) {
     std::string l = lowerCopy(raw);
     if (l == "5keyonly" || l == "5konly" || l == "5k_only") return "5keyOnly";
-    if (l == "5keymix" || l == "streetmix" || l == "5k" || l == "5kstandard") return "5keyMix";
+    // "5keymix" and "streetmix" are SEPARATE game modes: each ships its own song.bin, stage.ini,
+    // .gds and panel, and its own per-song charts (streetmix even carries difficulties 5keymix does
+    // not). Collapsing both into one canonical made the mod serve a single profile to both, so the
+    // keys-only mode inherited the other's scratch/pedal and its custom charts came out wrong.
+    // Which of the two is the keys-only one is NOT decided here -- each canonical learns its own
+    // native layout, and the model enables or disables scratch/pedal from that.
+    if (l == "5keymix" || l == "5k" || l == "5kstandard") return "5keyMix";
+    if (l == "streetmix") return "streetMix";
     if (l == "7keymix" || l == "7streetmix" || l == "7k" || l == "7kstandard") return "7keyMix";
     if (l == "clubmix" || l == "club" || l == "10k") return "clubMix";
     if (l == "spacemix" || l == "space" || l == "14k") return "spaceMix";
@@ -126,7 +133,15 @@ void DetectActiveModeFromPath(const char* path, const char* reason) {
                   (p.find("stage.int") != std::string::npos) ||
                   (p.find(".gds") != std::string::npos);
     if (!strong) return;
-    const char* candidates[] = {"5keyonly", "5keymix", "7keymix", "clubmix", "spacemix", "rubymix", "ez2catch", "turntable", "scratchmix", "cv2mix"};
+    // These must be the folder names the GAME uses, not the mod's canonical mode names — the two
+    // differ for 7-key, whose folder is "7StreetMix". The old list only had "7keymix", so entering
+    // 7-key never switched the active mode: SongSelect kept serving the previous mode's catalog and
+    // ApplyModeAutoGeneration never ran, leaving generated 7k charts on the source's 5 lanes.
+    // SetActiveMode maps each of these through NormalizeModeName, so aliases are fine here.
+    // ORDER MATTERS: "7streetmix" must be tested before "streetmix", which is a substring of it.
+    const char* candidates[] = {"7streetmix", "5keyonly", "5keymix", "streetmix", "7keymix",
+                                "clubmix", "spacemix", "rubymix", "ez2catch", "turntable",
+                                "scratchmix", "cv2mix"};
     for (const char* c : candidates) {
         if (p.find(c) != std::string::npos) {
             SetActiveMode(c, reason);
@@ -404,6 +419,8 @@ static int bmsChannelToEzTrackMode(int ch, bool sevenKey) {
 static bool g_curModeSevenKey = false;
 static std::string g_curGenerateMode = "5keyOnly";
 static bool g_curAutoGenerate = false;
+// Set for the SOURCE mode's own charts: extract scratch/pedal, but never move the authored notes.
+static bool g_curAutoEnrich = false;
 static int bmsChannelToEzTrack5Key(int ch) { return bmsChannelToEzTrackMode(ch, g_curModeSevenKey); }
 
 static int bmsEventToEzTrack5Key(const ParsedBmsEvent& e) {
@@ -677,7 +694,8 @@ static std::string inferNativeModeFromPath(const std::string& raw) {
     if (p.find("catch1p") != std::string::npos || p.find("ez2catch") != std::string::npos) return "ez2Catch";
     if (p.find("scratchmix") != std::string::npos || p.find("turntable") != std::string::npos) return "turnTable";
     if (p.find("cv2mix") != std::string::npos) return "cv2Mix";
-    if (p.find("5keymix") != std::string::npos || p.find("streetmix") != std::string::npos) return "5keyMix";
+    if (p.find("5keymix") != std::string::npos) return "5keyMix";
+    if (p.find("streetmix") != std::string::npos) return "streetMix"; // 7streetmix already returned above
     return std::string();
 }
 
@@ -821,6 +839,29 @@ static std::vector<int> modelTracksByUsage(const std::array<uint64_t,64>& usage,
     return out;
 }
 
+// Tracks the native charts really use, by share of that side's notes, in physical left-to-right
+// order. Unlike modelTracksByUsage this does NOT take a count from the caller: the count is exactly
+// what the hardcoded profiles kept getting wrong (rubyMix hardcoded 4 lanes where the native charts
+// use 5; ez2Catch/cv2Mix had no second side at all while the native charts use one).
+static std::vector<int> modelTracksAboveShare(const std::array<uint64_t,64>& usage, double minShare) {
+    uint64_t total = 0;
+    for (int track = 0; track < 64; ++track) total += usage[track];
+    std::vector<int> out;
+    if (!total) return out;
+    for (int track = 0; track < 64; ++track)
+        if (static_cast<double>(usage[track]) / static_cast<double>(total) > minShare) out.push_back(track);
+    return out; // already ascending == physical order
+}
+
+static std::string tracksToText(const std::vector<int>& tracks) {
+    std::string out;
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        if (i) out += ",";
+        out += std::to_string(tracks[i]);
+    }
+    return out.empty() ? std::string("-") : out;
+}
+
 static int modelDominantTrack(const std::array<uint64_t,64>& usage, int fallback, int excluded = -1) {
     int best = fallback;
     uint64_t bestCount = 0;
@@ -856,11 +897,111 @@ static void writeNativeModelReport(const std::string& root) {
     std::fclose(f);
 }
 
+// The SOUND walk visits the WHOLE native tree (~165k files on a full install) even though it only
+// ever keeps nativeModelMaxChartsPerMode charts per mode, and it runs inside the startup gate before
+// a single BMS song is scanned. With a warm OS file cache that is ~2s; cold — a cabinet's storage on
+// every boot — it is minutes with no progress feedback, which reads as a hang. Cache the learned
+// model next to the other mod data (cacheRoot, so it stays drive-relative) and skip the walk when it
+// is present. Delete the file to force a relearn after changing SOUND.
+static const char* kNativeModelCacheName = "native_model.cache";
+static std::string nativeModelCachePath() {
+    return JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), kNativeModelCacheName);
+}
+
+// Single source of truth for field order so the reader and writer can never drift apart.
+template <typename Fn>
+static void visitNativeModelFields(NativeModeModel& m, Fn fn) {
+    fn(m.notes); fn(m.scratchNotes); fn(m.pedalNotes); fn(m.secondSideNotes);
+    fn(m.longNotes); fn(m.scratchLongNotes); fn(m.pedalLongNotes);
+    fn(m.scratchChordNotes); fn(m.pedalChordNotes);
+    fn(m.scratchGapSum); fn(m.scratchGapCount); fn(m.pedalGapSum); fn(m.pedalGapCount);
+    for (auto& v : m.scratchPhase) fn(v);
+    for (auto& v : m.pedalPhase) fn(v);
+    for (auto& v : m.primaryTrackNotes) fn(v);
+    for (auto& v : m.secondTrackNotes) fn(v);
+    for (auto& v : m.scratchTrackNotes) fn(v);
+    for (auto& v : m.pedalTrackNotes) fn(v);
+}
+
+static void writeNativeModelCache() {
+    std::string dir = JoinPath(GetExeDirectory(), Config().cacheRoot);
+    ensureDir(dir);
+    FILE* f = std::fopen(JoinPath(dir, kNativeModelCacheName).c_str(), "wb");
+    if (!f) return;
+    std::fprintf(f, "EZ2NativeModelCache 2 %lu\n", static_cast<unsigned long>(g_nativeModeModels.size()));
+    for (auto& kv : g_nativeModeModels) {
+        NativeModeModel& m = kv.second;
+        std::fprintf(f, "%s %lu", m.mode.c_str(), static_cast<unsigned long>(m.charts));
+        visitNativeModelFields(m, [&](uint64_t& v) {
+            std::fprintf(f, " %llu", static_cast<unsigned long long>(v));
+        });
+        std::fputc('\n', f);
+    }
+    std::fclose(f);
+}
+
+// Parsed with strtoull rather than fscanf: MSVCRT's scanf does not reliably accept %llu, and a
+// silent parse failure here would poison the model instead of just missing the cache.
+static bool readNativeModelCache() {
+    FILE* f = std::fopen(nativeModelCachePath().c_str(), "rb");
+    if (!f) return false;
+    std::string text;
+    char buf[4096];
+    size_t got;
+    while ((got = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, got);
+    std::fclose(f);
+
+    std::vector<std::string> tok;
+    std::string cur;
+    for (char c : text) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { if (!cur.empty()) { tok.push_back(cur); cur.clear(); } }
+        else cur.push_back(c);
+    }
+    if (!cur.empty()) tok.push_back(cur);
+
+    size_t i = 0;
+    auto next = [&]() -> const std::string* { return i < tok.size() ? &tok[i++] : nullptr; };
+    const std::string* tag = next();
+    const std::string* version = next();
+    const std::string* count = next();
+    // v2: 5keymix/streetmix became separate modes, so a v1 cache holds a merged 5keyMix model and
+    // must be relearned rather than reused.
+    if (!tag || !version || !count || *tag != "EZ2NativeModelCache" || *version != "2") return false;
+    unsigned long modes = std::strtoul(count->c_str(), nullptr, 10);
+    if (modes == 0 || modes > 64) return false;
+
+    std::map<std::string, NativeModeModel> loaded;
+    for (unsigned long mi = 0; mi < modes; ++mi) {
+        const std::string* name = next();
+        const std::string* charts = next();
+        if (!name || !charts) return false;
+        NativeModeModel m;
+        m.mode = *name;
+        m.charts = static_cast<uint32_t>(std::strtoul(charts->c_str(), nullptr, 10));
+        bool ok = true;
+        visitNativeModelFields(m, [&](uint64_t& v) {
+            const std::string* s = next();
+            if (!s) { ok = false; return; }
+            v = std::strtoull(s->c_str(), nullptr, 10);
+        });
+        if (!ok) return false;
+        loaded[m.mode] = m;
+    }
+    if (loaded.empty()) return false;
+    g_nativeModeModels.swap(loaded);
+    return true;
+}
+
 static void LearnNativeModeModels() {
     if (g_nativeModeModelsReady) return;
     g_nativeModeModelsReady = true;
     if (!Config().learnNativeCharts) {
         LogLine("[autochart-model] native learning disabled");
+        return;
+    }
+    if (readNativeModelCache()) {
+        LogLine("[autochart-model] loaded cached model modes=%lu path='%s' (SOUND walk skipped; delete that file to relearn)",
+            static_cast<unsigned long>(g_nativeModeModels.size()), nativeModelCachePath().c_str());
         return;
     }
     std::string root = JoinPath(GetExeDirectory(), Config().nativeChartRoot);
@@ -872,8 +1013,12 @@ static void LearnNativeModeModels() {
     DWORD started = GetTickCount();
     std::map<std::string, int> counts;
     std::set<std::string> seen;
+    // No cache yet: this walks the entire SOUND tree and is the single slowest step of startup on
+    // cold storage. Say so before blocking, so a long first boot is legible instead of looking hung.
+    LogLine("[autochart-model] no cache; walking '%s' (first run only, minutes on cold/slow storage)", root.c_str());
     scanNativeModelDirectory(root, 0, counts, seen);
     writeNativeModelReport(root);
+    writeNativeModelCache();
     for (const auto& kv : g_nativeModeModels) {
         const NativeModeModel& m = kv.second;
         LogLine("[autochart-model] mode='%s' charts=%lu notes=%llu scratch=%llu pedal=%llu p2=%llu",
@@ -904,6 +1049,11 @@ static AutoModeProfile profileForMode(const std::string& rawMode) {
     AutoModeProfile p;
     if (mode == "5keyOnly") p.primaryKeys = {3,4,5,6,7};
     else if (mode == "5keyMix") {
+        p.primaryKeys = {3,4,5,6,7}; p.scratchTrack = 10; p.pedalTrack1 = 11;
+        p.scratchShare = 0.085; p.pedalShare = 0.030;
+    } else if (mode == "streetMix") {
+        // Same shape as the sibling 5-key mode. Whether this one actually has scratch/pedal is
+        // settled by its own learned model below, not by this fallback.
         p.primaryKeys = {3,4,5,6,7}; p.scratchTrack = 10; p.pedalTrack1 = 11;
         p.scratchShare = 0.085; p.pedalShare = 0.030;
     } else if (mode == "7keyMix") {
@@ -1006,17 +1156,43 @@ static std::set<uint32_t> selectAutoSpecialTicks(const std::vector<AutoTickGroup
     return selected;
 }
 
+// 192 ticks per measure, so this is an 8th note: hitting the same lane again inside that window
+// is a jack, and a generated chart full of them is unplayable. "lastLane" only ever remembered ONE
+// note back and its 48-point penalty was swamped by the unbounded laneUse term, so nothing actually
+// stopped a lane repeating on consecutive ticks.
+static const uint32_t kJackGapTicks = 24;
+// Minimum rest between the end of a long note and the start of the next long on the SAME lane.
+static const uint32_t kLongChainGapTicks = 24;
+
 static int chooseAutoLane(const std::vector<int>& candidates, uint32_t tick, int sourceTrack,
                           const std::set<int>& usedAtTick, const std::array<uint32_t,64>& blockedUntil,
-                          const std::array<uint64_t,64>& laneUse, int lastLane, uint32_t seed) {
+                          const std::array<uint64_t,64>& laneUse,
+                          const std::array<uint32_t,64>& laneLastTick,
+                          const std::array<bool,64>& laneEver,
+                          const std::array<bool,64>& laneLastWasLong,
+                          int lastLane, uint32_t seed, bool noteIsLong, int strictness) {
     int best = -1;
     uint64_t bestCost = ~uint64_t(0);
     for (size_t i = 0; i < candidates.size(); ++i) {
         int lane = candidates[i];
         if (lane < 0 || lane >= 64 || usedAtTick.find(lane) != usedAtTick.end()) continue;
         if (blockedUntil[lane] > tick) continue;
+        uint32_t since = (laneEver[lane] && tick >= laneLastTick[lane]) ? tick - laneLastTick[lane] : 0xffffffffu;
+        // Two long notes back to back on one lane are not playable in this engine: there is no room
+        // to release and press again, the second cannot be caught and the combo drops. Measured from
+        // the END of the previous long (blockedUntil holds it), not from its start -- keying this off
+        // "the last note here was long" alone would poison a lane permanently and a chart made mostly
+        // of long notes would exhaust every lane. Outranks the jack gap: a jack is merely hard, this
+        // one the engine gets wrong, so it survives one more relaxation step.
+        if (strictness >= 1 && noteIsLong && laneLastWasLong[lane] &&
+            tick >= blockedUntil[lane] && tick - blockedUntil[lane] < kLongChainGapTicks) continue;
+        // Hard gap, relaxed first. The caller steps strictness down rather than let a note fall to
+        // background audio merely because the chart is dense.
+        if (strictness >= 2 && laneEver[lane] && since < kJackGapTicks) continue;
         uint64_t cost = laneUse[lane] * 32u;
         if (lane == lastLane) cost += 48u;
+        // Graded recency on top of the hard gap: among legal lanes, prefer the one resting longest.
+        if (laneEver[lane] && since < kJackGapTicks * 4u) cost += (kJackGapTicks * 4u - since);
         int sourcePos = sourceTrack >= 3 && sourceTrack <= 9 ? sourceTrack - 3 : 0;
         int targetPos = static_cast<int>(i);
         cost += static_cast<uint64_t>(std::abs(sourcePos - targetPos) * 3);
@@ -1029,7 +1205,7 @@ static int chooseAutoLane(const std::vector<int>& candidates, uint32_t tick, int
 static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
                                     const ParsedBmsForEz& bms, const std::string& rawMode,
                                     const std::string& identity) {
-    if (!Config().autoGenerateModes || !g_curAutoGenerate) return;
+    if (!Config().autoGenerateModes || (!g_curAutoGenerate && !g_curAutoEnrich)) return;
     std::string mode = NormalizeModeName(rawMode);
     if (mode.empty() || mode == "5keyOnly") return;
     AutoModeProfile profile = profileForMode(mode);
@@ -1059,6 +1235,43 @@ static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
     if (model) {
         // Native track names/usage are authoritative. Keep profile fallbacks only when the model
         // did not observe the corresponding controller in enough source charts.
+        // Same class of bug as the lane set below: the hardcoded profile decided WHETHER a mode
+        // has scratch/pedal at all and the model could only correct WHICH track. rubyMix shipped
+        // with neither set, while its native charts put 7.2% of notes on scratch (track 10) and
+        // 5.2% on pedal (track 11) -- so generated ruby charts came out as a bare copy of the
+        // 5-key source. Let the model turn a control ON when the native charts clearly use it.
+        if (profile.scratchTrack < 0 && model->notes && model->scratchNotes * 100u >= model->notes) {
+            int learned = modelDominantTrack(model->scratchTrackNotes, -1);
+            if (learned >= 0) {
+                profile.scratchTrack = learned;
+                LogLine("[autochart-lanes] mode='%s' scratch enabled from model: track=%d (%.1f%% of native notes)",
+                        mode.c_str(), learned,
+                        100.0 * (double)model->scratchNotes / (double)model->notes);
+            }
+        }
+        if (profile.pedalTrack1 < 0 && model->notes && model->pedalNotes * 100u >= model->notes) {
+            int learned = modelDominantTrack(model->pedalTrackNotes, -1);
+            if (learned >= 0) {
+                profile.pedalTrack1 = learned;
+                LogLine("[autochart-lanes] mode='%s' pedal enabled from model: track=%d (%.1f%% of native notes)",
+                        mode.c_str(), learned,
+                        100.0 * (double)model->pedalNotes / (double)model->notes);
+            }
+        }
+        // Symmetric to the enable above, and the half that was missing: a control the hardcoded
+        // profile assumes has to go away when the mode's OWN native charts do not use it. This is
+        // what keeps the keys-only 5-key mode free of the scratch/pedal its sibling mode has,
+        // whichever of the two it turns out to be.
+        if (profile.scratchTrack >= 0 && model->notes && model->scratchNotes * 200u < model->notes) {
+            LogLine("[autochart-lanes] mode='%s' scratch DISABLED from model: %llu of %llu native notes (<0.5%%)",
+                    mode.c_str(), (unsigned long long)model->scratchNotes, (unsigned long long)model->notes);
+            profile.scratchTrack = -1; profile.scratchTrack2 = -1; profile.scratchShare = 0.0;
+        }
+        if (profile.pedalTrack1 >= 0 && model->notes && model->pedalNotes * 200u < model->notes) {
+            LogLine("[autochart-lanes] mode='%s' pedal DISABLED from model: %llu of %llu native notes (<0.5%%)",
+                    mode.c_str(), (unsigned long long)model->pedalNotes, (unsigned long long)model->notes);
+            profile.pedalTrack1 = -1; profile.pedalTrack2 = -1; profile.pedalShare = 0.0;
+        }
         if (profile.scratchTrack >= 0) {
             profile.scratchTrack = modelDominantTrack(model->scratchTrackNotes, profile.scratchTrack);
             if (profile.scratchTrack2 >= 0)
@@ -1069,15 +1282,35 @@ static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
             if (profile.pedalTrack2 >= 0)
                 profile.pedalTrack2 = modelDominantTrack(model->pedalTrackNotes, profile.pedalTrack2, profile.pedalTrack1);
         }
-        std::vector<int> learnedPrimary = modelTracksByUsage(model->primaryTrackNotes, profile.primaryKeys.size());
-        std::vector<int> learnedSecond = modelTracksByUsage(model->secondTrackNotes, profile.secondaryKeys.size());
-        if (learnedPrimary.size() == profile.primaryKeys.size()) {
-            std::sort(learnedPrimary.begin(), learnedPrimary.end()); // preserve physical left-to-right order
+        // The lane SET comes from the model, not just the lane numbers. The old code asked for
+        // exactly profile.primaryKeys.size() tracks, so the model could fix WHICH tracks a mode uses
+        // but never HOW MANY — the hardcoded count stayed authoritative and wrong: rubyMix played on
+        // 4 lanes where the native charts use 5, and ez2Catch/cv2Mix never got a second side at all,
+        // so every note piled into half the playfield. clubMix/spaceMix only looked right because
+        // their hardcoded profiles happened to match the native layout exactly.
+        std::vector<int> learnedPrimary = modelTracksAboveShare(model->primaryTrackNotes, 0.02);
+        std::vector<int> learnedSecond  = modelTracksAboveShare(model->secondTrackNotes, 0.02);
+        if (!learnedPrimary.empty() && learnedPrimary.size() <= 16 && learnedPrimary != profile.primaryKeys) {
+            LogLine("[autochart-lanes] mode='%s' primary hardcoded=[%s] -> learned=[%s]", mode.c_str(),
+                    tracksToText(profile.primaryKeys).c_str(), tracksToText(learnedPrimary).c_str());
             profile.primaryKeys = learnedPrimary;
         }
-        if (!profile.secondaryKeys.empty() && learnedSecond.size() == profile.secondaryKeys.size()) {
-            std::sort(learnedSecond.begin(), learnedSecond.end());
+        if (!learnedSecond.empty() && learnedSecond.size() <= 16 && learnedSecond != profile.secondaryKeys) {
+            LogLine("[autochart-lanes] mode='%s' second  hardcoded=[%s] -> learned=[%s]", mode.c_str(),
+                    tracksToText(profile.secondaryKeys).c_str(), tracksToText(learnedSecond).c_str());
             profile.secondaryKeys = learnedSecond;
+        }
+        // turnTable is hardcoded as a one-scratch-lane mode, but the learned model reports its native
+        // charts using key lanes and essentially no scratch. Trust that only when it is unambiguous
+        // (a real model, and under 1% scratch), and say so in the log — if inferNativeModeFromPath
+        // mislabelled those charts this is the line that will show it.
+        if (profile.turntableOnly && model->charts >= 32 && model->notes &&
+            model->scratchNotes * 100u < model->notes && !profile.primaryKeys.empty()) {
+            LogLine("[autochart-lanes] mode='%s' turntableOnly OFF: native model has %llu scratch of %llu notes on %lu key lanes",
+                    mode.c_str(), static_cast<unsigned long long>(model->scratchNotes),
+                    static_cast<unsigned long long>(model->notes),
+                    static_cast<unsigned long>(profile.primaryKeys.size() + profile.secondaryKeys.size()));
+            profile.turntableOnly = false;
         }
     }
     double intensity = static_cast<double>(Config().autoGenerateIntensity) / 100.0;
@@ -1125,6 +1358,9 @@ static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
 
     std::array<uint32_t,64> blockedUntil{};
     std::array<uint64_t,64> laneUse{};
+    std::array<uint32_t,64> laneLastTick{};
+    std::array<bool,64> laneEver{};
+    std::array<bool,64> laneLastWasLong{};
     int lastLane = -1;
     size_t scratchMade = 0, pedalMade = 0, p2Made = 0, overflowAudio = 0;
     for (auto& group : groups) {
@@ -1132,6 +1368,12 @@ static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
         std::vector<AutoNotePack> remaining = group.notes;
         auto moveBestTo = [&](int target, bool pedal) -> bool {
             if (target < 0 || target >= 64 || blockedUntil[target] > group.tick || remaining.empty()) return false;
+            // Pedal is placed before scratch and both resolve their track through the model, so they
+            // can land on the SAME track. Without this the second call stacked another playable note
+            // on the same lane at the same tick -- an overlap that can never be hit.
+            if (used.find(target) != used.end()) return false;
+            if (laneEver[target] && group.tick >= laneLastTick[target] &&
+                group.tick - laneLastTick[target] < kJackGapTicks) return false;
             size_t best = 0;
             double bestScore = -1e9;
             for (size_t i = 0; i < remaining.size(); ++i) {
@@ -1141,10 +1383,15 @@ static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
                 if (score > bestScore) { bestScore = score; best = i; }
             }
             EzRawEventOut event = remaining[best].event;
+            // Same rule for the scratch/pedal lanes: refuse rather than chain two longs, and let the
+            // normal lane assignment below place this note somewhere it can actually be played.
+            if (event.len > 6 && laneLastWasLong[target]) return false;
             remaining.erase(remaining.begin() + static_cast<ptrdiff_t>(best));
             event.track = target;
             byTrack[target].push_back(event);
             used.insert(target); ++laneUse[target];
+            laneLastTick[target] = group.tick; laneEver[target] = true;
+            laneLastWasLong[target] = event.len > 6;
             if (event.len > 6) blockedUntil[target] = std::max(blockedUntil[target], event.tick + static_cast<uint32_t>(event.len));
             lastLane = target;
             return true;
@@ -1179,6 +1426,20 @@ static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
             continue;
         }
 
+        if (g_curAutoEnrich) {
+            // The author's own chart. The scratch/pedal extraction above is the ONLY change; every
+            // remaining note stays on the lane it was written for, so 5-key standard gains the
+            // controls the mode really has without its authored pattern being reshuffled.
+            for (auto& note : remaining) {
+                int track = note.sourceTrack;
+                if (track < 0 || track >= 64) continue;
+                note.event.track = track;
+                byTrack[track].push_back(note.event);
+                ++laneUse[track];
+            }
+            continue;
+        }
+
         bool preferSecond = false;
         if (!profile.secondaryKeys.empty()) {
             uint32_t roll = autoHash(group.tick / 24u, seed ^ 0x2F2Fu, static_cast<uint32_t>(group.notes.size())) & 0xffffu;
@@ -1195,8 +1456,15 @@ static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
             laneCandidates.insert(laneCandidates.end(), profile.secondaryKeys.begin(), profile.secondaryKeys.end());
         }
         for (auto& note : remaining) {
-            int lane = chooseAutoLane(laneCandidates, group.tick, note.sourceTrack, used,
-                                      blockedUntil, laneUse, lastLane, seed);
+            const bool noteIsLong = note.event.len > 6;
+            // Strictness steps down instead of dropping the note: 2 = jack gap + no chained longs,
+            // 1 = no chained longs, 0 = any legal lane. Overlap and active long notes are refused
+            // at every level.
+            int lane = -1;
+            for (int strictness = 2; strictness >= 0 && lane < 0; --strictness)
+                lane = chooseAutoLane(laneCandidates, group.tick, note.sourceTrack, used,
+                                      blockedUntil, laneUse, laneLastTick, laneEver, laneLastWasLong,
+                                      lastLane, seed, noteIsLong, strictness);
             if (lane < 0) {
                 int bg = 22 + (note.event.wav % 10);
                 note.event.track = bg; byTrack[bg].push_back(note.event); ++overflowAudio;
@@ -1205,23 +1473,72 @@ static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
             note.event.track = lane;
             byTrack[lane].push_back(note.event);
             used.insert(lane); ++laneUse[lane];
+            laneLastTick[lane] = group.tick; laneEver[lane] = true;
+            laneLastWasLong[lane] = noteIsLong;
             if (lane >= 12 && lane <= 18) ++p2Made;
             if (note.event.len > 6)
                 blockedUntil[lane] = std::max(blockedUntil[lane], note.event.tick + static_cast<uint32_t>(note.event.len));
             lastLane = lane;
         }
     }
+    // Safety net and measurement for the two symptoms this pass targets. Two playable notes on one
+    // lane at the same tick can never be hit, so the extra is moved to background audio (the
+    // keysound still plays) rather than dropped. Remaining jacks are only counted, not altered --
+    // they can be legitimate at low density, and the count is what tells us if the gap is working.
+    size_t collisions = 0, jacks = 0;
+    for (int track = 3; track <= 21; ++track) {
+        std::stable_sort(byTrack[track].begin(), byTrack[track].end(), [](const EzRawEventOut& a, const EzRawEventOut& b) {
+            return a.tick != b.tick ? a.tick < b.tick : a.wav < b.wav;
+        });
+        std::vector<EzRawEventOut> keep;
+        keep.reserve(byTrack[track].size());
+        bool havePrev = false;
+        uint32_t prevTick = 0;
+        for (const auto& event : byTrack[track]) {
+            if (event.type != 1) { keep.push_back(event); continue; }
+            if (havePrev && event.tick == prevTick) {
+                EzRawEventOut moved = event;
+                moved.track = 22 + (event.wav % 10);
+                byTrack[moved.track].push_back(moved);
+                ++collisions;
+                continue;
+            }
+            if (havePrev && event.tick - prevTick < kJackGapTicks) ++jacks;
+            keep.push_back(event);
+            havePrev = true;
+            prevTick = event.tick;
+        }
+        byTrack[track].swap(keep);
+    }
     for (int track = 0; track < 64; ++track)
         std::stable_sort(byTrack[track].begin(), byTrack[track].end(), [](const EzRawEventOut& a, const EzRawEventOut& b) {
             return a.tick != b.tick ? a.tick < b.tick : a.wav < b.wav;
         });
-    LogLine("[autochart] id='%s' mode='%s' modelCharts=%lu notes=%lu scratch=%lu pedal=%lu p2=%lu overflowAudio=%lu shares=%.3f/%.3f/%.3f tracks=%d,%d,%d,%d%s",
+    // Per-lane histogram: "notes=240" alone cannot tell an even spread from everything piled onto
+    // three lanes. This is the line that shows which lanes a generated chart actually reaches.
+    std::string laneHist;
+    {
+        std::vector<int> shown = profile.primaryKeys;
+        shown.insert(shown.end(), profile.secondaryKeys.begin(), profile.secondaryKeys.end());
+        for (int extra : {profile.scratchTrack, profile.scratchTrack2, profile.pedalTrack1, profile.pedalTrack2})
+            if (extra >= 0 && std::find(shown.begin(), shown.end(), extra) == shown.end()) shown.push_back(extra);
+        for (size_t i = 0; i < shown.size(); ++i) {
+            if (i) laneHist += ",";
+            laneHist += std::to_string(shown[i]) + ":" +
+                        std::to_string(static_cast<unsigned long long>(laneUse[shown[i]]));
+        }
+        if (laneHist.empty()) laneHist = "-";
+    }
+    LogLine("[autochart] id='%s' mode='%s' modelCharts=%lu notes=%lu scratch=%lu pedal=%lu p2=%lu overflowAudio=%lu collisions=%lu jacks=%lu shares=%.3f/%.3f/%.3f tracks=%d,%d,%d,%d lanes=[%s]%s",
         identity.c_str(), mode.c_str(), static_cast<unsigned long>(model ? model->charts : 0),
         static_cast<unsigned long>(playableCount), static_cast<unsigned long>(scratchMade),
         static_cast<unsigned long>(pedalMade), static_cast<unsigned long>(p2Made),
-        static_cast<unsigned long>(overflowAudio), scratchShare, pedalShare, secondSideShare,
+        static_cast<unsigned long>(overflowAudio),
+        static_cast<unsigned long>(collisions), static_cast<unsigned long>(jacks),
+        scratchShare, pedalShare, secondSideShare,
         profile.scratchTrack, profile.scratchTrack2, profile.pedalTrack1, profile.pedalTrack2,
-        profile.catchApproximation ? " catchApproximation=1" : "");
+        laneHist.c_str(),
+        g_curAutoEnrich ? " enrichSourceOnly=1" : profile.catchApproximation ? " catchApproximation=1" : "");
 }
 
 
@@ -2134,6 +2451,7 @@ static void FinalizeSongBinDifficultyFields(CustomBmsSong& song) {
 static std::string modePrefixForCache(const std::string& mode) {
     std::string m = NormalizeModeName(mode);
     if (m == "5keyMix") return "5keyMix1p-";
+    if (m == "streetMix") return "streetmix1p-";
     if (m == "5keyOnly") return "5keyOnly1p-";
     if (m == "7keyMix") return "7streetmix1p-";
     if (m == "clubMix") return "clubmix1p-";
@@ -2159,6 +2477,7 @@ static void GeneratePlayableCacheV10(const CustomBmsSong& song, bool materialize
     g_curModeSevenKey = modeIsSevenKey(song.mode);
     g_curGenerateMode = song.mode;
     g_curAutoGenerate = song.autoGenerated;
+    g_curAutoEnrich = !song.autoGenerated && Config().autoGenerateEnrichSource;
     std::vector<CustomBmsChart> charts = song.chartMeta;
     charts.erase(std::remove_if(charts.begin(), charts.end(), [](const CustomBmsChart& c){ return c.slot < 0 || c.slot >= 4; }), charts.end());
     std::sort(charts.begin(), charts.end(), [](const CustomBmsChart& a, const CustomBmsChart& b){
@@ -2533,6 +2852,7 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
     g_curModeSevenKey = modeIsSevenKey(song->mode);
     g_curGenerateMode = song->mode;
     g_curAutoGenerate = song->autoGenerated;
+    g_curAutoEnrich = !song->autoGenerated && Config().autoGenerateEnrichSource;
     std::vector<unsigned char> ez;
     std::string report;
     if (!generateEzFromBms(chartPath, std::string(), song->id, &report, &ez)) {
@@ -3558,7 +3878,7 @@ static std::vector<std::string> configuredAutoTargetModes() {
 
 static int autoModeLevelBonus(const std::string& mode) {
     std::string m = NormalizeModeName(mode);
-    if (m == "5keyMix" || m == "turnTable") return 1;
+    if (m == "5keyMix" || m == "streetMix" || m == "turnTable") return 1;
     if (m == "7keyMix" || m == "cv2Mix") return 2;
     if (m == "clubMix") return 3;
     if (m == "spaceMix") return 4;
@@ -3582,9 +3902,39 @@ static void ExpandAutoGeneratedModes() {
     std::vector<std::string> targets = configuredAutoTargetModes();
     if (targets.empty()) return;
 
-    std::vector<CustomBmsSong> sources;
-    for (const auto& song : g_songs)
-        if (_stricmp(song.mode.c_str(), sourceMode.c_str()) == 0 && !song.autoGenerated) sources.push_back(song);
+    auto collectFor = [](const std::string& mode) {
+        std::vector<CustomBmsSong> out;
+        for (const auto& song : g_songs)
+            if (_stricmp(song.mode.c_str(), mode.c_str()) == 0 && !song.autoGenerated) out.push_back(song);
+        return out;
+    };
+
+    std::vector<CustomBmsSong> sources = collectFor(sourceMode);
+    // The configured SourceMode may simply not exist on a real install: most libraries keep every
+    // chart in BMSData\5keyMix and leave the other mode folders empty. Generating nothing is NOT a
+    // safe no-op — InstallCustomCategoryPatches extends the wheel to 47+N categories GLOBALLY, so a
+    // mode left with no custom songs still has those categories navigable, they resolve to zero
+    // visible entries, and the game divides by that count (STATUS_INTEGER_DIVIDE_BY_ZERO, observed
+    // at 0x441911 on entering SpaceMix). Fall back to the scanned mode that actually has charts.
+    if (sources.empty()) {
+        std::vector<std::string> scanned;
+        for (const auto& song : g_songs) {
+            if (song.autoGenerated) continue;
+            bool seen = false;
+            for (const auto& mode : scanned) if (_stricmp(mode.c_str(), song.mode.c_str()) == 0) { seen = true; break; }
+            if (!seen) scanned.push_back(song.mode);
+        }
+        std::string best;
+        for (const auto& mode : scanned) {
+            std::vector<CustomBmsSong> cur = collectFor(mode);
+            if (cur.size() > sources.size()) { sources.swap(cur); best = mode; }
+        }
+        if (!best.empty()) {
+            LogLine("[autochart] configured sourceMode='%s' has no songs; using scanned mode='%s' songs=%lu",
+                    sourceMode.c_str(), best.c_str(), (unsigned long)sources.size());
+            sourceMode = best;
+        }
+    }
     if (sources.empty()) {
         LogLine("[autochart] no source songs for mode='%s'; no virtual modes generated", sourceMode.c_str());
         return;

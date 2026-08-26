@@ -76,6 +76,7 @@ ModConfig LoadConfig() {
     if (cfg.autoGenerateIntensity < 0) cfg.autoGenerateIntensity = 0;
     if (cfg.autoGenerateIntensity > 200) cfg.autoGenerateIntensity = 200;
     cfg.autoGenerateSeed = readInt("AutoChart", "Seed", 1337, ini);
+    cfg.autoGenerateEnrichSource = readBool("AutoChart", "EnrichSourceMode", true, ini);
     cfg.learnNativeCharts = readBool("AutoChart", "LearnNativeCharts", true, ini);
     cfg.nativeChartRoot = readString("AutoChart", "NativeChartRoot", "SOUND", ini);
     cfg.nativeModelMaxChartsPerMode = readInt("AutoChart", "NativeModelMaxChartsPerMode", 192, ini);

@@ -42,6 +42,10 @@ struct ModConfig {
     std::string autoGenerateTargetModes = "7keyMix,clubMix,spaceMix,rubyMix,ez2Catch,turnTable,cv2Mix";
     int autoGenerateIntensity = 100;
     int autoGenerateSeed = 1337;
+    // The source mode's songs are the author's own charts, so they are never redistributed. But a
+    // raw 5-key BMS has no scratch or pedal, while 5-key standard really has both -- enrich adds
+    // only those two controls and leaves the authored lane pattern untouched. 0 = play them raw.
+    bool autoGenerateEnrichSource = true;
 
     // Statistical model learned from native FNEX .es/.ez charts under SOUND.
     bool learnNativeCharts = true;
