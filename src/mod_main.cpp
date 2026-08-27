@@ -88,7 +88,6 @@ static CreateFileA_t RealCreateFileA = nullptr;
 static FindFirstFileA_t RealFindFirstFileA = nullptr;
 static FindNextFileA_t RealFindNextFileA = nullptr;
 static SetCurrentDirectoryA_t RealSetCurrentDirectoryA = nullptr;
-static GetFileAttributesA_t RealGetFileAttributesA = nullptr;
 static std::string g_lastCustomCacheDir;
 
 
@@ -404,82 +403,6 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
                 std::string def = JoinPath(JoinPath(JoinPath(GetExeDirectory(), "Video"), "_spv"), "default.ini");
                 if (LocalFileExists(def)) return def;
                 break;
-            }
-        }
-    }
-
-    // category_NN.abm redirect — LOAD-BEARING (decomp fun_43673d texture loader + crash
-    // 0x4322ce): native Sortimage/ only ships category_01..47.abm. The patched loader now
-    // requests category_48/49.abm for our custom slots; those native files DON'T exist, so
-    // the load fails → wheel texture slot = garbage 0x30 → FUN_00403f80 derefs [0x30+0x80]
-    // → CRASH. Redirect 48/49 to our generated CustomCache\<mode>\_categories\category_NN.abm
-    // so the loader gets a valid texture. (Disabling this is what reintroduced the crash.)
-    std::string lowerPath = LowerAscii(p);
-    std::vector<std::string> cats;
-    std::string categoryMode = GetActiveMode();
-    if (categoryMode.empty()) categoryMode = "5keyOnly";
-    if (lowerPath.find("category_") != std::string::npos || lowerPath.find("categorybig_") != std::string::npos ||
-        lowerPath.find("version_") != std::string::npos)
-        cats = GetCustomBmsCategoriesForMode(categoryMode);
-    // categorybig_NN carries the full details.txt name for the LARGE centre label; category_NN keeps
-    // the short folder name for the tab row. Native Sortimage ships neither for slots 48+, so this
-    // redirect is load-bearing exactly like the category_NN one above it.
-    if (lowerPath.find("categorybig_") != std::string::npos) {
-        for (size_t i = 0; i < cats.size(); ++i) {
-            char abm[40] = {}, bmp[40] = {};
-            wsprintfA(abm, "categorybig_%02d.abm", 48 + (int)i);
-            wsprintfA(bmp, "categorybig_%02d.bmp", 48 + (int)i);
-            std::string req = lowerPath.find(LowerAscii(abm)) != std::string::npos ? abm :
-                              (lowerPath.find(LowerAscii(bmp)) != std::string::npos ? bmp : "");
-            if (req.empty()) continue;
-            std::string out = JoinPath(JoinPath(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot),
-                                       categoryMode), "_categories"), req);
-            if (LocalFileExists(out)) {
-                static int s_bigLogged = 0;
-                if (s_bigLogged < 4) { ++s_bigLogged;
-                    LogLine("[category] BIG label requested slot=%d name='%s' -> '%s'",
-                            47 + (int)i, cats[i].c_str(), out.c_str()); }
-                return out;
-            }
-        }
-    }
-    if (lowerPath.find("category_") != std::string::npos) {
-        for (size_t i = 0; i < cats.size(); ++i) {
-            char abm[32] = {}, bmp[32] = {};
-            wsprintfA(abm, "category_%02d.abm", 48 + (int)i);
-            wsprintfA(bmp, "category_%02d.bmp", 48 + (int)i);
-            std::string req = lowerPath.find(LowerAscii(abm)) != std::string::npos ? abm :
-                              (lowerPath.find(LowerAscii(bmp)) != std::string::npos ? bmp : "");
-            if (req.empty()) continue;
-            std::string out = JoinPath(JoinPath(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot),
-                                       categoryMode), "_categories"), req);
-            if (LocalFileExists(out)) {
-                LogLine("[category] redirect slot=%d name='%s' -> '%s'", 47 + (int)i, cats[i].c_str(), out.c_str());
-                return out;
-            }
-        }
-    }
-
-    // Version_NN.abm splash redirect (NN>18 = custom categories). The inject writes each custom song's
-    // version field to 19+categoryIndex; the game then loads Version_%02d.abm for that index. Serve it
-    // from CustomCache\<mode>\_versions\Version_NN.abm (generated from the category's details.txt).
-    if (lowerPath.find("version_") != std::string::npos &&
-        (lowerPath.find(".abm") != std::string::npos || lowerPath.find(".bmp") != std::string::npos)) {
-        for (size_t i = 0; i < cats.size(); ++i) {
-            int nn = 19 + (int)i;
-            char abm[32] = {}, bmp[32] = {};
-            wsprintfA(abm, "version_%02d.abm", nn);
-            wsprintfA(bmp, "version_%02d.bmp", nn);
-            std::string req = lowerPath.find(abm) != std::string::npos ? abm :
-                              (lowerPath.find(bmp) != std::string::npos ? bmp : "");
-            if (req.empty()) continue;
-            // cache file is capitalized Version_NN.abm; request match is case-insensitive
-            char cachefn[32] = {}; wsprintfA(cachefn, "Version_%02d.abm", nn);
-            std::string out = JoinPath(JoinPath(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot),
-                                       categoryMode), "_versions"), cachefn);
-            if (LocalFileExists(out)) {
-                LogLine("[version] redirect nn=%d cat='%s' -> '%s'", nn, cats[i].c_str(), out.c_str());
-                return out;
             }
         }
     }
@@ -1252,42 +1175,6 @@ static bool InstallPoolOverflowGuard() {
 // ponytail: +headroom is sized for songnames (~32KB each); discs (~463KB) stay lazy — fitting ALL discs
 // would be ~900MB and risk the 32-bit 2GB address-space cap.
 static const uint32_t kTexPoolSize = 0x08000000u; // 128 MB (all custom songnames ~70MB + UI; safe in 2GB)
-static void* g_texBuf = nullptr;
-// The texture KResourceContainer is a STATIC object at 0x00530c2c (ctor @0x486560: push 0x02000000=32MB;
-// mov ecx,0x530c2c; call 0x401ab0). Layout: [+8]=m_nKeyPoolSize, [+0xc]=m_pKeyPool (base, NULL until the
-// first texture loads), [+0x10]=bump ptr, [+0x14]=tree root. We give it OUR 128MB buffer at init —
-// while base is still NULL (the texture pool isn't used until SongSelect, so init is safe) — so all
-// textures (native discs + custom songnames + UI) load into the big pool from the very first load, with
-// no buffer swap (which discarded already-loaded native textures) and no reliance on the game allocator
-// (which returned bad memory at 160MB). Also patch the ctor's size constant in case the static ctor runs
-// after us. ponytail: discs stay lazy — titling all songs needs ~70MB; all discs would be ~900MB (2GB cap).
-static bool InstallTexPoolGrow() {
-    const uint32_t kPool = 0x00530c2cu;
-    g_texBuf = VirtualAlloc(NULL, kTexPoolSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    LogLine("[texpool] reserved %lu MB buffer at %p", (unsigned long)(kTexPoolSize >> 20), g_texBuf);
-    if (!g_texBuf) return false;
-    // (a) ctor size constant: push 0x02000000 @0x486561 -> 128MB (covers the ctor running after our init)
-    uint32_t bigsz = kTexPoolSize;
-    WriteMemory(Rva(0x86561), &bigsz, 4);
-    // (b) if the ctor already ran (size 32MB, base still NULL) install our buffer directly, now
-    uint32_t curSize = 0, curBase = 0;
-    if (!IsBadReadPtr((void*)(uintptr_t)(kPool + 8), 8)) {
-        curSize = *(volatile uint32_t*)(uintptr_t)(kPool + 8);
-        curBase = *(volatile uint32_t*)(uintptr_t)(kPool + 0xc);
-    }
-    if ((curSize == 0x02000000u || curSize == 0) && curBase == 0) {
-        uint32_t b = (uint32_t)(uintptr_t)g_texBuf, z = 0;
-        WriteMemory((void*)(uintptr_t)(kPool + 8), &bigsz, 4);   // size = 128MB
-        WriteMemory((void*)(uintptr_t)(kPool + 0xc), &b, 4);     // base = our buffer (game's lazy alloc sees base!=0 → skips)
-        WriteMemory((void*)(uintptr_t)(kPool + 0x10), &b, 4);    // bump = base
-        WriteMemory((void*)(uintptr_t)(kPool + 0x14), &z, 4);    // tree = empty
-        LogLine("[texpool] installed buffer at init: pool=%08lx size 32->128 MB base=%p", (unsigned long)kPool, g_texBuf);
-    } else {
-        LogLine("[texpool] pool already in use at init (size=%lu MB base=%08lx) — relying on ctor-const patch",
-                (unsigned long)(curSize >> 20), (unsigned long)curBase);
-    }
-    return true;
-}
 
 bool g_songInjectRan = false;  // set by the song inject; gates the tracer arm to the load window
 static void MaybeArmTracerOnCredits(LPCSTR name) {
@@ -1406,11 +1293,11 @@ static int VirtualAssetKind(const std::string& lowerPath, size_t catCount, int& 
         { "categorybig_", kCatAbmOverlay, 48 },
         { "category_",    kCatAbmTab,     48 },
         { "version_",     kCatAbmLabel,   19 },
-        // The two-line overlay. Native sortstyle art is 256x64 24bpp (verified against a decoded
-        // sortstyle_00.bmp: 49206 bytes, biWidth 256, biHeight 64). The numbering the game uses for
-        // custom categories is not known yet, so anything at or past the 30 native entries is
-        // treated as ours and logged.
-        { "sortstyle_",   kCatAbmSort,    30 },
+        // The two-line category-change overlay, 256x64 24bpp like the 30 shipped sortstyle_NN.
+        // The game never asks for these by name -- it bulk-loads 00..29 at init and then only
+        // indexes the array -- so the request comes from our own loadTex call, which numbers the
+        // file after the category (47+) to keep the array index and the asset name the same thing.
+        { "sortstyle_",   kCatAbmSort,    47 },
     };
     for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); ++i) {
         size_t at = lowerPath.find(kinds[i].prefix);
@@ -1762,53 +1649,6 @@ static void InstallCrashLogger() {
     AddVectoredExceptionHandler(0, FirstChanceCrashVEH); // 0 = run last among VEHs, before SEH unwind
 }
 
-// ---- Hardware write-watch (data breakpoint) -------------------------------------------------
-// The in-process "watchpoint debugger": arm a DR0 write breakpoint on a global that's getting
-// clobbered, and log the EIP of whatever writes it. Catches the corruptor exactly instead of
-// guessing. Legit writers fire too, so we cap the log; the odd writer (a string-copy overrun)
-// stands out and its RVA maps straight into the decomp.
-static uintptr_t g_watchAddr = 0;
-static LONG CALLBACK WatchVEH(EXCEPTION_POINTERS* ep) {
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && g_watchAddr &&
-        (ep->ContextRecord->Dr6 & 0x1)) {
-        static unsigned long n = 0;
-        if (n++ < 40) {
-            uintptr_t base = (uintptr_t)GetModuleHandleA(nullptr);
-            uintptr_t eip = ep->ContextRecord->Eip;
-            LogLine("[watch] write to %08lx by eip=%08lx rva=%08lx",
-                    (unsigned long)g_watchAddr, (unsigned long)eip,
-                    (eip >= base + 0x1000 && eip < base + 0x100000) ? (unsigned long)(eip - base) : 0xffffffff);
-        }
-        ep->ContextRecord->Dr6 = 0;
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-static void SetWriteWatch4(uintptr_t addr) {
-    g_watchAddr = addr;
-    AddVectoredExceptionHandler(1, WatchVEH);
-    DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
-    THREADENTRY32 te; te.dwSize = sizeof(te);
-    int armed = 0;
-    if (Thread32First(snap, &te)) do {
-        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-        HANDLE th = OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
-        if (!th) continue;
-        SuspendThread(th);
-        CONTEXT c; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (GetThreadContext(th, &c)) {
-            c.Dr0 = addr;
-            c.Dr7 = (c.Dr7 & ~0x000F0001ul) | 0x000D0001ul; // L0=1, R/W0=01(write), LEN0=11(4 bytes)
-            if (SetThreadContext(th, &c)) ++armed;
-        }
-        ResumeThread(th);
-        CloseHandle(th);
-    } while (Thread32Next(snap, &te));
-    CloseHandle(snap);
-    LogLine("[watch] hardware write-watch armed on %08lx threads=%d", (unsigned long)addr, armed);
-}
 
 static DWORD WINAPI InitThread(LPVOID) {
     WriteMarkerFile("InitThread.begin");

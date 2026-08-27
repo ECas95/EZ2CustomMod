@@ -68,9 +68,6 @@ struct CategoryMemoryEdit {
 };
 
 // ponytail: x86 uses signed imm8 loop bounds, so 127 total categories is the native ceiling.
-static uint32_t g_categoryTextures[127] = {};
-static unsigned char g_categoryBaseOriginal[2][6] = {};
-static bool g_categoryBaseInstalled = false;
 static uint32_t g_customCategoryCount = 0;
 
 // Version-label array relocation (details at InstallVersionArrayRelocation below).
@@ -87,6 +84,96 @@ static CategoryMemoryEdit g_verAEdits[] = {
     {0x3A107, kVerAOrig, kVerAReloc, 0, 4, false},
 };
 static bool g_verARelocated = false;
+
+// ---------------------------------------------------------------------------------------------
+// Sortstyle relocation -- the big 256x64 sprite the category-change overlay shows.
+//
+// Two separate things happen on a category change, and only the first was ever fixed:
+//
+//   Version_View  (obj+0xBEAF4)  the one-line label under the song title, gated to cat 2..18.
+//   Sortstyle_View(obj+0xBED10)  the two-line overlay, gated to cat 0..1 and 19..46.
+//
+// Disassembled at 0x4447DF (and an identical twin at 0x44497B):
+//     mov  eax,[esi+0xBC57C]        ; active category
+//     cmp  eax,edi(0) / jl  ...     ; cat 0..1 take the special cases below
+//     cmp  eax,1      / jle ...
+//     cmp  eax,0x13   / jl  0x44483E   <- outer gate: below 19, nothing happens
+//     cmp  eax,0x2e   / jg  0x44483E   <- and above 46, nothing happens
+//     cmp  eax,0 / jne ; mov ecx,[esi+0xC000C]   ; cat 0 -> sortstyle[0]
+//     cmp  eax,1 / jne ; mov edx,[esi+0xC0010]   ; cat 1 -> sortstyle[1]
+//     cmp  eax,0x13 / jl / cmp eax,0x2e / jg     <- inner gate on the array read
+//     mov  eax,[esi+eax*4+0xBFFC8]  ; cat 19..46 -> sortstyle[cat-17]
+//     push eax / push 0 / lea ecx,[esi+0xBED10] / push 2 / call sub_402910   ; set texture
+//     lea  ecx,[esi+0xBED10] / call sub_402990                               ; START the animation
+//
+// Custom categories are 47+, so the outer gate sent them straight past BOTH calls. Widening the
+// draw dispatcher at 0x43604 (done earlier) made the renderer visit Sortstyle_View, but the object
+// was never handed a texture and its animation was never started -- which is exactly "no sale
+// nada, ni siquiera el mask".
+//
+// 0xBFFC8 is a BIASED base: it is only ever indexed by cat>=19, so effective addresses start at
+// 0xC0014 = sortstyle[2]. The relocated array drops the bias and is indexed by category directly,
+// so slot N belongs to category N for every N -- natives copied in, customs loaded on top.
+static const uint32_t kSortBiasedOrig = 0xBFFC8;   // [base + cat*4], cat 19..46 -> sortstyle[2..29]
+static const uint32_t kSortReloc      = 0x113000;  // clear of A at 0x112000; 128 entries = 512 bytes
+static const uint32_t kSortNativeLo   = 19;        // first category served out of the array
+static const uint32_t kSortNativeHi   = 46;        // last native one
+static CategoryMemoryEdit g_sortEdits[] = {
+    {0x44820, kSortBiasedOrig, kSortReloc, 0, 4, false},
+    {0x449BC, kSortBiasedOrig, kSortReloc, 0, 4, false},
+};
+// Both gates, in both copies of the routine. The `cmp eax,0x13` floors stay: 47 clears them.
+static CategoryMemoryEdit g_sortGuardEdits[] = {
+    {0x447F5, 46, 127, 0, 1, false},   // outer gate, first copy
+    {0x4481A, 46, 127, 0, 1, false},   // inner gate on the array read
+    {0x44991, 46, 127, 0, 1, false},   // outer gate, twin
+    {0x449B6, 46, 127, 0, 1, false},   // inner gate, twin
+};
+static bool g_sortRelocated = false;
+
+static bool InstallSortstyleRelocation() {
+    for (const auto& e : g_sortEdits)
+        if (memcmp(Rva(e.rva), &e.expected, e.length) != 0) {
+            LogLine("[sortstyle] reloc ABORTED: rva=0x%05lx does not hold base 0x%lx",
+                    (unsigned long)e.rva, (unsigned long)e.expected);
+            return false;
+        }
+    for (const auto& e : g_sortGuardEdits)
+        if (memcmp(Rva(e.rva), &e.expected, e.length) != 0) {
+            LogLine("[sortstyle] gate widen ABORTED: rva=0x%05lx is not the expected imm8 %lu",
+                    (unsigned long)e.rva, (unsigned long)e.expected);
+            return false;
+        }
+    for (auto& e : g_sortEdits) {
+        memcpy(&e.original, Rva(e.rva), e.length);
+        if (!WriteMemory(Rva(e.rva), &e.replacement, e.length)) return false;
+        e.installed = true;
+    }
+    for (auto& e : g_sortGuardEdits) {
+        memcpy(&e.original, Rva(e.rva), e.length);
+        if (!WriteMemory(Rva(e.rva), &e.replacement, e.length)) return false;
+        e.installed = true;
+    }
+    g_sortRelocated = true;
+    LogLine("[sortstyle] array 0x%lx -> 0x%lx (2 reads, bias dropped), gates 19..46 -> 19..127",
+            (unsigned long)kSortBiasedOrig, (unsigned long)kSortReloc);
+    return true;
+}
+
+static void RemoveSortstyleRelocation() {
+    for (auto& e : g_sortEdits) {
+        if (!e.installed) continue;
+        WriteMemory(Rva(e.rva), &e.original, e.length);
+        e.installed = false;
+    }
+    for (auto& e : g_sortGuardEdits) {
+        if (!e.installed) continue;
+        WriteMemory(Rva(e.rva), &e.original, e.length);
+        e.installed = false;
+    }
+    g_sortRelocated = false;
+}
+// ---------------------------------------------------------------------------------------------
 
 static bool InstallVersionArrayARelocation() {
     for (const auto& e : g_verAEdits)
@@ -264,102 +351,15 @@ static bool SafeWriteBytes(uint32_t addr, const void* src, size_t bytes) {
     return true;
 }
 
-static void WriteEntrySongId(uint32_t entryBase, const std::string& id) {
-    char buf[64] = {};
-    lstrcpynA(buf, id.c_str(), sizeof(buf));
-    SafeWriteBytes(entryBase + 0x10C, buf, sizeof(buf));
-}
-
-static void WriteEntrySongBinLikeFields(uint32_t entryBase, const CustomBmsSong& song) {
-    // SongSelect entries carry a song.bin-like record at entry+0x10C.
-    // Native song.bin record layout confirmed from FUN_00469c30/FUN_00469f40:
-    //   +0x00 char[0x32] song id
-    //   +0x32 NM level,  +0x33 dword flags/reserved, +0x37 float BPM
-    //   +0x3B HD level,  +0x3C dword flags/reserved, +0x40 float BPM
-    //   +0x44 SHD level, +0x45 dword flags/reserved, +0x49 float BPM
-    //   +0x4D EX level,  +0x4E dword flags/reserved, +0x52 float BPM
-    // The visible levels must come from each BMS chart's #PLAYLEVEL, not filename heuristics.
-    uint32_t rec = entryBase + 0x10C;
-    WriteEntrySongId(entryBase, song.id);
-
-    const uint32_t levelOff[4] = {0x32, 0x3B, 0x44, 0x4D};
-    const uint32_t reservedOff[4] = {0x33, 0x3C, 0x45, 0x4E};
-    const uint32_t bpmOff[4] = {0x37, 0x40, 0x49, 0x52};
-    unsigned char levels[4] = {
-        (unsigned char)(song.levelNM  < 0 ? 0 : (song.levelNM  > 255 ? 255 : song.levelNM)),
-        (unsigned char)(song.levelHD  < 0 ? 0 : (song.levelHD  > 255 ? 255 : song.levelHD)),
-        (unsigned char)(song.levelSHD < 0 ? 0 : (song.levelSHD > 255 ? 255 : song.levelSHD)),
-        (unsigned char)(song.levelEX  < 0 ? 0 : (song.levelEX  > 255 ? 255 : song.levelEX))
-    };
-    float bpms[4] = {song.bpmNM, song.bpmHD, song.bpmSHD, song.bpmEX};
-    float fallback = 120.0f;
-    for (int i = 0; i < 4; ++i) { if (bpms[i] > 0.0f) { fallback = bpms[i]; break; } }
-    uint32_t zero = 0;
-    for (int i = 0; i < 4; ++i) {
-        float bpm = bpms[i] > 0.0f ? bpms[i] : fallback;
-        SafeWriteBytes(rec + levelOff[i], &levels[i], 1);
-        SafeWriteBytes(rec + reservedOff[i], &zero, 4);
-        SafeWriteBytes(rec + bpmOff[i], &bpm, 4);
-    }
-}
-
-static bool EntryIdEquals(uint32_t entryBase, const std::string& id) {
-    std::string cur = SafeReadAscii(entryBase + 0x10C, 64);
-    return _stricmp(cur.c_str(), id.c_str()) == 0;
-}
 
 
-// v20: normal SongSelect categories are parsed from system\<mode>\Stage.ini inside FUN_00435070.
-// Decomp notes for non-radio modes:
-//   - ALLSONG is copied to master id records at ecx + 0x5e3c8 + idx*0x374.
-//   - HID-HD%d category labels are copied into records of 9 dwords:
-//       name   at int-index 0x836a0 + idx*9  (32-byte string area)
-//       row/id at int-index 0x836a8 + idx*9  (the Stage.ini row that owns the label)
-//       count  at int-index 0x83a24.
-// These are high offsets because the decompiler typed ECX as int*. We write them as byte
-// addresses ecx + intIndex*4. This is still a memory-only overlay: Stage.ini is untouched.
-static uint32_t ObjDwordIndexedAddress(uint32_t ecx, uint32_t intIndex) {
-    return ecx + intIndex * 4u;
-}
 
-static bool WriteObjectDwordIndexed(uint32_t ecx, uint32_t intIndex, const void* src, size_t bytes) {
-    return SafeWriteBytes(ObjDwordIndexedAddress(ecx, intIndex), src, bytes);
-}
 
-static uint32_t ReadObjectDwordIndexedU32(uint32_t ecx, uint32_t intIndex, uint32_t def = 0) {
-    return SafeRead32(ObjDwordIndexedAddress(ecx, intIndex), def);
-}
 
-static std::string ReadObjectDwordIndexedAscii(uint32_t ecx, uint32_t intIndex, size_t maxLen = 32) {
-    return SafeReadAscii(ObjDwordIndexedAddress(ecx, intIndex), maxLen);
-}
 
-static std::string SanitizeCategoryName(const std::string& raw) {
-    std::string out;
-    out.reserve(31);
-    for (char c : raw) {
-        unsigned char uc = static_cast<unsigned char>(c);
-        if (uc < 0x20 || uc > 0x7e) continue;
-        if (c == ';' || c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') continue;
-        out.push_back(c);
-        if (out.size() >= 31) break;
-    }
-    if (out.empty()) out = "CUSTOM";
-    return out;
-}
 
-static std::vector<std::string> UniqueCustomCategories(const std::vector<CustomBmsSong>& songs) {
-    std::vector<std::string> cats;
-    for (const auto& s : songs) {
-        std::string cat = SanitizeCategoryName(s.category.empty() ? "CUSTOM" : s.category);
-        bool exists = false;
-        for (const auto& c : cats) {
-            if (_stricmp(c.c_str(), cat.c_str()) == 0) { exists = true; break; }
-        }
-        if (!exists) cats.push_back(cat);
-    }
-    return cats;
-}
+
+
 
 static std::vector<std::string> CustomCategoriesForModeOrLargest(const std::string& preferred) {
     std::vector<std::string> best;
@@ -374,218 +374,12 @@ static std::vector<std::string> CustomCategoriesForModeOrLargest(const std::stri
     return best;
 }
 
-static void WriteVirtualCategoryDiagnostics(const std::vector<CustomBmsSong>& songs) {
-    // Leave a human-readable record in each CustomCache folder so the Stage.ini overlay
-    // can be verified even though the real Stage.ini is never modified.
-    for (const auto& s : songs) {
-        if (s.cacheDir.empty()) continue;
-        std::string cat = SanitizeCategoryName(s.category.empty() ? "CUSTOM" : s.category);
-        std::string text;
-        text += "; EZ2CustomMod v20 virtual category overlay.\r\n";
-        text += "; Original system\\" + s.mode + "\\Stage.ini and song.bin are not modified.\r\n";
-        text += "Mode=" + s.mode + "\r\n";
-        text += "Category=" + cat + "\r\n";
-        text += "SongId=" + s.id + "\r\n";
-        text += "Title=" + s.title + "\r\n";
-        text += "Artist=" + s.artist + "\r\n";
-        text += "Levels=" + std::to_string(s.levelNM) + ";" + std::to_string(s.levelHD) + ";" + std::to_string(s.levelSHD) + ";" + std::to_string(s.levelEX) + "\r\n";
-        std::string path = s.cacheDir + "\\virtual_stage_category_" + cat + ".ini";
-        HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h != INVALID_HANDLE_VALUE) {
-            DWORD written = 0;
-            WriteFile(h, text.data(), (DWORD)text.size(), &written, nullptr);
-            CloseHandle(h);
-        }
-    }
-}
-
-static void InjectCustomStageCategories(uint32_t ecx, const std::vector<CustomBmsSong>& songs, const char* phase) {
-    if (songs.empty() || !ecx) return;
-
-    // Only standard songselect modes use this Stage.ini category table. Radio-style modes
-    // use channel_normal/channel_secret and different arrays.
-    const std::string mode = GetActiveMode();
-    if (_stricmp(mode.c_str(), "5keyMix") != 0 && _stricmp(mode.c_str(), "5keyOnly") != 0 &&
-        _stricmp(mode.c_str(), "streetMix") != 0 &&
-        _stricmp(mode.c_str(), "7keyMix") != 0 && _stricmp(mode.c_str(), "clubMix") != 0 &&
-        _stricmp(mode.c_str(), "spaceMix") != 0 && _stricmp(mode.c_str(), "rubyMix") != 0 &&
-        _stricmp(mode.c_str(), "ez2Catch") != 0 && _stricmp(mode.c_str(), "turnTable") != 0 &&
-        _stricmp(mode.c_str(), "cv2Mix") != 0) {
-        // If mode detection was empty, still attempt for 5keyMix scans because the object
-        // itself is already inside FUN_00435070.
-        if (!mode.empty()) return;
-    }
-
-    const uint32_t kCatCountIndex = 0x83a24;
-    const uint32_t kCatNameBaseIndex = 0x836a0;
-    const uint32_t kCatRowBaseIndex  = 0x836a8;
-    const uint32_t kCatStrideDwords = 9;
-    const uint32_t kMaxCats = 100;
-
-    uint32_t catCountAddr = ObjDwordIndexedAddress(ecx, kCatCountIndex);
-    if (!CanReadPtr(reinterpret_cast<void*>(catCountAddr), 4)) {
-        LogLine("[category] %s skip: Stage.ini category count unreadable ecx=%08lx addr=%08lx note='FUN_00435070 category table not resident yet'",
-                phase, static_cast<unsigned long>(ecx), static_cast<unsigned long>(catCountAddr));
-        return;
-    }
-
-    uint32_t count = ReadObjectDwordIndexedU32(ecx, kCatCountIndex, 0);
-    if (count > kMaxCats) count = 0;
-
-    auto cats = UniqueCustomCategories(songs);
-    uint32_t added = 0;
-    for (const auto& cat : cats) {
-        bool exists = false;
-        uint32_t existingIndex = 0;
-        for (uint32_t i = 0; i < count && i < kMaxCats; ++i) {
-            std::string cur = ReadObjectDwordIndexedAscii(ecx, kCatNameBaseIndex + i * kCatStrideDwords, 32);
-            if (_stricmp(cur.c_str(), cat.c_str()) == 0) {
-                exists = true;
-                existingIndex = i;
-                break;
-            }
-        }
-        if (exists) {
-            LogLine("[category] %s exists name='%s' index=%lu count=%lu", phase, cat.c_str(),
-                    static_cast<unsigned long>(existingIndex), static_cast<unsigned long>(count));
-            continue;
-        }
-        if (count >= kMaxCats) break;
-
-        char nameBuf[32] = {};
-        lstrcpynA(nameBuf, cat.c_str(), sizeof(nameBuf));
-        uint32_t rowIndex = 0x80000000u | count; // synthetic row marker; not a real Stage.ini row.
-        uint32_t nameIndex = kCatNameBaseIndex + count * kCatStrideDwords;
-        uint32_t rowIndexAddr = kCatRowBaseIndex + count * kCatStrideDwords;
-        bool okName = WriteObjectDwordIndexed(ecx, nameIndex, nameBuf, sizeof(nameBuf));
-        bool okRow  = WriteObjectDwordIndexed(ecx, rowIndexAddr, &rowIndex, sizeof(rowIndex));
-        if (okName && okRow) {
-            count++;
-            WriteObjectDwordIndexed(ecx, kCatCountIndex, &count, sizeof(count));
-            added++;
-            LogLine("[category] %s injected name='%s' index=%lu syntheticRow=0x%08lx count=%lu note='from BMSData\\%s\\%s'",
-                    phase, cat.c_str(), static_cast<unsigned long>(count - 1), static_cast<unsigned long>(rowIndex),
-                    static_cast<unsigned long>(count), songs[0].modeFolder.c_str(), cat.c_str());
-        } else {
-            LogLine("[category] %s failed name='%s' nameAddr=%08lx rowAddr=%08lx okName=%d okRow=%d",
-                    phase, cat.c_str(), static_cast<unsigned long>(ObjDwordIndexedAddress(ecx, nameIndex)),
-                    static_cast<unsigned long>(ObjDwordIndexedAddress(ecx, rowIndexAddr)), okName ? 1 : 0, okRow ? 1 : 0);
-        }
-    }
-
-    if (added > 0) {
-        WriteVirtualCategoryDiagnostics(songs);
-        LogLine("[category] %s virtual Stage.ini category overlay added=%lu total=%lu first='%s' originalStageIniUntouched=1",
-                phase, static_cast<unsigned long>(added), static_cast<unsigned long>(count), cats.empty() ? "" : cats[0].c_str());
-    }
-}
 
 
-static bool SafeMoveBytes(uint32_t dst, uint32_t src, size_t bytes) {
-    if (bytes == 0) return true;
-    if (!CanReadPtr(reinterpret_cast<void*>(dst), bytes)) return false;
-    if (!CanReadPtr(reinterpret_cast<void*>(src), bytes)) return false;
-    uint32_t lo = dst < src ? dst : src;
-    uint32_t hi = (dst + bytes) > (src + bytes) ? (dst + bytes) : (src + bytes);
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(reinterpret_cast<void*>(lo), hi - lo, PAGE_READWRITE, &oldProtect)) return false;
-    std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), bytes);
-    DWORD tmp = 0;
-    VirtualProtect(reinterpret_cast<void*>(lo), hi - lo, oldProtect, &tmp);
-    return true;
-}
 
 
-static void PinCustomSongInMasterAtTop(uint32_t ecx, const CustomBmsSong& song, uint32_t& master, uint32_t& injectedMaster) {
-    const uint32_t kEntrySize = 0x374;
-    const uint32_t kCapacity = 436;
-    uint32_t masterBase = ecx + 0x5e2bc;
-    if (!CanReadPtr(reinterpret_cast<void*>(masterBase), kEntrySize)) return;
-    if (master > kCapacity) return;
 
-    int existingIndex = -1;
-    for (uint32_t i = 0; i < master && i < kCapacity; ++i) {
-        if (EntryIdEquals(masterBase + i * kEntrySize, song.id)) {
-            existingIndex = static_cast<int>(i);
-            break;
-        }
-    }
 
-    unsigned char temp[0x374] = {};
-    if (existingIndex == 0) {
-        WriteEntrySongBinLikeFields(masterBase, song);
-        return;
-    }
-
-    if (existingIndex > 0) {
-        std::memcpy(temp, reinterpret_cast<void*>(masterBase + existingIndex * kEntrySize), kEntrySize);
-        if (SafeMoveBytes(masterBase + kEntrySize, masterBase, static_cast<size_t>(existingIndex) * kEntrySize)) {
-            SafeWriteBytes(masterBase, temp, kEntrySize);
-            WriteEntrySongBinLikeFields(masterBase, song);
-        }
-        return;
-    }
-
-    // Clone the current first native row as a complete structural template, then move
-    // the native master table down and put the virtual song.bin-like record at index 0.
-    // This is still memory-only; system\\<mode>\\song.bin is not modified.
-    if (master >= kCapacity) return;
-    std::memcpy(temp, reinterpret_cast<void*>(masterBase), kEntrySize);
-    if (SafeMoveBytes(masterBase + kEntrySize, masterBase, static_cast<size_t>(master) * kEntrySize)) {
-        SafeWriteBytes(masterBase, temp, kEntrySize);
-        WriteEntrySongBinLikeFields(masterBase, song);
-        master++;
-        injectedMaster++;
-    }
-}
-
-static void PinCustomSongAtTop(uint32_t ecx, const CustomBmsSong& song, uint32_t& visible, uint32_t& injectedVisible) {
-    const uint32_t kEntrySize = 0x374;
-    const uint32_t kCapacity = 436;
-    uint32_t visibleBase = ecx + 0x12c;
-    uint32_t cloneMaster = ecx + 0x5e2bc;
-
-    // v23 allows rebuilding an empty visible table from master[0].
-    if (!CanReadPtr(reinterpret_cast<void*>(visibleBase), kEntrySize)) return;
-
-    int existingIndex = -1;
-    for (uint32_t i = 0; i < visible && i < kCapacity; ++i) {
-        if (EntryIdEquals(visibleBase + i * kEntrySize, song.id)) {
-            existingIndex = static_cast<int>(i);
-            break;
-        }
-    }
-
-    unsigned char temp[0x374] = {};
-    if (existingIndex >= 0) {
-        std::memcpy(temp, reinterpret_cast<void*>(visibleBase + existingIndex * kEntrySize), kEntrySize);
-        if (existingIndex > 0) {
-            SafeMoveBytes(visibleBase + kEntrySize, visibleBase, static_cast<size_t>(existingIndex) * kEntrySize);
-            SafeWriteBytes(visibleBase, temp, kEntrySize);
-        }
-    } else {
-        if (visible >= kCapacity) return;
-        // Clone master[0], which v19 has already turned into the virtual song.bin-like row.
-        // This avoids visible[0] inheriting a random native song template.
-        uint32_t clone = cloneMaster;
-        if (!CanReadPtr(reinterpret_cast<void*>(clone), kEntrySize)) clone = visibleBase;
-        std::memcpy(temp, reinterpret_cast<void*>(clone), kEntrySize);
-        if (SafeMoveBytes(visibleBase + kEntrySize, visibleBase, static_cast<size_t>(visible) * kEntrySize)) {
-            SafeWriteBytes(visibleBase, temp, kEntrySize);
-            WriteEntrySongBinLikeFields(visibleBase, song);
-            visible++;
-            injectedVisible++;
-        }
-    }
-
-    // Make the custom row immediately actionable.
-    WriteEntrySongBinLikeFields(visibleBase, song);
-    if (Config().forceSelectCustom) {
-        uint32_t zero = 0;
-        SafeWriteBytes(ecx + 0x84, &zero, 4); // selected index
-        SafeWriteBytes(ecx + 0x8c, &zero, 4); // previous selected index
-    }
-}
 
 // Native category tables (confirmed globals, image base 0x00400000, only read by the
 // category filter FUN_00435070; never written by the game, so safe to populate):
@@ -746,34 +540,7 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     memcpy(nativeTemplate, reinterpret_cast<void*>(masterBase), 0x374);
     // DIAGNOSTIC (one-shot): every custom entry is a byte-for-byte clone of master[0] with only id,
     // levels, version and the songname pointer overridden -- so it inherits every OTHER field of that
-    // native song. The flag-driven native categories (HOT / NEW) do not use the id tables at all, which
-    // is why custom songs appear inside them while the category counts look correct. Log the offsets
-    // that actually differ between native records: the membership flag has to be one of them.
-    {
-        static bool s_entryDiffDumped = false;
-        if (!s_entryDiffDumped && master >= 6 &&
-            CanReadPtr(reinterpret_cast<void*>(masterBase), 6 * kEntrySize)) {
-            s_entryDiffDumped = true;
-            const unsigned char* a = reinterpret_cast<const unsigned char*>(masterBase);
-            for (uint32_t j = 1; j < 6; ++j) {
-                const unsigned char* b = a + j * kEntrySize;
-                std::string diff;
-                char buf[32];
-                for (uint32_t off = 0; off < 0x374; ++off) {
-                    if (a[off] == b[off]) continue;
-                    if (off >= 0x10C && off < 0x12C) continue;      // the id string itself
-                    if (off >= 0x214 && off < 0x244) continue;      // level floats
-                    if (diff.size() > 600) { diff += " ..."; break; }
-                    snprintf(buf, sizeof(buf), " %03lX:%02X/%02X",
-                             (unsigned long)off, (unsigned)a[off], (unsigned)b[off]);
-                    diff += buf;
-                }
-                LogLine("[entrydiff] master[0]='%.15s' vs master[%lu]='%.15s':%s",
-                        reinterpret_cast<const char*>(a + 0x10C), (unsigned long)j,
-                        reinterpret_cast<const char*>(b + 0x10C), diff.c_str());
-            }
-        }
-    }
+    // category is about to be filtered, so LoadCustomCategorySongnames loads only that category.
     // Custom SongName textures are intentionally NOT loaded here. FUN_00435070 tells us which
     // category is about to be filtered, so LoadCustomCategorySongnames loads only that category.
     // This removes thousands of synchronous texture loads from SongSelect startup.
@@ -823,25 +590,6 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     // is relocated out of the capped pool block.
     uint32_t budget = (kCapacity > master) ? (kCapacity - master) : 0;
     uint32_t numCats = (uint32_t)categories.size();
-    // Extend the version-splash load loop (0x437815 `cmp edi,0x13`, i.e. <19) to 19+numCats so the game
-    // loads our custom Version_19..NN.abm too (else those texture slots are null → blank splash). The
-    // limit is a single byte at RVA 0x37817; clamp to 255 (it's compared as a byte). One-shot.
-    {
-        // DISABLED -- this patch corrupts two other arrays. From the decompiled loader, ONE loop
-        // fills TWO adjacent arrays per iteration, and a third array follows immediately:
-        //     A  System\SongSelect\Version\Version_NN          dword 196573..196591  (19)
-        //     B  System\SongSelect\V_View\version\Version_NN   dword 196592..196610  (19)
-        //        System\SongSelect\V_View\sortstyle\...        dword 196611..196640  (30)
-        // Raising the bound to 19+numCats makes A run to 196615 (over all of B and into sortstyle)
-        // and B run to 196634 (over most of sortstyle). The label the game actually draws is read
-        // from B:  this[ this[221*this[33] + 295] + 196592 ]  -- so extending the loop destroyed the
-        // very array the version label is read from, which is why custom labels appeared over native
-        // categories and the sortstyle art misbehaved.
-        // Custom slots need array B RELOCATED to our own buffer with the reader's 196592 base
-        // repointed, the same way the category id tables were relocated. Until then, leave the
-        // native loop alone: a missing custom slot is a blank label, corrupting B is not.
-        (void)numCats;
-    }
     // If master[] can hold ALL custom songs (the normal case — newCap is sized to fit them), give
     // each category its full per-category limit (436 stride) so big folders aren't truncated. Only
     // when budget can't fit everything (newCap clamp hit) fall back to an even split so no wheel
@@ -1182,6 +930,38 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
                             (unsigned long)g_customCategoryCount);
                     }
                 }
+                // Sortstyle overlay, same shape as the version arrays above: the natives are
+                // re-copied on every pass (on the first one the game's own loader may not have run
+                // yet, and copying zeros once would blank every native category's overlay), the
+                // customs are loaded once because the texture pool is a bump allocator that never
+                // frees. Indexing is by category now that the 0xBFFC8 bias is gone, so slot 19..46
+                // holds what sortstyle[2..29] used to and 47.. holds ours.
+                if (g_sortRelocated) {
+                    const uint32_t nSort = kSortNativeHi - kSortNativeLo + 1;
+                    if (CanReadPtr(reinterpret_cast<void*>(r->ecx + kSortBiasedOrig + kSortNativeLo * 4),
+                                   nSort * 4))
+                        SafeWriteBytes(r->ecx + kSortReloc + kSortNativeLo * 4,
+                                       reinterpret_cast<void*>(r->ecx + kSortBiasedOrig + kSortNativeLo * 4),
+                                       nSort * 4);
+                    static uint32_t s_sortFilledFor = 0;
+                    bool sortLost = g_customCategoryCount && !SafeRead32(r->ecx + kSortReloc + 47 * 4);
+                    if (s_sortFilledFor != r->ecx || sortLost) {
+                        s_sortFilledFor = r->ecx;
+                        unsigned long sok = 0;
+                        for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
+                            const uint32_t cat = 47 + c;
+                            char sf[128] = {};
+                            snprintf(sf, sizeof(sf),
+                                     "System\\SongSelect\\V_View\\sortstyle\\sortstyle_%02lu.bmp",
+                                     (unsigned long)cat);
+                            loadTex(gfxCtx, sf,
+                                    reinterpret_cast<void*>(r->ecx + kSortReloc + cat * 4), nullptr);
+                            if (SafeRead32(r->ecx + kSortReloc + cat * 4)) ++sok;
+                        }
+                        LogLine("[sortstyle] %lu natives copied (cat 19..46) + %lu/%lu custom loaded",
+                                (unsigned long)nSort, sok, (unsigned long)g_customCategoryCount);
+                    }
+                }
                 LogLine("[category] loaded %lu wheel icons into relocated slots 47.. small=%08lx big=%08lx",
                         (unsigned long)g_customCategoryCount,
                         (unsigned long)SafeRead32(r->ecx + g_catTexSmallBase + 47 * 4),
@@ -1216,83 +996,6 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
                 *reinterpret_cast<uint32_t*>(functionEsp + 20) = 0;
                 static bool logged = false;
                 if (!logged) { logged = true; LogLine("[rank] custom Top-5 suppressed id='%.15s' selected=%lu", id, (unsigned long)selected); }
-            }
-        }
-        // The version index the renderer reads for the SELECTED entry:
-        //     this[ 221*this[33] + 295 ]  == dword 220 (0x370) of the visible entry.
-        // Custom songs are written 19+categoryIndex there. If this reads that, the index travels
-        // correctly and any missing label is a texture/animation problem; if it reads 0 or garbage,
-        // the field is not surviving the filter's copy into the visible array.
-        if (selected < visible && selected < 436) {
-            static uint32_t s_lastVerSig = 0;
-            static unsigned s_verDumps = 0;
-            uint32_t verAddr = regs->ecx + (221u * selected + 295u) * 4u;
-            if (s_verDumps < 40 && CanReadPtr(reinterpret_cast<void*>(verAddr), 4)) {
-                uint32_t verIdx = SafeRead32(verAddr);
-                const char* sid = reinterpret_cast<const char*>(regs->ecx + 0x238 + selected * 0x374);
-                uint32_t sig = verIdx * 7919u + (unsigned char)sid[0] * 31u + (unsigned char)sid[3];
-                if (sig != s_lastVerSig) {
-                    s_lastVerSig = sig; ++s_verDumps;
-                    uint32_t tex = 0;
-                    if (verIdx < 64) tex = SafeRead32(regs->ecx + kVerArrayReloc + verIdx * 4);
-                    // Everything the runtime updater tests before it assigns the texture:
-                    //   cat   = this[192863]      active category (must be inside the widened range)
-                    //   selfx = this[33]          the index IT uses -- not the stack arg we hooked
-                    //   vVis  = this[221*sel+295]   version idx from the VISIBLE array (drives the
-                    //                               texture lookup)
-                    //   vMas  = this[221*sel+96651] version idx from MASTER at its ORIGINAL offset --
-                    //                               master is relocated by +0xEFDF4, so this read may
-                    //                               be stale, and it is what the change test compares
-                    //   prev/cur = this[196471]/this[196472]  the "did it change" pair; equal means
-                    //                               the assignment is skipped no matter what else is right
-                    uint32_t selfx = SafeRead32(regs->ecx + 0x84);
-                    uint32_t cat   = SafeRead32(regs->ecx + 192863u * 4u);
-                    // Read the master version field at BOTH offsets. The game's own reads are now
-                    // repointed to the relocated master, so the original is expected to be 0 and
-                    // only the relocated one is meaningful. If vRel holds the right value while
-                    // cur/prev stay 0, the updater function is not running at all -- it writes those
-                    // two unconditionally on entry, before any guard.
-                    uint32_t vMas  = SafeRead32(regs->ecx + (221u * selfx + 96651u) * 4u);
-                    uint32_t vRel  = SafeRead32(regs->ecx + (221u * selfx) * 4u + 0x5E62Cu + 0xEFDF4u);
-                    uint32_t vVis  = SafeRead32(regs->ecx + (221u * selfx + 295u) * 4u);
-                    uint32_t prev  = SafeRead32(regs->ecx + 196471u * 4u);
-                    uint32_t cur   = SafeRead32(regs->ecx + 196472u * 4u);
-                    LogLine("[verread] this[33]=%lu id='%.15s' vVis=%lu vMasOrig=%lu vMasReloc=%lu"
-                            " tex=%08lx | cat=%lu inRange=%d prev=%lu cur=%lu changed=%d",
-                            (unsigned long)selfx, sid, (unsigned long)vVis,
-                            (unsigned long)vMas, (unsigned long)vRel, (unsigned long)tex,
-                            (unsigned long)cat, (cat >= 2 && cat <= 127) ? 1 : 0,
-                            (unsigned long)prev, (unsigned long)cur, (prev != cur) ? 1 : 0);
-                }
-            }
-        }
-        // What the wheel is ACTUALLY displaying right now. The category id tables came back clean,
-        // but ALL reports 436 entries against 430 native songs, so at least one category is not
-        // built from those tables -- and a table-only check cannot clear it. This reads the visible
-        // array the renderer is drawing from (ecx+0x12C, stride 0x374, id at +0x10C == ecx+0x238)
-        // and reports how many of its entries are ours. Logged only when the list changes, and
-        // capped, because this hook runs every frame.
-        {
-            static uint32_t s_lastSig = 0;
-            static unsigned s_dumps = 0;
-            if (visible && visible <= 436 && s_dumps < 40) {
-                const char* first = reinterpret_cast<const char*>(regs->ecx + 0x238);
-                uint32_t sig = visible * 131u;
-                for (int k = 0; k < 12 && first[k]; ++k) sig = sig * 31u + (unsigned char)first[k];
-                if (sig != s_lastSig) {
-                    s_lastSig = sig; ++s_dumps;
-                    uint32_t custom = 0;
-                    std::string sample;
-                    for (uint32_t i = 0; i < visible; ++i) {
-                        const char* e = reinterpret_cast<const char*>(regs->ecx + 0x238 + i * 0x374);
-                        if (!CanReadPtr(const_cast<char*>(e), 4)) break;
-                        if (e[0] == 'b' && e[1] == 'm' && e[2] == 's') ++custom;
-                        if (i < 8) { sample += " "; sample.append(e, strnlen(e, 15)); }
-                    }
-                    LogLine("[visible] entries=%lu custom=%lu native=%lu first8:%s",
-                            (unsigned long)visible, (unsigned long)custom,
-                            (unsigned long)(visible - custom), sample.c_str());
-                }
             }
         }
         return; // called every frame; never trace-spam this renderer
@@ -1427,25 +1130,6 @@ static bool InstallOne(TraceHook& h) {
 // time, 2 entry paths = same class), so a small ring of reused buffers avoids any leak.
 // ponytail: ring of 4; if two SongSelect objects ever coexist, bump the ring.
 static const size_t kObjBufSize = 8u * 1024u * 1024u; // holds master[] up to ~6000 songs
-static void* g_objBufs[4] = {};
-static int   g_objBufIdx = 0;
-static void* __stdcall SongSelectObjAlloc(uint32_t size) {
-    (void)size;
-    int i = g_objBufIdx; g_objBufIdx = (g_objBufIdx + 1) & 3;
-    if (!g_objBufs[i]) g_objBufs[i] = VirtualAlloc(nullptr, kObjBufSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (g_objBufs[i]) memset(g_objBufs[i], 0, kObjBufSize); // ctor expects fresh zeroed memory on reuse
-    LogLine("[objbuf] SongSelect object -> %p slot=%d size=%uMB", g_objBufs[i], i, (unsigned)(kObjBufSize >> 20));
-    return g_objBufs[i];
-}
-static void PatchObjectAllocSites() {
-    for (uintptr_t rva : {0x1bb55u, 0x5cf95u}) {
-        uint8_t* site = reinterpret_cast<uint8_t*>(Rva(rva));
-        if (site[0] != 0xE8) { LogLine("[objbuf] site 0x%lx not a call (0x%02x) — skip", (unsigned long)rva, site[0]); continue; }
-        int32_t rel = (int32_t)((uintptr_t)&SongSelectObjAlloc - ((uintptr_t)site + 5));
-        WriteMemory(site + 1, &rel, 4);
-        LogLine("[objbuf] detoured alloc call @rva 0x%lx -> SongSelectObjAlloc", (unsigned long)rva);
-    }
-}
 
 static bool InstallSongCapacityPatches(uint32_t newCap) {
     if (g_capacityPatched) return true;
@@ -1695,6 +1379,7 @@ void InstallTraceHooks() {
         InstallVersionArrayRelocation();
         InstallVersionArrayARelocation();
         InstallVersionGuardWiden();
+        InstallSortstyleRelocation();
     }
     if (customCategory && !InstallCustomCategoryPatches()) {
         LogLine("[category] new category disabled: executable layout mismatch");
@@ -1726,5 +1411,6 @@ void RemoveTraceHooks() {
     RemoveVersionArrayRelocation();
     RemoveVersionArrayARelocation();
     RemoveVersionGuardWiden();
+    RemoveSortstyleRelocation();
     g_traceInstalled = false;
 }

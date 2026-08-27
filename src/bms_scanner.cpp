@@ -3175,7 +3175,7 @@ static bool GenerateBmpFile(const std::string& path, int w, int h,
                     // ~10px native glyphs. styled: bold + plain AA.
                     font = CreateFontA(-px, 0, 0, 0, plain ? plainWeight : FW_BOLD, FALSE, FALSE, FALSE,
                                        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                       plain ? CLEARTYPE_QUALITY : ANTIALIASED_QUALITY,
+                                       plain ? ANTIALIASED_QUALITY : ANTIALIASED_QUALITY,
                                        DEFAULT_PITCH | FF_SWISS, "Arial");
                     oldFont = (HFONT)SelectObject(hdc, font);
                     SIZE size{};
@@ -3304,24 +3304,32 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
     RECT full = {0,0,w,h};
     HBRUSH black = CreateSolidBrush(RGB(0,0,0)); FillRect(hdc, &full, black); DeleteObject(black);
     SetBkMode(hdc, TRANSPARENT);
+    // Fit by WIDTH only. Measuring height too is what made every custom label come out smaller than
+    // the native art beside it: DrawText reports a full line box (~1.15em) even for one line, so a
+    // 15px font never "fits" a 16px canvas and the loop shrank it several pixels. The native assets
+    // are all-caps with no descenders, so a line box overhanging the canvas costs nothing.
+    // The loop also always ends holding a font -- the old one returned with font==nullptr when the
+    // text was too long even at 6px, silently rendering an empty sprite instead of an elided one.
     auto draw = [&](const std::wstring& txt, RECT r, int maxPx, COLORREF col) {
         if (txt.empty()) return;
         HFONT font = nullptr, oldFont = nullptr;
-        for (int px = maxPx; px >= 6; --px) {
+        for (int px = maxPx < 6 ? 6 : maxPx; ; --px) {
             font = CreateFontW(-px, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                                DEFAULT_PITCH | FF_SWISS, L"Arial");
             oldFont = (HFONT)SelectObject(hdc, font);
-            RECT calc = r; DrawTextW(hdc, txt.c_str(), -1, &calc, DT_CALCRECT | DT_WORDBREAK);
-            if ((calc.right - calc.left) <= (r.right - r.left) && (calc.bottom - calc.top) <= (r.bottom - r.top)) break;
+            RECT calc = r; DrawTextW(hdc, txt.c_str(), -1, &calc, DT_CALCRECT | DT_SINGLELINE);
+            if (px <= 6 || (calc.right - calc.left) <= (r.right - r.left)) break;
             SelectObject(hdc, oldFont); DeleteObject(font); font = nullptr;
         }
-        if (!font) return;
-        // A one-pixel dark shadow keeps thin glyphs readable, which is what the native art does.
         const UINT fmt = (alignRight ? DT_RIGHT : DT_CENTER) | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
-        SetTextColor(hdc, RGB(0,0,0));
-        RECT sh = r; sh.top += 1; sh.bottom += 1;
-        DrawTextW(hdc, txt.c_str(), -1, &sh, fmt);
+        // The native 256x64 art has symmetric antialiasing and no drop shadow; only the cramped
+        // 128x16 slots need the extra pixel of contrast to stay readable.
+        if (h <= 16) {
+            SetTextColor(hdc, RGB(0,0,0));
+            RECT sh = r; sh.top += 1; sh.bottom += 1;
+            DrawTextW(hdc, txt.c_str(), -1, &sh, fmt);
+        }
         SetTextColor(hdc, col);
         DrawTextW(hdc, txt.c_str(), -1, &r, fmt);
         SelectObject(hdc, oldFont); DeleteObject(font);
@@ -3331,16 +3339,22 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
     // rather than falling back to the folder name: a raw "PIU.1" in the song panel is noise. The
     // texture is still produced (empty) because a missing file leaves a null slot.
     if (!twoLine) {
-        // One line using the full canvas height, so a tab matches the native ones beside it.
-        draw(Utf8ToWide(category), RECT{2, 0, w - (alignRight ? 3 : 2), h}, h - 2, RGB(235,235,235));
+        // One line over the whole canvas. Native category_NN.abm is 128x16 with its ink in y 2..12,
+        // i.e. 11px caps, which Arial Bold reaches at an em of about h-1.
+        draw(Utf8ToWide(category), RECT{2, 0, w - (alignRight ? 3 : 2), h}, h - 1, RGB(235,235,235));
     } else {
         // Category sprite: BOTH lines live in this one texture, exactly like the native art --
         // the name in white over a smaller subtitle in orange. It is only 16px tall because every
         // Sortimage asset is 128x16 and the game scales it up for the overlay; giving it a bigger
         // canvas (256x64) changed the 8:1 aspect and came out stretched across the mask.
-        int split = (h * 5) / 8;
-        draw(Utf8ToWide(category), RECT{2, 0, w-2, split},      split,       RGB(240,240,240));
-        draw(Utf8ToWide(subtext),  RECT{2, split - 1, w-2, h},  h - split,   RGB(255,150,0));
+        // Geometry lifted off the shipped sortstyle_NN.bmp (256x64 24bpp), all 30 of which place
+        // their ink identically: the white category name occupies y 18..31 (14px caps) centred on
+        // x=128, and the orange caption y 43..50 (8px caps). Arial Bold reaches those cap heights
+        // at ems of 20 and 11. Kept as fractions of the canvas so the 128x16 variant is the same
+        // layout at a quarter scale. Orange is the native (255,174,0), not an approximation.
+        const int pad = w / 16;
+        draw(Utf8ToWide(category), RECT{pad, h * 6 / 64,  w - pad, h * 46 / 64}, h * 20 / 64, RGB(255,255,255));
+        draw(Utf8ToWide(subtext),  RECT{pad, h * 34 / 64, w - pad, h * 61 / 64}, h * 11 / 64, RGB(255,174,0));
     }
 
     int rowBytes = ((w * 24 / 8 + 3) & ~3), pixelBytes = rowBytes * h;
@@ -3780,34 +3794,8 @@ static std::string g_virtualStagePath;
 // Defined below, next to the details.txt parser they belong to.
 static bool ReadCategoryDetails(const std::string& mode, const std::string& category,
                                 std::string& categoryText, std::string& subText);
-static std::string readSmallTextFile(const std::string& path);
-static void writeSmallTextFile(const std::string& path, const std::string& text);
 
-static void GenerateCategoryAssetsForMode(const std::string& mode) {
-    // Nothing is written any more. The wheel tab and the category sprite are built in RAM on the
-    // request that asks for them (BuildCategoryAbmInMemory) and served straight through the file
-    // hooks, so no .bmp/.abm/.label ever lands in CustomCache for these.
-    (void)mode;
-}
 
-// Read a category's details.txt (any song folder in it carries one) -> CATEGORY / SUBTEXT lines.
-// Returns false if no details.txt found. Values are raw UTF-8 (kept for CJK/special chars).
-// Small text sidecars: used to record what a generated label was rendered from, so the cached
-// artwork is rebuilt when details.txt changes instead of being served stale forever.
-static std::string readSmallTextFile(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return std::string();
-    std::string out; char buf[512]; size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
-    fclose(f);
-    return out;
-}
-static void writeSmallTextFile(const std::string& path, const std::string& text) {
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return;
-    if (!text.empty()) fwrite(text.data(), 1, text.size(), f);
-    fclose(f);
-}
 
 static bool ReadCategoryDetails(const std::string& mode, const std::string& category,
                                 std::string& categoryText, std::string& subText) {
@@ -3839,15 +3827,6 @@ static bool ReadCategoryDetails(const std::string& mode, const std::string& cate
         return !categoryText.empty() || !subText.empty();
     }
     return false;
-}
-
-// One Version_NN.abm per custom category from its details.txt, into the mode's _versions cache dir.
-// NN = 19 + categoryIndex (native versions are 0..18). The inject writes each custom song's version
-// field to its category's NN, and the FS-hook redirects System\SongSelect\...\Version_NN.abm (NN>18)
-// here. Index order MUST match GetCustomBmsCategoriesForMode (same order the inject/wheel uses).
-static void GenerateVersionSplashForMode(const std::string& mode) {
-    // Same: the label under the song title is generated in RAM when requested.
-    (void)mode;
 }
 
 static void WriteVirtualStageIniForMode(const std::string& mode) {
@@ -4299,8 +4278,6 @@ void ScanBMSData() {
         }
         for (const auto& m : modes) {
             if (!g_directBmsEnabled) WriteVirtualStageIniForMode(m);
-            GenerateCategoryAssetsForMode(m);
-            GenerateVersionSplashForMode(m);
         }
     }
     SaveIdMap(); // persist stable ids so the cache survives the next scan / folder additions
