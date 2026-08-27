@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <cstdio>
+#include <map>
 #include <cstdarg>
 #include "config.h"
 #include "logger.h"
@@ -417,8 +418,31 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
     std::vector<std::string> cats;
     std::string categoryMode = GetActiveMode();
     if (categoryMode.empty()) categoryMode = "5keyOnly";
-    if (lowerPath.find("category_") != std::string::npos || lowerPath.find("version_") != std::string::npos)
+    if (lowerPath.find("category_") != std::string::npos || lowerPath.find("categorybig_") != std::string::npos ||
+        lowerPath.find("version_") != std::string::npos)
         cats = GetCustomBmsCategoriesForMode(categoryMode);
+    // categorybig_NN carries the full details.txt name for the LARGE centre label; category_NN keeps
+    // the short folder name for the tab row. Native Sortimage ships neither for slots 48+, so this
+    // redirect is load-bearing exactly like the category_NN one above it.
+    if (lowerPath.find("categorybig_") != std::string::npos) {
+        for (size_t i = 0; i < cats.size(); ++i) {
+            char abm[40] = {}, bmp[40] = {};
+            wsprintfA(abm, "categorybig_%02d.abm", 48 + (int)i);
+            wsprintfA(bmp, "categorybig_%02d.bmp", 48 + (int)i);
+            std::string req = lowerPath.find(LowerAscii(abm)) != std::string::npos ? abm :
+                              (lowerPath.find(LowerAscii(bmp)) != std::string::npos ? bmp : "");
+            if (req.empty()) continue;
+            std::string out = JoinPath(JoinPath(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot),
+                                       categoryMode), "_categories"), req);
+            if (LocalFileExists(out)) {
+                static int s_bigLogged = 0;
+                if (s_bigLogged < 4) { ++s_bigLogged;
+                    LogLine("[category] BIG label requested slot=%d name='%s' -> '%s'",
+                            47 + (int)i, cats[i].c_str(), out.c_str()); }
+                return out;
+            }
+        }
+    }
     if (lowerPath.find("category_") != std::string::npos) {
         for (size_t i = 0; i < cats.size(); ++i) {
             char abm[32] = {}, bmp[32] = {};
@@ -1354,10 +1378,168 @@ static void EnsureQuartzHook() {
     LogLine("[bgpool] quartz.dll CreateFileW hook=%d", ok ? 1 : 0);
 }
 
+// ---------------------------------------------------------------------------------------------
+// In-memory assets. The ABM loader is plain Win32: CreateFileA, then GetFileSize / ReadFile /
+// CloseHandle on the returned handle (decompiled, sub_413180 calls GetFileSize(this[1],0) and
+// sub_413120 calls ReadFile(this[1],...)). So a category sprite never has to exist as a file --
+// the DLL renders it, hands back a handle of its own, and answers those calls out of RAM.
+//
+// The handle is a real kernel object (an unsignalled event) rather than an invented value: unique,
+// safe to pass around, and CloseHandle disposes of it normally if code we do not hook touches it.
+struct VirtualAsset { std::vector<unsigned char> data; size_t pos; };
+static std::map<HANDLE, VirtualAsset> g_virtualFiles;
+static CRITICAL_SECTION g_virtualLock;
+static bool g_virtualLockReady = false;
+
+static void EnsureVirtualLock() {
+    if (g_virtualLockReady) return;
+    InitializeCriticalSection(&g_virtualLock);
+    g_virtualLockReady = true;
+}
+
+// Recognise the three sprites we own and report which one was asked for. Returns the category
+// index, or -1 when the path is not ours. Longest prefix first: "category_" also matches inside
+// "categorybig_".
+static int VirtualAssetKind(const std::string& lowerPath, size_t catCount, int& kindOut) {
+    struct Entry { const char* prefix; int kind; int base; };
+    static const Entry kinds[] = {
+        { "categorybig_", kCatAbmOverlay, 48 },
+        { "category_",    kCatAbmTab,     48 },
+        { "version_",     kCatAbmLabel,   19 },
+        // The two-line overlay. Native sortstyle art is 256x64 24bpp (verified against a decoded
+        // sortstyle_00.bmp: 49206 bytes, biWidth 256, biHeight 64). The numbering the game uses for
+        // custom categories is not known yet, so anything at or past the 30 native entries is
+        // treated as ours and logged.
+        { "sortstyle_",   kCatAbmSort,    30 },
+    };
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); ++i) {
+        size_t at = lowerPath.find(kinds[i].prefix);
+        if (at == std::string::npos) continue;
+        int nn = atoi(lowerPath.c_str() + at + strlen(kinds[i].prefix));
+        int idx = nn - kinds[i].base;
+        if (idx < 0 || (size_t)idx >= catCount) return -1;
+        kindOut = kinds[i].kind;
+        return idx;
+    }
+    return -1;
+}
+
+static HANDLE OpenVirtualAsset(const std::string& mode, size_t index, int kind) {
+    std::vector<unsigned char> bytes;
+    if (!BuildCategoryAbmInMemory(mode, index, kind, bytes) || bytes.empty())
+        return INVALID_HANDLE_VALUE;
+    HANDLE h = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!h) return INVALID_HANDLE_VALUE;
+    EnsureVirtualLock();
+    EnterCriticalSection(&g_virtualLock);
+    VirtualAsset& v = g_virtualFiles[h];
+    v.data.swap(bytes);
+    v.pos = 0;
+    LeaveCriticalSection(&g_virtualLock);
+    return h;
+}
+
+typedef DWORD (WINAPI *GetFileSize_t)(HANDLE, LPDWORD);
+typedef BOOL  (WINAPI *ReadFile_t)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+typedef BOOL  (WINAPI *CloseHandle_t)(HANDLE);
+typedef DWORD (WINAPI *SetFilePointer_t)(HANDLE, LONG, PLONG, DWORD);
+static GetFileSize_t RealGetFileSize = nullptr;
+static ReadFile_t RealReadFile = nullptr;
+static CloseHandle_t RealCloseHandle = nullptr;
+static SetFilePointer_t RealSetFilePointer = nullptr;
+
+static VirtualAsset* FindVirtualLocked(HANDLE h) {
+    std::map<HANDLE, VirtualAsset>::iterator it = g_virtualFiles.find(h);
+    return it == g_virtualFiles.end() ? nullptr : &it->second;
+}
+
+static DWORD WINAPI HookGetFileSize(HANDLE h, LPDWORD hi) {
+    if (g_virtualLockReady) {
+        EnterCriticalSection(&g_virtualLock);
+        VirtualAsset* v = FindVirtualLocked(h);
+        DWORD sz = v ? (DWORD)v->data.size() : 0;
+        bool ours = v != nullptr;
+        LeaveCriticalSection(&g_virtualLock);
+        if (ours) { if (hi) *hi = 0; return sz; }
+    }
+    return RealGetFileSize ? RealGetFileSize(h, hi) : GetFileSize(h, hi);
+}
+
+static BOOL WINAPI HookReadFile(HANDLE h, LPVOID buf, DWORD want, LPDWORD got, LPOVERLAPPED ov) {
+    if (g_virtualLockReady) {
+        EnterCriticalSection(&g_virtualLock);
+        VirtualAsset* v = FindVirtualLocked(h);
+        bool ours = v != nullptr;
+        if (ours) {
+            size_t left = v->data.size() > v->pos ? v->data.size() - v->pos : 0;
+            DWORD n = (DWORD)(want < left ? want : left);
+            if (n && buf) memcpy(buf, v->data.data() + v->pos, n);
+            v->pos += n;
+            if (got) *got = n;
+        }
+        LeaveCriticalSection(&g_virtualLock);
+        if (ours) return TRUE;
+    }
+    return RealReadFile ? RealReadFile(h, buf, want, got, ov) : ReadFile(h, buf, want, got, ov);
+}
+
+static DWORD WINAPI HookSetFilePointer(HANDLE h, LONG lo, PLONG hi, DWORD method) {
+    if (g_virtualLockReady) {
+        EnterCriticalSection(&g_virtualLock);
+        VirtualAsset* v = FindVirtualLocked(h);
+        bool ours = v != nullptr;
+        DWORD out = 0;
+        if (ours) {
+            long long base = method == FILE_CURRENT ? (long long)v->pos
+                           : method == FILE_END     ? (long long)v->data.size() : 0;
+            long long np = base + lo;
+            if (np < 0) np = 0;
+            if (np > (long long)v->data.size()) np = (long long)v->data.size();
+            v->pos = (size_t)np;
+            out = (DWORD)np;
+        }
+        LeaveCriticalSection(&g_virtualLock);
+        if (ours) { if (hi) *hi = 0; return out; }
+    }
+    return RealSetFilePointer ? RealSetFilePointer(h, lo, hi, method) : SetFilePointer(h, lo, hi, method);
+}
+
+static BOOL WINAPI HookCloseHandle(HANDLE h) {
+    if (g_virtualLockReady) {
+        EnterCriticalSection(&g_virtualLock);
+        std::map<HANDLE, VirtualAsset>::iterator it = g_virtualFiles.find(h);
+        if (it != g_virtualFiles.end()) g_virtualFiles.erase(it);
+        LeaveCriticalSection(&g_virtualLock);
+    }
+    return RealCloseHandle ? RealCloseHandle(h) : CloseHandle(h);
+}
+// ---------------------------------------------------------------------------------------------
+
 static HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD creation, DWORD flags, HANDLE templ) {
     if (!DirectBmsEnabled()) EnsureQuartzHook();
     DetectActiveModeFromPath(name, "CreateFileA");
     MaybeArmTracerOnCredits(name);
+    // Our own sprites never reach the filesystem: build the .abm in RAM and answer with a handle
+    // the read hooks know how to serve.
+    if (name && (creation == OPEN_EXISTING || creation == OPEN_ALWAYS)) {
+        std::string lower = LowerAscii(name);
+        if (lower.find("songselect") != std::string::npos) {
+            std::string mode = GetActiveMode();
+            if (mode.empty()) mode = "5keyOnly";
+            std::vector<std::string> cats = GetCustomBmsCategoriesForMode(mode);
+            int kind = kCatAbmTab;
+            int idx = cats.empty() ? -1 : VirtualAssetKind(lower, cats.size(), kind);
+            if (idx >= 0) {
+                HANDLE vh = OpenVirtualAsset(mode, (size_t)idx, kind);
+                if (vh != INVALID_HANDLE_VALUE) {
+                    static int s_logged = 0;
+                    if (s_logged < 12) { ++s_logged;
+                        LogLine("[asset] served from memory: '%s' cat='%s' kind=%d", name, cats[idx].c_str(), kind); }
+                    return vh;
+                }
+            }
+        }
+    }
     std::string redirected = MaybeRedirectCustomPath(name);
     LPCSTR finalName = redirected.empty() ? name : redirected.c_str();
     if (Config().traceFileApi && finalName) LogLine("[file] CreateFileA '%s' access=0x%08lx creation=%lu", finalName, access, creation);
@@ -1393,6 +1575,12 @@ static void InstallFileHooks() {
     bool c = HookIAT("KERNEL32.dll", "FindNextFileA", reinterpret_cast<void*>(HookFindNextFileA), reinterpret_cast<void**>(&RealFindNextFileA));
     bool d = HookIAT("KERNEL32.dll", "SetCurrentDirectoryA", reinterpret_cast<void*>(HookSetCurrentDirectoryA), reinterpret_cast<void**>(&RealSetCurrentDirectoryA));
     LogLine("[file] IAT hooks CreateFile=%d FindFirst=%d FindNext=%d SetCwd=%d realCreate=%p realSetCwd=%p", a?1:0, b?1:0, c?1:0, d?1:0, RealCreateFileA, RealSetCurrentDirectoryA);
+    bool g1 = HookIAT("KERNEL32.dll", "GetFileSize", reinterpret_cast<void*>(HookGetFileSize), reinterpret_cast<void**>(&RealGetFileSize));
+    bool g2 = HookIAT("KERNEL32.dll", "ReadFile", reinterpret_cast<void*>(HookReadFile), reinterpret_cast<void**>(&RealReadFile));
+    bool g3 = HookIAT("KERNEL32.dll", "CloseHandle", reinterpret_cast<void*>(HookCloseHandle), reinterpret_cast<void**>(&RealCloseHandle));
+    bool g4 = HookIAT("KERNEL32.dll", "SetFilePointer", reinterpret_cast<void*>(HookSetFilePointer), reinterpret_cast<void**>(&RealSetFilePointer));
+    LogLine("[asset] in-memory hooks GetFileSize=%d ReadFile=%d CloseHandle=%d SetFilePointer=%d",
+            g1?1:0, g2?1:0, g3?1:0, g4?1:0);
     bool ep = HookIAT("KERNEL32.dll", "ExitProcess", reinterpret_cast<void*>(HookExitProcess), reinterpret_cast<void**>(&RealExitProcess));
     bool tp = HookIAT("KERNEL32.dll", "TerminateProcess", reinterpret_cast<void*>(HookTerminateProcess), reinterpret_cast<void**>(&RealTerminateProcess));
     // Inline-hook kernel32!ExitProcess too: the game's CRT calls it NOT via the exe IAT, so the IAT

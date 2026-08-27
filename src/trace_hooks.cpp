@@ -72,6 +72,102 @@ static uint32_t g_categoryTextures[127] = {};
 static unsigned char g_categoryBaseOriginal[2][6] = {};
 static bool g_categoryBaseInstalled = false;
 static uint32_t g_customCategoryCount = 0;
+
+// Version-label array relocation (details at InstallVersionArrayRelocation below).
+static const uint32_t kVerArrayOrig  = 0xBFFC0;   // 196592 * 4
+static const uint32_t kVerArrayReloc = 0x111000;  // clear of 0x110000/0x110800 (508 bytes each)
+static const uint32_t kVerNativeCount = 19;
+// Array A -- system/SongSelect/Version/ -- is the one behind the label under the song title:
+//     3A104  mov eax,[esi+edx*4+0xBFF74]   ; A lookup
+//     3A10D  lea edi,[esi+0xBE8D8]         ; its animation object, slot 1
+// (B at 0xBFFC0 drives a different object at +0xBEAF4 slot 2.) Single read site, so one patch.
+static const uint32_t kVerAOrig  = 0xBFF74;
+static const uint32_t kVerAReloc = 0x112000;   // clear of B at 0x111000 (43 entries = 172 bytes)
+static CategoryMemoryEdit g_verAEdits[] = {
+    {0x3A107, kVerAOrig, kVerAReloc, 0, 4, false},
+};
+static bool g_verARelocated = false;
+
+static bool InstallVersionArrayARelocation() {
+    for (const auto& e : g_verAEdits)
+        if (memcmp(Rva(e.rva), &e.expected, e.length) != 0) {
+            LogLine("[version] A reloc ABORTED: rva=0x%05lx not the expected base", (unsigned long)e.rva);
+            return false;
+        }
+    for (auto& e : g_verAEdits) {
+        memcpy(&e.original, Rva(e.rva), e.length);
+        if (!WriteMemory(Rva(e.rva), &e.replacement, e.length)) return false;
+        e.installed = true;
+    }
+    g_verARelocated = true;
+    LogLine("[version] array A relocated 0x%lx -> 0x%lx", (unsigned long)kVerAOrig, (unsigned long)kVerAReloc);
+    return true;
+}
+
+static void RemoveVersionArrayARelocation() {
+    for (auto& e : g_verAEdits) {
+        if (!e.installed) continue;
+        WriteMemory(Rva(e.rva), &e.original, e.length);
+        e.installed = false;
+    }
+    g_verARelocated = false;
+}
+static bool g_versionRelocated = false;
+
+// The runtime updater refuses to touch the version label outside a category range:
+//     mov eax,[esi+0xBC57C]   ; active category index (same value passed to FUN_00435070 as param2)
+//     cmp eax,2   / jl  skip
+//     cmp eax,18  / jg  skip  <- imm8 patched below
+//     ... sub_402910(anim, 2, 0, this[ this[221*this[33]+295] + 196592 ])
+// Custom categories are 47+, so the assignment never ran for them and the animation object simply
+// kept whatever texture it was last handed -- a native label, which is exactly what showed over
+// custom songs. Raising the ceiling lets the update fire for our slots too.
+// Two sites, both immediately ahead of the relocated read; a third copy at 0x33322 feeds a
+// different array and is deliberately left alone.
+// 0x33322 is the one that matters: it sits in the same function as the master reads above and the
+// relocated array read at 0x33367. The other two belong to a separate screen that shows the same
+// label; widening them too keeps the two paths consistent.
+static CategoryMemoryEdit g_verGuardEdits[] = {
+    {0x33322, 18, 127, 0, 1, false},
+    // 0x435DC picks WHICH animation object shows the category, and the ranges are not one gate but
+    // two branches:
+    //     cat 2..18            -> lea ecx,[esi+0xBEAF4]   Version_View, the one-line label
+    //     cat 0..1 or 19..46   -> lea ecx,[esi+0xBED10]   Sortstyle_View, the two-line sprite
+    //     anything else        -> neither branch, nothing is shown
+    // Custom categories are 47+, so they fell off the end. Widening the FIRST range (as an earlier
+    // attempt did) routed them to the one-line object; the two-line overlay is the second branch,
+    // so the ceiling that has to move is the 46 at 0x43604 -- and the 18 stays as it was.
+    {0x43604, 46, 127, 0, 1, false},
+    {0x4479B, 18, 127, 0, 1, false},
+    {0x44937, 18, 127, 0, 1, false},
+};
+
+static bool InstallVersionGuardWiden() {
+    for (const auto& e : g_verGuardEdits) {
+        if (memcmp(Rva(e.rva), &e.expected, e.length) != 0) {
+            LogLine("[version] guard widen ABORTED: rva=0x%05lx is not the expected imm8 %lu",
+                    (unsigned long)e.rva, (unsigned long)e.expected);
+            return false;
+        }
+    }
+    for (auto& e : g_verGuardEdits) {
+        memcpy(&e.original, Rva(e.rva), e.length);
+        if (!WriteMemory(Rva(e.rva), &e.replacement, e.length)) return false;
+        e.installed = true;
+    }
+    LogLine("[version] label-update category range widened 2..18 -> 2..127 (%u sites)",
+            (unsigned)(sizeof(g_verGuardEdits)/sizeof(g_verGuardEdits[0])));
+    return true;
+}
+
+static void RemoveVersionGuardWiden() {
+    for (auto& e : g_verGuardEdits) {
+        if (!e.installed) continue;
+        WriteMemory(Rva(e.rva), &e.original, e.length);
+        e.installed = false;
+    }
+}
+
 static bool g_capacityPatched = false;     // master-array cap raised + relocated (+0xEFDF4)
 static uint32_t g_songCapacity = 436;      // raised by InstallSongCapacityPatches
 
@@ -648,6 +744,36 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     // per-song entry builder exists.
     unsigned char nativeTemplate[0x374];
     memcpy(nativeTemplate, reinterpret_cast<void*>(masterBase), 0x374);
+    // DIAGNOSTIC (one-shot): every custom entry is a byte-for-byte clone of master[0] with only id,
+    // levels, version and the songname pointer overridden -- so it inherits every OTHER field of that
+    // native song. The flag-driven native categories (HOT / NEW) do not use the id tables at all, which
+    // is why custom songs appear inside them while the category counts look correct. Log the offsets
+    // that actually differ between native records: the membership flag has to be one of them.
+    {
+        static bool s_entryDiffDumped = false;
+        if (!s_entryDiffDumped && master >= 6 &&
+            CanReadPtr(reinterpret_cast<void*>(masterBase), 6 * kEntrySize)) {
+            s_entryDiffDumped = true;
+            const unsigned char* a = reinterpret_cast<const unsigned char*>(masterBase);
+            for (uint32_t j = 1; j < 6; ++j) {
+                const unsigned char* b = a + j * kEntrySize;
+                std::string diff;
+                char buf[32];
+                for (uint32_t off = 0; off < 0x374; ++off) {
+                    if (a[off] == b[off]) continue;
+                    if (off >= 0x10C && off < 0x12C) continue;      // the id string itself
+                    if (off >= 0x214 && off < 0x244) continue;      // level floats
+                    if (diff.size() > 600) { diff += " ..."; break; }
+                    snprintf(buf, sizeof(buf), " %03lX:%02X/%02X",
+                             (unsigned long)off, (unsigned)a[off], (unsigned)b[off]);
+                    diff += buf;
+                }
+                LogLine("[entrydiff] master[0]='%.15s' vs master[%lu]='%.15s':%s",
+                        reinterpret_cast<const char*>(a + 0x10C), (unsigned long)j,
+                        reinterpret_cast<const char*>(b + 0x10C), diff.c_str());
+            }
+        }
+    }
     // Custom SongName textures are intentionally NOT loaded here. FUN_00435070 tells us which
     // category is about to be filtered, so LoadCustomCategorySongnames loads only that category.
     // This removes thousands of synchronous texture loads from SongSelect startup.
@@ -701,14 +827,20 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     // loads our custom Version_19..NN.abm too (else those texture slots are null → blank splash). The
     // limit is a single byte at RVA 0x37817; clamp to 255 (it's compared as a byte). One-shot.
     {
-        static bool s_verLoopPatched = false;
-        if (!s_verLoopPatched) {
-            uint32_t total = 19 + numCats;
-            if (total > 255) total = 255;
-            uint8_t b = (uint8_t)total;
-            if (WriteMemory(Rva(0x37817), &b, 1)) { s_verLoopPatched = true;
-                LogLine("[version] load-loop limit 19 -> %u (numCats=%u)", total, numCats); }
-        }
+        // DISABLED -- this patch corrupts two other arrays. From the decompiled loader, ONE loop
+        // fills TWO adjacent arrays per iteration, and a third array follows immediately:
+        //     A  System\SongSelect\Version\Version_NN          dword 196573..196591  (19)
+        //     B  System\SongSelect\V_View\version\Version_NN   dword 196592..196610  (19)
+        //        System\SongSelect\V_View\sortstyle\...        dword 196611..196640  (30)
+        // Raising the bound to 19+numCats makes A run to 196615 (over all of B and into sortstyle)
+        // and B run to 196634 (over most of sortstyle). The label the game actually draws is read
+        // from B:  this[ this[221*this[33] + 295] + 196592 ]  -- so extending the loop destroyed the
+        // very array the version label is read from, which is why custom labels appeared over native
+        // categories and the sortstyle art misbehaved.
+        // Custom slots need array B RELOCATED to our own buffer with the reader's 196592 base
+        // repointed, the same way the category id tables were relocated. Until then, leave the
+        // native loop alone: a missing custom slot is a blank label, corrupting B is not.
+        (void)numCats;
     }
     // If master[] can hold ALL custom songs (the normal case — newCap is sized to fit them), give
     // each category its full per-category limit (436 stride) so big folders aren't truncated. Only
@@ -810,6 +942,32 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
         LogLine("[texpool] size=%luMB base=%08lx used=%luMB",
                 (unsigned long)(pSize >> 20), (unsigned long)pBase,
                 (unsigned long)(((pBase && pBump >= pBase) ? (pBump - pBase) : 0) >> 20));
+    }
+    // Definitive answer to "are custom songs leaking into the native categories?". Membership is the
+    // id list, so walk the NATIVE categories (0..46) and count entries whose id starts with "bms".
+    // Anything other than zero means the inject is writing outside its own slots.
+    {
+        std::string leaks;
+        uint32_t leakTotal = 0;
+        for (uint32_t c = 0; c < 47; ++c) {
+            uint32_t cnt = SafeRead32(CatCountTable() + c * 4);
+            if (!cnt || cnt > kCatNameStride) continue;
+            uint32_t hits = 0;
+            for (uint32_t k = 0; k < cnt; ++k) {
+                uint32_t addr = CatNameTable() + (k + c * kCatNameStride) * kCatNameSize;
+                if (!CanReadPtr(reinterpret_cast<void*>(addr), 4)) break;
+                const char* id = reinterpret_cast<const char*>(addr);
+                if (id[0] == 'b' && id[1] == 'm' && id[2] == 's') ++hits;
+            }
+            if (hits) {
+                char buf[48];
+                snprintf(buf, sizeof(buf), " cat=%lu:%lu/%lu", (unsigned long)c,
+                         (unsigned long)hits, (unsigned long)cnt);
+                leaks += buf; leakTotal += hits;
+            }
+        }
+        LogLine("[catleak] custom ids inside native categories 0..46: %lu%s",
+                (unsigned long)leakTotal, leakTotal ? leaks.c_str() : " (none - native categories are clean)");
     }
     // DIAG: the filter FUN_00435070 builds a 436-entry STACK array; a category whose count exceeds
     // that overruns it → /GS terminates the process with no catchable exception (the unexplained
@@ -949,8 +1107,80 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
                     char fn[80];
                     snprintf(fn, sizeof(fn), "System\\SongSelect\\Sortimage\\category_%02d.bmp", catNum);
                     uint32_t slot = 47 + c;
+                    // Small array = the tab row (short folder name). Big array = the large centre
+                    // label, which gets its own asset with the full details.txt name.
                     loadTex(gfxCtx, fn, reinterpret_cast<void*>(r->ecx + g_catTexSmallBase + slot * 4), nullptr);
-                    loadTex(gfxCtx, fn, reinterpret_cast<void*>(r->ecx + g_catTexBigBase + slot * 4), nullptr);
+                    char bigFn[96] = {};
+                    snprintf(bigFn, sizeof(bigFn), "System\\SongSelect\\Sortimage\\categorybig_%02d.bmp", catNum);
+                    loadTex(gfxCtx, bigFn, reinterpret_cast<void*>(r->ecx + g_catTexBigBase + slot * 4), nullptr);
+                }
+                // Version labels. The natives are copied rather than reloaded: the game's own loader
+                // already filled them at the original base, and this array is only read, never
+                // written, by the renderer. Done here and not at patch time because those textures
+                // do not exist until SongSelect has run its loader.
+                static uint32_t s_verFilledFor = 0;
+                if (g_versionRelocated &&
+                    CanReadPtr(reinterpret_cast<void*>(r->ecx + kVerArrayOrig), kVerNativeCount * 4)) {
+                    // The native half is re-copied on EVERY pass, on purpose. Copying it once was a
+                    // bug: on the first filter call the game's own loader had not filled the source
+                    // yet, so 19 zeros were copied and every native song lost its label -- while the
+                    // custom slots, loaded here directly, looked fine. Re-copying is 76 bytes and
+                    // self-heals as soon as the loader has run.
+                    SafeWriteBytes(r->ecx + kVerArrayReloc,
+                                   reinterpret_cast<void*>(r->ecx + kVerArrayOrig), kVerNativeCount * 4);
+                    uint32_t nativeOk = 0;
+                    for (uint32_t v = 0; v < kVerNativeCount; ++v)
+                        if (SafeRead32(r->ecx + kVerArrayReloc + v * 4)) ++nativeOk;
+                    // Array A gets the same treatment: natives re-copied every pass, customs once.
+                    if (g_verARelocated &&
+                        CanReadPtr(reinterpret_cast<void*>(r->ecx + kVerAOrig), kVerNativeCount * 4))
+                        SafeWriteBytes(r->ecx + kVerAReloc,
+                                       reinterpret_cast<void*>(r->ecx + kVerAOrig), kVerNativeCount * 4);
+                    // The custom textures DO load once: the pool is a bump allocator that never
+                    // frees, so reloading them per pass burned ~770KB each time.
+                    if (s_verFilledFor == r->ecx) {
+                        static uint32_t s_lastNativeOk = 0xffffffffu;
+                        if (nativeOk != s_lastNativeOk) {
+                            s_lastNativeOk = nativeOk;
+                            LogLine("[version] native labels present: %lu/%u", (unsigned long)nativeOk,
+                                    (unsigned)kVerNativeCount);
+                        }
+                    }
+                    // Re-entering SongSelect from the menu can reuse the same object address while
+                    // the texture pool has been reset underneath it -- our slots come back null and
+                    // the labels vanish, which is exactly the "it worked, I went to the menu, came
+                    // back and the text was gone" case. So the refill condition is not just "new
+                    // object" but also "our first custom slot lost its texture".
+                    bool slotsLost = g_customCategoryCount &&
+                                     !SafeRead32(r->ecx + kVerAReloc + kVerNativeCount * 4);
+                    if (s_verFilledFor != r->ecx || slotsLost) {
+                    if (slotsLost && s_verFilledFor == r->ecx)
+                        LogLine("[version] custom slots were reset (menu round-trip); reloading");
+                    s_verFilledFor = r->ecx;
+                    unsigned long ok = 0;
+                    for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
+                        uint32_t slotIdx = kVerNativeCount + c;
+                        char vf[112] = {};
+                        snprintf(vf, sizeof(vf),
+                                 "System\\SongSelect\\V_View\\version\\Version_%02lu.bmp",
+                                 (unsigned long)slotIdx);
+                        loadTex(gfxCtx, vf,
+                                reinterpret_cast<void*>(r->ecx + kVerArrayReloc + slotIdx * 4), nullptr);
+                        // The visible label lives in array A, so load it there too.
+                        if (g_verARelocated) {
+                            char af[112] = {};
+                            snprintf(af, sizeof(af),
+                                     "System\\SongSelect\\Version\\Version_%02lu.bmp",
+                                     (unsigned long)slotIdx);
+                            loadTex(gfxCtx, af,
+                                    reinterpret_cast<void*>(r->ecx + kVerAReloc + slotIdx * 4), nullptr);
+                        }
+                        if (SafeRead32(r->ecx + kVerAReloc + slotIdx * 4)) ++ok;
+                    }
+                    LogLine("[version] relocated array filled: %lu/%u native present + %lu/%lu custom loaded",
+                            (unsigned long)nativeOk, (unsigned)kVerNativeCount, ok,
+                            (unsigned long)g_customCategoryCount);
+                    }
                 }
                 LogLine("[category] loaded %lu wheel icons into relocated slots 47.. small=%08lx big=%08lx",
                         (unsigned long)g_customCategoryCount,
@@ -986,6 +1216,83 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
                 *reinterpret_cast<uint32_t*>(functionEsp + 20) = 0;
                 static bool logged = false;
                 if (!logged) { logged = true; LogLine("[rank] custom Top-5 suppressed id='%.15s' selected=%lu", id, (unsigned long)selected); }
+            }
+        }
+        // The version index the renderer reads for the SELECTED entry:
+        //     this[ 221*this[33] + 295 ]  == dword 220 (0x370) of the visible entry.
+        // Custom songs are written 19+categoryIndex there. If this reads that, the index travels
+        // correctly and any missing label is a texture/animation problem; if it reads 0 or garbage,
+        // the field is not surviving the filter's copy into the visible array.
+        if (selected < visible && selected < 436) {
+            static uint32_t s_lastVerSig = 0;
+            static unsigned s_verDumps = 0;
+            uint32_t verAddr = regs->ecx + (221u * selected + 295u) * 4u;
+            if (s_verDumps < 40 && CanReadPtr(reinterpret_cast<void*>(verAddr), 4)) {
+                uint32_t verIdx = SafeRead32(verAddr);
+                const char* sid = reinterpret_cast<const char*>(regs->ecx + 0x238 + selected * 0x374);
+                uint32_t sig = verIdx * 7919u + (unsigned char)sid[0] * 31u + (unsigned char)sid[3];
+                if (sig != s_lastVerSig) {
+                    s_lastVerSig = sig; ++s_verDumps;
+                    uint32_t tex = 0;
+                    if (verIdx < 64) tex = SafeRead32(regs->ecx + kVerArrayReloc + verIdx * 4);
+                    // Everything the runtime updater tests before it assigns the texture:
+                    //   cat   = this[192863]      active category (must be inside the widened range)
+                    //   selfx = this[33]          the index IT uses -- not the stack arg we hooked
+                    //   vVis  = this[221*sel+295]   version idx from the VISIBLE array (drives the
+                    //                               texture lookup)
+                    //   vMas  = this[221*sel+96651] version idx from MASTER at its ORIGINAL offset --
+                    //                               master is relocated by +0xEFDF4, so this read may
+                    //                               be stale, and it is what the change test compares
+                    //   prev/cur = this[196471]/this[196472]  the "did it change" pair; equal means
+                    //                               the assignment is skipped no matter what else is right
+                    uint32_t selfx = SafeRead32(regs->ecx + 0x84);
+                    uint32_t cat   = SafeRead32(regs->ecx + 192863u * 4u);
+                    // Read the master version field at BOTH offsets. The game's own reads are now
+                    // repointed to the relocated master, so the original is expected to be 0 and
+                    // only the relocated one is meaningful. If vRel holds the right value while
+                    // cur/prev stay 0, the updater function is not running at all -- it writes those
+                    // two unconditionally on entry, before any guard.
+                    uint32_t vMas  = SafeRead32(regs->ecx + (221u * selfx + 96651u) * 4u);
+                    uint32_t vRel  = SafeRead32(regs->ecx + (221u * selfx) * 4u + 0x5E62Cu + 0xEFDF4u);
+                    uint32_t vVis  = SafeRead32(regs->ecx + (221u * selfx + 295u) * 4u);
+                    uint32_t prev  = SafeRead32(regs->ecx + 196471u * 4u);
+                    uint32_t cur   = SafeRead32(regs->ecx + 196472u * 4u);
+                    LogLine("[verread] this[33]=%lu id='%.15s' vVis=%lu vMasOrig=%lu vMasReloc=%lu"
+                            " tex=%08lx | cat=%lu inRange=%d prev=%lu cur=%lu changed=%d",
+                            (unsigned long)selfx, sid, (unsigned long)vVis,
+                            (unsigned long)vMas, (unsigned long)vRel, (unsigned long)tex,
+                            (unsigned long)cat, (cat >= 2 && cat <= 127) ? 1 : 0,
+                            (unsigned long)prev, (unsigned long)cur, (prev != cur) ? 1 : 0);
+                }
+            }
+        }
+        // What the wheel is ACTUALLY displaying right now. The category id tables came back clean,
+        // but ALL reports 436 entries against 430 native songs, so at least one category is not
+        // built from those tables -- and a table-only check cannot clear it. This reads the visible
+        // array the renderer is drawing from (ecx+0x12C, stride 0x374, id at +0x10C == ecx+0x238)
+        // and reports how many of its entries are ours. Logged only when the list changes, and
+        // capped, because this hook runs every frame.
+        {
+            static uint32_t s_lastSig = 0;
+            static unsigned s_dumps = 0;
+            if (visible && visible <= 436 && s_dumps < 40) {
+                const char* first = reinterpret_cast<const char*>(regs->ecx + 0x238);
+                uint32_t sig = visible * 131u;
+                for (int k = 0; k < 12 && first[k]; ++k) sig = sig * 31u + (unsigned char)first[k];
+                if (sig != s_lastSig) {
+                    s_lastSig = sig; ++s_dumps;
+                    uint32_t custom = 0;
+                    std::string sample;
+                    for (uint32_t i = 0; i < visible; ++i) {
+                        const char* e = reinterpret_cast<const char*>(regs->ecx + 0x238 + i * 0x374);
+                        if (!CanReadPtr(const_cast<char*>(e), 4)) break;
+                        if (e[0] == 'b' && e[1] == 'm' && e[2] == 's') ++custom;
+                        if (i < 8) { sample += " "; sample.append(e, strnlen(e, 15)); }
+                    }
+                    LogLine("[visible] entries=%lu custom=%lu native=%lu first8:%s",
+                            (unsigned long)visible, (unsigned long)custom,
+                            (unsigned long)(visible - custom), sample.c_str());
+                }
             }
         }
         return; // called every frame; never trace-spam this renderer
@@ -1172,7 +1479,13 @@ static bool InstallSongCapacityPatches(uint32_t newCap) {
     for (uintptr_t off : {0x3515Bu, 0x375B9u}) ok &= w32(off, 0x5E2BC + REL);
     for (uintptr_t off : {0x35118u, 0x35F80u, 0x360EFu, 0x36198u}) ok &= w32(off, 0x5E3C8 + REL);
     for (uintptr_t off : {0x30F69u, 0x394BAu}) ok &= w32(off, 0x5E2C4 + REL);
-    ok &= w32(0x39447, 0x5E62C + REL);
+    // 0x332DB and 0x33304 are the version-label updater's own reads of the master version field:
+    //     this[196471] = this[221*this[196470] + 96651];   // previous song
+    //     this[196472] = this[221*this[33]      + 96651];   // current song
+    // and the assignment below is gated on those two DIFFERING. Left un-relocated they both read
+    // the vacated original master and returned 0, so "changed" was permanently false and the label
+    // texture was never assigned -- no matter how correct the array, index and guard were.
+    for (uintptr_t off : {0x39447u, 0x332DBu, 0x33304u}) ok &= w32(off, 0x5E62C + REL);
     for (uintptr_t off : {0x3946Du, 0x39301u}) ok &= w32(off, 0x5E4D0 + REL);
     ok &= w32(0x362B2, (uint32_t)(-(int32_t)(0x5E29C + REL)));
     ok &= w32(0x362EF, (uint32_t)(-(int32_t)(0x5E298 + REL)));
@@ -1195,6 +1508,58 @@ static bool InstallSongCapacityPatches(uint32_t newCap) {
     LogLine("[capacity] master array %s newCap=%lu relocation=+0x%lx (was 436)",
             ok ? "RAISED" : "FAILED", (unsigned long)g_songCapacity, (unsigned long)REL);
     return ok;
+}
+
+// Version-label array relocation.
+//
+// From the decompiled loader, ONE loop fills two adjacent arrays and a third follows:
+//     A  System\\SongSelect\\Version\\Version_NN         dword 196573..196591  (19)
+//     B  System\\SongSelect\\V_View\\version\\Version_NN  dword 196592..196610  (19)
+//        System\\SongSelect\\V_View\\sortstyle\\...       dword 196611..196640  (30)
+// The label the game draws comes from B:  this[ this[221*this[33] + 295] + 196592 ].
+// Raising the loop bound to fit custom slots overran B and sortstyle, which is why custom labels
+// appeared over native categories -- so the loop stays at 19 and the READS move instead.
+//
+// The addressing is object-relative ([obj + idx*4 + disp32]), so the new array has to live inside
+// the object: the reloc gap between the original end (~0x103540) and the relocated master[]
+// (0x14E0B0), the same committed region the category texture arrays already use at 0x110000/0x110800.
+// The loader is deliberately NOT repointed: natives keep loading where they always did, and the
+// inject copies those 19 entries across before adding ours at 19+.
+// Read sites only (found by scanning the exe for the disp32; the 0x377B7 lea is the loader).
+static CategoryMemoryEdit g_versionEdits[] = {
+    {0x33367, kVerArrayOrig, kVerArrayReloc, 0, 4, false},
+    {0x37900, kVerArrayOrig, kVerArrayReloc, 0, 4, false},
+    {0x447C0, kVerArrayOrig, kVerArrayReloc, 0, 4, false},
+    {0x4495C, kVerArrayOrig, kVerArrayReloc, 0, 4, false},
+};
+
+static bool InstallVersionArrayRelocation() {
+    for (const auto& e : g_versionEdits) {
+        if (memcmp(Rva(e.rva), &e.expected, e.length) != 0) {
+            LogLine("[version] reloc ABORTED: rva=0x%05lx does not hold the expected base 0x%lx",
+                    (unsigned long)e.rva, (unsigned long)e.expected);
+            return false;
+        }
+    }
+    for (auto& e : g_versionEdits) {
+        memcpy(&e.original, Rva(e.rva), e.length);
+        if (!WriteMemory(Rva(e.rva), &e.replacement, e.length)) return false;
+        e.installed = true;
+    }
+    g_versionRelocated = true;
+    LogLine("[version] label array relocated 0x%lx -> 0x%lx (%u read sites; loader untouched)",
+            (unsigned long)kVerArrayOrig, (unsigned long)kVerArrayReloc,
+            (unsigned)(sizeof(g_versionEdits)/sizeof(g_versionEdits[0])));
+    return true;
+}
+
+static void RemoveVersionArrayRelocation() {
+    for (auto& e : g_versionEdits) {
+        if (!e.installed) continue;
+        WriteMemory(Rva(e.rva), &e.original, e.length);
+        e.installed = false;
+    }
+    g_versionRelocated = false;
 }
 
 static void RemoveCustomCategoryPatches();
@@ -1326,6 +1691,11 @@ void InstallTraceHooks() {
         if (newCap > 60000u)  newCap = 60000u; // 64MB object inflate holds ~70k master entries (LAA=4GB)
         InstallSongCapacityPatches(newCap);
     }
+    if (customCategory && g_capacityPatched) {
+        InstallVersionArrayRelocation();
+        InstallVersionArrayARelocation();
+        InstallVersionGuardWiden();
+    }
     if (customCategory && !InstallCustomCategoryPatches()) {
         LogLine("[category] new category disabled: executable layout mismatch");
         return;
@@ -1353,5 +1723,8 @@ void RemoveTraceHooks() {
         }
     }
     RemoveCustomCategoryPatches();
+    RemoveVersionArrayRelocation();
+    RemoveVersionArrayARelocation();
+    RemoveVersionGuardWiden();
     g_traceInstalled = false;
 }
