@@ -255,7 +255,35 @@ static void RemoveVersionGuardWiden() {
     }
 }
 
-static bool g_capacityPatched = false;     // master-array cap raised + relocated (+0xEFDF4)
+// Bumped whenever the inject rewrites master[], so the filter's id index rebuilds.
+static uint32_t g_masterGen = 0;
+// Published by the filter so a /GS failure report names the category that led into it.
+static uint32_t g_gsLastCat   = 0xFFFFFFFFu;   // set by the filter, for correlation
+static uint32_t g_gsLastCount = 0;
+// master[] relocation delta.
+//
+// It used to be 0xEFDF4, putting the array at obj+0x14E0B0 -- chosen as "just past the original
+// object end (~0x103540)". That end was wrong. The SongSelect object keeps live fields far above
+// it: the decompilation shows accesses up to obj+0x210988, with a dense cluster around
+// obj+0x20C000..0x20E900. Those fields land INSIDE master[] once the array grows past entry ~880:
+//
+//     this+2146528 -> master[880]     this+2150756 -> master[885]
+//     this+2148028 -> master[882]     this+2152376 -> master[887]
+//     this+2148052 -> master[882]     [esi+0x20E894] -> master[891]
+//
+// The game writes those every frame, so song entries in that band had their ids and level floats
+// quietly zeroed. A zeroed level makes the filter skip the entry; a zeroed id makes the disc-art
+// loader sprintf "system\disc\%s.bmp" over an unterminated field, which is what smashed a
+// 260-byte stack buffer and produced the CYT-2.2 crash. With the stock 436 entries master ended at
+// obj+0x1A0DA0, below the cluster, so this only ever appears on a grown library.
+//
+// 0x400000 puts the array at obj+0x400000, about 2 MB clear of the highest field anywhere in the
+// decompilation, and the offsets our own arrays use (0x110000..0x1131FC) sit in a 1 MB hole that
+// no field touches.
+static const uint32_t kMasterOrigBase = 0x5E2BC;
+static const uint32_t kMasterHome     = 0x400000;                        // where master[] now lives
+static const uint32_t kMasterRel      = kMasterHome - kMasterOrigBase;   // 0x3A1D44
+static bool g_capacityPatched = false;     // master-array cap raised + relocated (+kMasterRel)
 static uint32_t g_songCapacity = 436;      // raised by InstallSongCapacityPatches
 
 // Relocated category texture arrays (object-relative). The native arrays are EXACTLY 47
@@ -476,9 +504,9 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     if (kCapacity > 60000u) kCapacity = 60000u; // 64MB object inflate + LAA 4GB; real walls now = the
                                                 // songname pool (~7000 titles), categories (<=80), memory
     uint32_t master = SafeRead32(ecx + 0x80);
-    // master[] base: when the capacity patch relocated the array by +0xEFDF4, the game now
-    // reads/writes master at ecx+0x5e2bc+0xEFDF4, so our inject MUST target the same place.
-    uint32_t masterBase = ecx + 0x5e2bc + (g_capacityPatched ? 0xEFDF4u : 0u);
+    // master[] base: the capacity patch relocated the array by +kMasterRel, and the game now
+    // reads/writes master there, so our inject MUST target the same place.
+    uint32_t masterBase = ecx + kMasterOrigBase + (g_capacityPatched ? kMasterRel : 0u);
     if (master == 0 || master > kCapacity || !CanReadPtr(reinterpret_cast<void*>(masterBase), kEntrySize)) return;
 
     // Idempotency by DATA: the heap reuses ecx across SongSelect recreate, AND this hook
@@ -652,6 +680,10 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     // entry left it 0 → the game's `% [+0x7c]` modulo (fun_43ff00) divided by zero →
     // INT_DIVIDE_BY_ZERO crash (0x440439). The filter manages +0x7c correctly on its own.
     SafeWriteBytes(ecx + 0x80, &slot, 4);
+    // Only a pass that actually wrote entries invalidates the filter's id index. Bumping this on
+    // every entry to the inject would rebuild a 60k-entry index on every category change, which is
+    // precisely the cost the index exists to remove.
+    if (appended) ++g_masterGen;
     LogLine("[category] %s native inject done master=%lu->%lu appended=%lu",
             phase, (unsigned long)master, (unsigned long)slot, (unsigned long)appended);
     size_t lazyIndexed = 0;
@@ -810,12 +842,151 @@ static void DumpSongSelectStructure(uint32_t ecx, uint32_t param2) {
             LogLine("[diag]   %s[%lu] id='%s' NM=%.1f HD=%.1f SHD=%.1f EX=%.1f",
                     tag, (unsigned long)i, id.c_str(), l[0],l[1],l[2],l[3]);
         };
-        uint32_t mbase = 0x5e2bc + (g_capacityPatched ? 0xEFDF4u : 0u); // relocated master
+        uint32_t mbase = kMasterOrigBase + (g_capacityPatched ? kMasterRel : 0u); // relocated master
         levels(ecx + 0x12C + 884u*i, "vis ");
         levels(ecx + mbase + 884u*i, "mstr");
     };
     for (uint32_t i = 0; i < 5 && i < master; ++i) dumpEntry(i);
     for (uint32_t i = (master > 3 ? master - 3 : 0); i < master; ++i) dumpEntry(i);
+}
+
+// Everything that has to happen before a category is filtered: inject the custom songs into
+// master[], preload that category's songname textures, and fill the relocated wheel-icon,
+// version and sortstyle arrays. Extracted from the 0x35070 trace hook so the replacement
+// filter (FilterCategoryImpl) can run the same preparation -- it stands in for the original
+// function, so nothing else is left to do it.
+static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
+    DumpSongSelectStructure(obj, cat);
+    InjectCustomSongsIntoSongSelect(obj, "pre-filter", cat);
+    LoadCustomCategorySongnames(obj, cat);
+    // Wheel category icons: the texture arrays are relocated to the grown object tail
+    // (kCatTexSmallReloc/kCatTexBigReloc), so slots 47.. are safe free memory. The native
+    // loader fills [0..46]; we load OUR category_NN.bmp into [47..] of both arrays via the
+    // game's loader (thiscall, ecx=gfx ctx [0x1b2f054]) — same call as songname. Redirect
+    // serves category_48/49.bmp from our _categories cache. Only when relocated.
+    if (g_customCategoryCount > 0 && g_capacityPatched && g_catTexSmallBase) {
+        typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
+        LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
+        uint32_t gfxCtx = SafeRead32(0x1b2f054);
+        if (gfxCtx) {
+            for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
+                int catNum = 48 + (int)c;             // native uses 01..47, custom start at 48
+                char fn[80];
+                snprintf(fn, sizeof(fn), "System\\SongSelect\\Sortimage\\category_%02d.bmp", catNum);
+                uint32_t slot = 47 + c;
+                // Small array = the tab row (short folder name). Big array = the large centre
+                // label, which gets its own asset with the full details.txt name.
+                loadTex(gfxCtx, fn, reinterpret_cast<void*>(obj + g_catTexSmallBase + slot * 4), nullptr);
+                char bigFn[96] = {};
+                snprintf(bigFn, sizeof(bigFn), "System\\SongSelect\\Sortimage\\categorybig_%02d.bmp", catNum);
+                loadTex(gfxCtx, bigFn, reinterpret_cast<void*>(obj + g_catTexBigBase + slot * 4), nullptr);
+            }
+            // Version labels. The natives are copied rather than reloaded: the game's own loader
+            // already filled them at the original base, and this array is only read, never
+            // written, by the renderer. Done here and not at patch time because those textures
+            // do not exist until SongSelect has run its loader.
+            static uint32_t s_verFilledFor = 0;
+            if (g_versionRelocated &&
+                CanReadPtr(reinterpret_cast<void*>(obj + kVerArrayOrig), kVerNativeCount * 4)) {
+                // The native half is re-copied on EVERY pass, on purpose. Copying it once was a
+                // bug: on the first filter call the game's own loader had not filled the source
+                // yet, so 19 zeros were copied and every native song lost its label -- while the
+                // custom slots, loaded here directly, looked fine. Re-copying is 76 bytes and
+                // self-heals as soon as the loader has run.
+                SafeWriteBytes(obj + kVerArrayReloc,
+                               reinterpret_cast<void*>(obj + kVerArrayOrig), kVerNativeCount * 4);
+                uint32_t nativeOk = 0;
+                for (uint32_t v = 0; v < kVerNativeCount; ++v)
+                    if (SafeRead32(obj + kVerArrayReloc + v * 4)) ++nativeOk;
+                // Array A gets the same treatment: natives re-copied every pass, customs once.
+                if (g_verARelocated &&
+                    CanReadPtr(reinterpret_cast<void*>(obj + kVerAOrig), kVerNativeCount * 4))
+                    SafeWriteBytes(obj + kVerAReloc,
+                                   reinterpret_cast<void*>(obj + kVerAOrig), kVerNativeCount * 4);
+                // The custom textures DO load once: the pool is a bump allocator that never
+                // frees, so reloading them per pass burned ~770KB each time.
+                if (s_verFilledFor == obj) {
+                    static uint32_t s_lastNativeOk = 0xffffffffu;
+                    if (nativeOk != s_lastNativeOk) {
+                        s_lastNativeOk = nativeOk;
+                        LogLine("[version] native labels present: %lu/%u", (unsigned long)nativeOk,
+                                (unsigned)kVerNativeCount);
+                    }
+                }
+                // Re-entering SongSelect from the menu can reuse the same object address while
+                // the texture pool has been reset underneath it -- our slots come back null and
+                // the labels vanish, which is exactly the "it worked, I went to the menu, came
+                // back and the text was gone" case. So the refill condition is not just "new
+                // object" but also "our first custom slot lost its texture".
+                bool slotsLost = g_customCategoryCount &&
+                                 !SafeRead32(obj + kVerAReloc + kVerNativeCount * 4);
+                if (s_verFilledFor != obj || slotsLost) {
+                if (slotsLost && s_verFilledFor == obj)
+                    LogLine("[version] custom slots were reset (menu round-trip); reloading");
+                s_verFilledFor = obj;
+                unsigned long ok = 0;
+                for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
+                    uint32_t slotIdx = kVerNativeCount + c;
+                    char vf[112] = {};
+                    snprintf(vf, sizeof(vf),
+                             "System\\SongSelect\\V_View\\version\\Version_%02lu.bmp",
+                             (unsigned long)slotIdx);
+                    loadTex(gfxCtx, vf,
+                            reinterpret_cast<void*>(obj + kVerArrayReloc + slotIdx * 4), nullptr);
+                    // The visible label lives in array A, so load it there too.
+                    if (g_verARelocated) {
+                        char af[112] = {};
+                        snprintf(af, sizeof(af),
+                                 "System\\SongSelect\\Version\\Version_%02lu.bmp",
+                                 (unsigned long)slotIdx);
+                        loadTex(gfxCtx, af,
+                                reinterpret_cast<void*>(obj + kVerAReloc + slotIdx * 4), nullptr);
+                    }
+                    if (SafeRead32(obj + kVerAReloc + slotIdx * 4)) ++ok;
+                }
+                LogLine("[version] relocated array filled: %lu/%u native present + %lu/%lu custom loaded",
+                        (unsigned long)nativeOk, (unsigned)kVerNativeCount, ok,
+                        (unsigned long)g_customCategoryCount);
+                }
+            }
+            // Sortstyle overlay, same shape as the version arrays above: the natives are
+            // re-copied on every pass (on the first one the game's own loader may not have run
+            // yet, and copying zeros once would blank every native category's overlay), the
+            // customs are loaded once because the texture pool is a bump allocator that never
+            // frees. Indexing is by category now that the 0xBFFC8 bias is gone, so slot 19..46
+            // holds what sortstyle[2..29] used to and 47.. holds ours.
+            if (g_sortRelocated) {
+                const uint32_t nSort = kSortNativeHi - kSortNativeLo + 1;
+                if (CanReadPtr(reinterpret_cast<void*>(obj + kSortBiasedOrig + kSortNativeLo * 4),
+                               nSort * 4))
+                    SafeWriteBytes(obj + kSortReloc + kSortNativeLo * 4,
+                                   reinterpret_cast<void*>(obj + kSortBiasedOrig + kSortNativeLo * 4),
+                                   nSort * 4);
+                static uint32_t s_sortFilledFor = 0;
+                bool sortLost = g_customCategoryCount && !SafeRead32(obj + kSortReloc + 47 * 4);
+                if (s_sortFilledFor != obj || sortLost) {
+                    s_sortFilledFor = obj;
+                    unsigned long sok = 0;
+                    for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
+                        const uint32_t cat = 47 + c;
+                        char sf[128] = {};
+                        snprintf(sf, sizeof(sf),
+                                 "System\\SongSelect\\V_View\\sortstyle\\sortstyle_%02lu.bmp",
+                                 (unsigned long)cat);
+                        loadTex(gfxCtx, sf,
+                                reinterpret_cast<void*>(obj + kSortReloc + cat * 4), nullptr);
+                        if (SafeRead32(obj + kSortReloc + cat * 4)) ++sok;
+                    }
+                    LogLine("[sortstyle] %lu natives copied (cat 19..46) + %lu/%lu custom loaded",
+                            (unsigned long)nSort, sok, (unsigned long)g_customCategoryCount);
+                }
+            }
+            LogLine("[category] loaded %lu wheel icons into relocated slots 47.. small=%08lx big=%08lx",
+                    (unsigned long)g_customCategoryCount,
+                    (unsigned long)SafeRead32(obj + g_catTexSmallBase + 47 * 4),
+                    (unsigned long)SafeRead32(obj + g_catTexBigBase + 47 * 4));
+        }
+    }
 }
 
 static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit) {
@@ -836,139 +1007,7 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
     if (h->rva == 0x11460 || h->rva == 0x11090 || h->rva == 0x2DE0) {
         LogLine("[trace] path arg1='%s'", SafeReadAscii(a1, 240).c_str());
     }
-    if (h->rva == 0x35070) {
-        DumpSongSelectStructure(r->ecx, a2);
-        InjectCustomSongsIntoSongSelect(r->ecx, "pre-filter", a2);
-        LoadCustomCategorySongnames(r->ecx, a2);
-        // Wheel category icons: the texture arrays are relocated to the grown object tail
-        // (kCatTexSmallReloc/kCatTexBigReloc), so slots 47.. are safe free memory. The native
-        // loader fills [0..46]; we load OUR category_NN.bmp into [47..] of both arrays via the
-        // game's loader (thiscall, ecx=gfx ctx [0x1b2f054]) — same call as songname. Redirect
-        // serves category_48/49.bmp from our _categories cache. Only when relocated.
-        if (g_customCategoryCount > 0 && g_capacityPatched && g_catTexSmallBase) {
-            typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
-            LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
-            uint32_t gfxCtx = SafeRead32(0x1b2f054);
-            if (gfxCtx) {
-                for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
-                    int catNum = 48 + (int)c;             // native uses 01..47, custom start at 48
-                    char fn[80];
-                    snprintf(fn, sizeof(fn), "System\\SongSelect\\Sortimage\\category_%02d.bmp", catNum);
-                    uint32_t slot = 47 + c;
-                    // Small array = the tab row (short folder name). Big array = the large centre
-                    // label, which gets its own asset with the full details.txt name.
-                    loadTex(gfxCtx, fn, reinterpret_cast<void*>(r->ecx + g_catTexSmallBase + slot * 4), nullptr);
-                    char bigFn[96] = {};
-                    snprintf(bigFn, sizeof(bigFn), "System\\SongSelect\\Sortimage\\categorybig_%02d.bmp", catNum);
-                    loadTex(gfxCtx, bigFn, reinterpret_cast<void*>(r->ecx + g_catTexBigBase + slot * 4), nullptr);
-                }
-                // Version labels. The natives are copied rather than reloaded: the game's own loader
-                // already filled them at the original base, and this array is only read, never
-                // written, by the renderer. Done here and not at patch time because those textures
-                // do not exist until SongSelect has run its loader.
-                static uint32_t s_verFilledFor = 0;
-                if (g_versionRelocated &&
-                    CanReadPtr(reinterpret_cast<void*>(r->ecx + kVerArrayOrig), kVerNativeCount * 4)) {
-                    // The native half is re-copied on EVERY pass, on purpose. Copying it once was a
-                    // bug: on the first filter call the game's own loader had not filled the source
-                    // yet, so 19 zeros were copied and every native song lost its label -- while the
-                    // custom slots, loaded here directly, looked fine. Re-copying is 76 bytes and
-                    // self-heals as soon as the loader has run.
-                    SafeWriteBytes(r->ecx + kVerArrayReloc,
-                                   reinterpret_cast<void*>(r->ecx + kVerArrayOrig), kVerNativeCount * 4);
-                    uint32_t nativeOk = 0;
-                    for (uint32_t v = 0; v < kVerNativeCount; ++v)
-                        if (SafeRead32(r->ecx + kVerArrayReloc + v * 4)) ++nativeOk;
-                    // Array A gets the same treatment: natives re-copied every pass, customs once.
-                    if (g_verARelocated &&
-                        CanReadPtr(reinterpret_cast<void*>(r->ecx + kVerAOrig), kVerNativeCount * 4))
-                        SafeWriteBytes(r->ecx + kVerAReloc,
-                                       reinterpret_cast<void*>(r->ecx + kVerAOrig), kVerNativeCount * 4);
-                    // The custom textures DO load once: the pool is a bump allocator that never
-                    // frees, so reloading them per pass burned ~770KB each time.
-                    if (s_verFilledFor == r->ecx) {
-                        static uint32_t s_lastNativeOk = 0xffffffffu;
-                        if (nativeOk != s_lastNativeOk) {
-                            s_lastNativeOk = nativeOk;
-                            LogLine("[version] native labels present: %lu/%u", (unsigned long)nativeOk,
-                                    (unsigned)kVerNativeCount);
-                        }
-                    }
-                    // Re-entering SongSelect from the menu can reuse the same object address while
-                    // the texture pool has been reset underneath it -- our slots come back null and
-                    // the labels vanish, which is exactly the "it worked, I went to the menu, came
-                    // back and the text was gone" case. So the refill condition is not just "new
-                    // object" but also "our first custom slot lost its texture".
-                    bool slotsLost = g_customCategoryCount &&
-                                     !SafeRead32(r->ecx + kVerAReloc + kVerNativeCount * 4);
-                    if (s_verFilledFor != r->ecx || slotsLost) {
-                    if (slotsLost && s_verFilledFor == r->ecx)
-                        LogLine("[version] custom slots were reset (menu round-trip); reloading");
-                    s_verFilledFor = r->ecx;
-                    unsigned long ok = 0;
-                    for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
-                        uint32_t slotIdx = kVerNativeCount + c;
-                        char vf[112] = {};
-                        snprintf(vf, sizeof(vf),
-                                 "System\\SongSelect\\V_View\\version\\Version_%02lu.bmp",
-                                 (unsigned long)slotIdx);
-                        loadTex(gfxCtx, vf,
-                                reinterpret_cast<void*>(r->ecx + kVerArrayReloc + slotIdx * 4), nullptr);
-                        // The visible label lives in array A, so load it there too.
-                        if (g_verARelocated) {
-                            char af[112] = {};
-                            snprintf(af, sizeof(af),
-                                     "System\\SongSelect\\Version\\Version_%02lu.bmp",
-                                     (unsigned long)slotIdx);
-                            loadTex(gfxCtx, af,
-                                    reinterpret_cast<void*>(r->ecx + kVerAReloc + slotIdx * 4), nullptr);
-                        }
-                        if (SafeRead32(r->ecx + kVerAReloc + slotIdx * 4)) ++ok;
-                    }
-                    LogLine("[version] relocated array filled: %lu/%u native present + %lu/%lu custom loaded",
-                            (unsigned long)nativeOk, (unsigned)kVerNativeCount, ok,
-                            (unsigned long)g_customCategoryCount);
-                    }
-                }
-                // Sortstyle overlay, same shape as the version arrays above: the natives are
-                // re-copied on every pass (on the first one the game's own loader may not have run
-                // yet, and copying zeros once would blank every native category's overlay), the
-                // customs are loaded once because the texture pool is a bump allocator that never
-                // frees. Indexing is by category now that the 0xBFFC8 bias is gone, so slot 19..46
-                // holds what sortstyle[2..29] used to and 47.. holds ours.
-                if (g_sortRelocated) {
-                    const uint32_t nSort = kSortNativeHi - kSortNativeLo + 1;
-                    if (CanReadPtr(reinterpret_cast<void*>(r->ecx + kSortBiasedOrig + kSortNativeLo * 4),
-                                   nSort * 4))
-                        SafeWriteBytes(r->ecx + kSortReloc + kSortNativeLo * 4,
-                                       reinterpret_cast<void*>(r->ecx + kSortBiasedOrig + kSortNativeLo * 4),
-                                       nSort * 4);
-                    static uint32_t s_sortFilledFor = 0;
-                    bool sortLost = g_customCategoryCount && !SafeRead32(r->ecx + kSortReloc + 47 * 4);
-                    if (s_sortFilledFor != r->ecx || sortLost) {
-                        s_sortFilledFor = r->ecx;
-                        unsigned long sok = 0;
-                        for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
-                            const uint32_t cat = 47 + c;
-                            char sf[128] = {};
-                            snprintf(sf, sizeof(sf),
-                                     "System\\SongSelect\\V_View\\sortstyle\\sortstyle_%02lu.bmp",
-                                     (unsigned long)cat);
-                            loadTex(gfxCtx, sf,
-                                    reinterpret_cast<void*>(r->ecx + kSortReloc + cat * 4), nullptr);
-                            if (SafeRead32(r->ecx + kSortReloc + cat * 4)) ++sok;
-                        }
-                        LogLine("[sortstyle] %lu natives copied (cat 19..46) + %lu/%lu custom loaded",
-                                (unsigned long)nSort, sok, (unsigned long)g_customCategoryCount);
-                    }
-                }
-                LogLine("[category] loaded %lu wheel icons into relocated slots 47.. small=%08lx big=%08lx",
-                        (unsigned long)g_customCategoryCount,
-                        (unsigned long)SafeRead32(r->ecx + g_catTexSmallBase + 47 * 4),
-                        (unsigned long)SafeRead32(r->ecx + g_catTexBigBase + 47 * 4));
-            }
-        }
-    }
+    if (h->rva == 0x35070) SongSelectPreFilter(r->ecx, a2);
     // 0x31660 staging-preload inject removed: it called the same fabrication.
     if (h->rva == 0x23A90) {
         LogLine("[songload] enter ecx=%08lx object probe +148=%08lx +14c=%08lx +154=%08lx",
@@ -1115,7 +1154,7 @@ static bool InstallOne(TraceHook& h) {
 // Raise the hardcoded 436-song master-array cap so hundreds of custom songs fit.
 // Patch table is the FNEX section of EZ2Tools/ez2SongdbEditor (a tool that patches the
 // EXE on disk); we apply the SAME edits IN MEMORY (no EXE modification). It relocates the
-// SongSelect master/song arrays by +0xEFDF4 so they don't overrun the object state at
+// SongSelect master/song arrays by +kMasterRel so they don't overrun the object state at
 // +0x371FE, and widens every hardcoded song-count immediate. file_offset == RVA in .text.
 //   newCap = total songs the array must hold (native ~430 + custom). Keep <= ~700 so the
 //   0x56*newCap displacements stay sane; we write full dwords so >16-bit values are fine.
@@ -1133,7 +1172,7 @@ static const size_t kObjBufSize = 8u * 1024u * 1024u; // holds master[] up to ~6
 
 static bool InstallSongCapacityPatches(uint32_t newCap) {
     if (g_capacityPatched) return true;
-    const uint32_t REL = 0xEFDF4;                 // relocation delta (tested by the tool)
+    const uint32_t REL = kMasterRel;              // see kMasterHome for why it is where it is
     const uint32_t bytes = 0x56 * newCap;         // song.bin record area size
     auto w32 = [](uintptr_t rva, uint32_t v) { return WriteMemory(Rva(rva), &v, 4); };
 
@@ -1175,7 +1214,7 @@ static bool InstallSongCapacityPatches(uint32_t newCap) {
     ok &= w32(0x362EF, (uint32_t)(-(int32_t)(0x5E298 + REL)));
 
     // Texture arrays go in the RELOCATION GAP — the space between the original object end
-    // (~0x103540) and the relocated master[] start (0x5e2bc+REL = 0x14E0B0). That space is always
+    // (~0x103540) and the relocated master[] start (kMasterHome). That space is always
     // committed and FIXED, so it does NOT move with newCap. This decouples the texarrays from
     // master[], letting master[] grow (commit-on-inject) without pushing the texarrays into
     // uncommitted memory. 127 categories * 4 bytes each fits easily in the ~0x4AB70 gap.
@@ -1334,7 +1373,579 @@ static void RemoveCustomCategoryPatches() {
     g_customCategoryCount = 0;
 }
 
+// =============================================================================================
+// Replacement for sub_435070 -- the category filter.
+//
+// The original builds the whole visible list in a 376.4 KB array ON THE STACK
+// (mov eax,0x5E1C8 / call __chkstk), against a 1 MB process reserve, and the array is exactly
+// 436 entries of 884 bytes plus one hand-written cookie dword. That array IS the 436-song
+// per-category ceiling: there is no bounds check anywhere in the gather loop, so a category with
+// more ids simply writes past it. The binary has no /GS, so nothing would catch that.
+//
+// What the original does, in order:
+//   1. if a3, copy the currently selected song id out of the global at 0x1B2EB04 into char[32]
+//      -- with an unbounded do/while that stops only at the NUL.
+//   2. for each of catCount[cat] ids in the category name table, LINEARLY search master[] with
+//      _stricmp until it matches, and copy the whole 884-byte entry into the stack array.
+//      That is O(ids x masterCount) string compares: at 436 x 60000 it is already ~26M compares
+//      per category change, and it grows with the library.
+//   3. copy every gathered entry whose float at +0x214 is non-zero into the visible array at
+//      obj+300 (that float is the level for the active mode; zero means "not playable here").
+//   4. find the remembered id in the visible list and restore the selection and scroll position.
+//
+// This version keeps that behaviour exactly, minus the stack array (the gather is fused into the
+// write, so nothing is buffered at all) and minus the linear search (a case-insensitive hash index
+// over master[], rebuilt only when master changes).
+//
+// The two phases are kept SEPARATE and bug-compatible, deliberately. An earlier version fused them
+// and "corrected" two things on the way: it reported the written count instead of the gathered one,
+// and let the cap bound the write rather than the gather so no visible slot went to waste. Both
+// looked strictly safer. The first category that exercised either -- 243 ids of which 3 had no
+// chart for the active mode -- died on a /GS buffer-overrun check, right after eleven categories
+// with no unplayable songs had been browsed without trouble. Whatever downstream structure is
+// sized from the gathered count, it is not this function's to redefine, and the job here was to
+// lift the 436 ceiling, not to change what the game counts. So: gather, publish the gathered
+// total, then write the playable ones. Exactly as shipped.
+//
+// ONE deviation remains, and it removes undefined behaviour rather than changing a value:
+//   - when a3 is 0 the original leaves its char[32] uninitialised and then _stricmp's against it.
+//     Here the buffer is zeroed, which cannot match a real id, so the selection lands on 0 -- the
+//     same outcome the garbage produced in practice, without the undefined read.
+//
+// The visible array itself is untouched, and it is still 436 entries: obj+300 + 436*884 lands
+// exactly on the original master[] base, so visible[] and master[] were adjacent, equal-size
+// arrays. master[] is relocated by +kMasterRel, which should leave that region free -- but a static
+// scan could not prove it, so g_visibleCap stays at 436 and ProbeVacatedMaster watches the region
+// for writes instead. Raising the cap is a one-line change once the probe reports it clean.
+// =============================================================================================
+
+static const uint32_t kEntryBytes    = 0x374;   // 884
+static const uint32_t kEntryIdOff    = 0x10C;
+static const uint32_t kEntryLevelOff = 0x214;
+static const uint32_t kVisibleBase   = 300;     // obj+300, stride kEntryBytes
+static const uint32_t kMasterOrig    = 0x5E2BC;
+static const uint32_t kSelectedIdVar = 0x1B2EB04;
+
+// Object fields the filter owns, as byte offsets (the decompiler shows them as this[N] dwords).
+static const uint32_t kObjActiveCat   = 7  * 4;   // 0x1C
+static const uint32_t kObjVisCount    = 31 * 4;   // 0x7C
+static const uint32_t kObjMasterCount = 32 * 4;   // 0x80
+static const uint32_t kObjSelected    = 33 * 4;   // 0x84
+static const uint32_t kObjRetVal      = 34 * 4;   // 0x88
+static const uint32_t kObjSelected2   = 35 * 4;   // 0x8C
+static const uint32_t kObjRetCopy     = 36 * 4;   // 0x90
+static const uint32_t kObjScrollA     = 49 * 4;   // 0xC4
+static const uint32_t kObjScrollB     = 51 * 4;   // 0xCC
+
+static uint32_t g_visibleCap = 436;   // see the note above before raising this
+
+// ---- case-insensitive id index over master[] --------------------------------------------------
+// Ids are at most 15 characters in a 16-byte field. Keys are stored lowercased in our own memory
+// so a lookup never re-reads the game's object, and duplicates resolve to the LOWEST master index
+// -- which is what the original's first-match linear scan returned.
+struct MasterIdIndex {
+    std::vector<char>    keys;      // 16 bytes per master entry
+    std::vector<int32_t> table;     // open addressing, -1 = empty
+    uint32_t mask  = 0;
+    uint32_t base  = 0;
+    uint32_t count = 0;
+    uint32_t gen   = 0xFFFFFFFFu;
+};
+static MasterIdIndex g_midx;
+
+static void NormalizeId(const char* src, char* dst16) {
+    memset(dst16, 0, 16);
+    for (int i = 0; i < 15 && src[i]; ++i) {
+        unsigned char c = (unsigned char)src[i];
+        dst16[i] = (char)((c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c);
+    }
+}
+
+static uint32_t HashId16(const char* k) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 16 && k[i]; ++i) h = (h ^ (unsigned char)k[i]) * 16777619u;
+    return h;
+}
+
+static void EnsureMasterIndex(uint32_t masterBase, uint32_t count) {
+    if (g_midx.base == masterBase && g_midx.count == count && g_midx.gen == g_masterGen) return;
+    g_midx.base = masterBase; g_midx.count = count; g_midx.gen = g_masterGen;
+    g_midx.keys.assign((size_t)count * 16, 0);
+    size_t cap = 64;
+    while (cap < (size_t)count * 2) cap <<= 1;
+    g_midx.table.assign(cap, -1);
+    g_midx.mask = (uint32_t)(cap - 1);
+    uint32_t dup = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t addr = masterBase + i * kEntryBytes + kEntryIdOff;
+        if (!CanReadPtr(reinterpret_cast<void*>(addr), 16)) break;
+        char* key = &g_midx.keys[(size_t)i * 16];
+        NormalizeId(reinterpret_cast<const char*>(addr), key);
+        if (!key[0]) continue;                       // empty slot, not addressable by id
+        uint32_t h = HashId16(key) & g_midx.mask;
+        bool exists = false;
+        while (g_midx.table[h] >= 0) {
+            if (memcmp(&g_midx.keys[(size_t)g_midx.table[h] * 16], key, 16) == 0) { exists = true; break; }
+            h = (h + 1) & g_midx.mask;
+        }
+        if (exists) { ++dup; continue; }             // keep the first, like the original scan
+        g_midx.table[h] = (int32_t)i;
+    }
+    LogLine("[filter] master id index rebuilt: %lu entries, %lu buckets, %lu duplicate id(s)",
+            (unsigned long)count, (unsigned long)g_midx.table.size(), (unsigned long)dup);
+}
+
+static int32_t LookupMaster(const char* rawId) {
+    if (g_midx.table.empty()) return -1;
+    char key[16];
+    NormalizeId(rawId, key);
+    if (!key[0]) return -1;
+    uint32_t h = HashId16(key) & g_midx.mask;
+    while (g_midx.table[h] >= 0) {
+        if (memcmp(&g_midx.keys[(size_t)g_midx.table[h] * 16], key, 16) == 0) return g_midx.table[h];
+        h = (h + 1) & g_midx.mask;
+    }
+    return -1;
+}
+
+// ---- read-only probe of the region master[] used to occupy ------------------------------------
+// visible[] ends exactly where master[] began, so freeing master[] is what would let visible[]
+// grow past 436. A byte scan of .text found ~113 displacements inside that range, but almost all
+// of them decode as data rather than instructions and none could be confirmed as a live field.
+// Rather than guess, snapshot the region and report anything that writes to it. Purely read-only:
+// this cannot itself break anything, and one session with category changes and a played song is
+// enough to settle whether the cap can be raised.
+static std::vector<unsigned char> g_vacatedSnap;
+static uint32_t g_vacatedBase = 0;
+static unsigned g_vacatedReports = 0;
+
+static void ProbeVacatedMaster(uint32_t obj) {
+    if (!g_capacityPatched) return;
+    const uint32_t base = obj + kMasterOrig;
+    const uint32_t len  = 436 * kEntryBytes;          // 385 424 bytes
+    if (!CanReadPtr(reinterpret_cast<void*>(base), len)) return;
+    if (g_vacatedBase != base) {
+        g_vacatedBase = base;
+        g_vacatedSnap.assign(len, 0);
+        memcpy(g_vacatedSnap.data(), reinterpret_cast<void*>(base), len);
+        LogLine("[vacated] snapshot taken at obj+0x%lX (%lu bytes = %u entries)",
+                (unsigned long)kMasterOrig, (unsigned long)len, 436u);
+        return;
+    }
+    if (g_vacatedReports >= 8) return;
+    const unsigned char* now = reinterpret_cast<const unsigned char*>(base);
+    uint32_t changed = 0, firstOff = 0xFFFFFFFFu, lastOff = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+        if (now[i] == g_vacatedSnap[i]) continue;
+        ++changed;
+        if (firstOff == 0xFFFFFFFFu) firstOff = i;
+        lastOff = i;
+    }
+    ++g_vacatedReports;
+    if (!changed) {
+        LogLine("[vacated] CLEAN - nothing wrote to the old master region since the snapshot");
+    } else {
+        LogLine("[vacated] %lu byte(s) changed, first at +%lu (entry %.2f field 0x%lX), last at +%lu"
+                " -- the region is NOT free, keep g_visibleCap at 436",
+                (unsigned long)changed, (unsigned long)firstOff,
+                (double)firstOff / (double)kEntryBytes, (unsigned long)(firstOff % kEntryBytes),
+                (unsigned long)lastOff);
+        memcpy(g_vacatedSnap.data(), now, len);       // re-baseline so the next report is a delta
+    }
+}
+
+
+// Compare every id the index recorded against what master[] holds now. The index is built once and
+// only rebuilt when the inject actually appends, so a mismatch means something wrote over master[]
+// afterwards -- which is exactly the shape of "a slot the index resolved comes back with an empty
+// id". Bounded output; runs only when the filter saw an entry it could not explain.
+static void VerifyMasterAgainstIndex(uint32_t cat) {
+    if (g_midx.keys.empty()) return;
+    uint32_t mismatched = 0, emptied = 0, firstBad = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < g_midx.count; ++i) {
+        const char* want = &g_midx.keys[(size_t)i * 16];
+        if (!want[0]) continue;                                  // never indexed
+        const uint32_t addr = g_midx.base + i * kEntryBytes + kEntryIdOff;
+        if (!CanReadPtr(reinterpret_cast<void*>(addr), 16)) break;
+        char have[16];
+        NormalizeId(reinterpret_cast<const char*>(addr), have);
+        if (memcmp(have, want, 16) == 0) continue;
+        ++mismatched;
+        if (!have[0]) ++emptied;
+        if (firstBad == 0xFFFFFFFFu) {
+            firstBad = i;
+            LogLine("[integrity] cat=%lu master[%lu] was '%.15s' at index time, now '%.15s'",
+                    (unsigned long)cat, (unsigned long)i, want, have);
+        }
+    }
+    if (mismatched)
+        LogLine("[integrity] cat=%lu MASTER CORRUPTED: %lu/%lu ids changed since indexing"
+                " (%lu now empty), first at master[%lu]",
+                (unsigned long)cat, (unsigned long)mismatched, (unsigned long)g_midx.count,
+                (unsigned long)emptied, (unsigned long)firstBad);
+    else
+        LogLine("[integrity] cat=%lu master[] intact: all %lu indexed ids still match",
+                (unsigned long)cat, (unsigned long)g_midx.count);
+}
+
+// ---- the filter itself ------------------------------------------------------------------------
+static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSelection) {
+    SongSelectPreFilter(obj, cat);
+    ProbeVacatedMaster(obj);
+
+    const uint32_t masterCount = SafeRead32(obj + kObjMasterCount);
+    const uint32_t masterBase  = obj + kMasterOrig + (g_capacityPatched ? kMasterRel : 0u);
+
+    // The id to re-select once the list is rebuilt. Bounded, unlike the original's do/while.
+    char want[16] = {};
+    if (keepSelection && CanReadPtr(reinterpret_cast<void*>(kSelectedIdVar), 16))
+        NormalizeId(reinterpret_cast<const char*>(kSelectedIdVar), want);
+
+    // Phase 1 -- gather, exactly as the original did, but into the heap instead of 376 KB of stack.
+    // The cap bounds THIS list, because the original's cap was the size of its stack array.
+    static std::vector<uint32_t> s_gathered;
+    s_gathered.clear();
+    uint32_t missing = 0, unplayable = 0, available = 0;
+    if (masterCount && masterCount <= g_songCapacity &&
+        CanReadPtr(reinterpret_cast<void*>(masterBase), kEntryBytes)) {
+        EnsureMasterIndex(masterBase, masterCount);
+        uint32_t ids = SafeRead32(CatCountTable() + cat * 4);
+        if (ids > kCatNameStride) ids = kCatNameStride;
+        available = ids;
+        for (uint32_t k = 0; k < ids; ++k) {
+            const uint32_t nameAddr = CatNameTable() + (k + cat * kCatNameStride) * kCatNameSize;
+            if (!CanReadPtr(reinterpret_cast<void*>(nameAddr), kCatNameSize)) break;
+            const int32_t mi = LookupMaster(reinterpret_cast<const char*>(nameAddr));
+            if (mi < 0) { ++missing; continue; }
+            if (s_gathered.size() >= g_visibleCap) break;
+            s_gathered.push_back((uint32_t)mi);
+        }
+    }
+
+    const uint32_t gathered = (uint32_t)s_gathered.size();
+
+    // Phase 2 -- copy across the entries that have a chart for the active mode.
+    uint32_t written = 0;
+    for (uint32_t g = 0; g < gathered; ++g) {
+        const uint32_t entry = masterBase + s_gathered[g] * kEntryBytes;
+        float level = 0.0f;
+        memcpy(&level, reinterpret_cast<void*>(entry + kEntryLevelOff), 4);
+        if (level == 0.0f) {
+            // The inject guarantees NM >= 1 for every custom song it writes, so a zero here means
+            // the entry did not come from the inject -- name the id and the master slot so it is
+            // clear whether it is a native song, a truncated append, or something never written.
+            if (unplayable < 6)
+                LogLine("[filter] cat=%lu UNPLAYABLE master[%lu]%s id='%.31s'",
+                        (unsigned long)cat, (unsigned long)s_gathered[g],
+                        s_gathered[g] < 430 ? " (NATIVE)" : " (custom range)",
+                        reinterpret_cast<const char*>(entry + kEntryIdOff));
+            ++unplayable;
+            continue;                                        // the game's own visibility test
+        }
+        SafeWriteBytes(obj + kVisibleBase + written * kEntryBytes,
+                       reinterpret_cast<void*>(entry), kEntryBytes);
+        ++written;
+    }
+
+    // The original publishes the GATHERED count but writes only the playable entries, and never
+    // reconciles the two. visible[written .. gathered-1] therefore keeps whatever the previously
+    // filtered category left in those slots. The wheel scrolls into that window quite happily and
+    // the disc-art loader does:
+    //
+    //     sprintf(Buffer, "system\\disc\\%s.bmp", (char *)(this + 884 * a2 + 568));
+    //
+    // where 884*a2 + 568 is visible[a2].id -- so a stale or never-initialised id goes straight into
+    // a path, the open fails, and the failure path smashes a 260-byte stack buffer. That is the
+    // CYT-2.2 crash, and it needs BOTH a category with songs that have no chart for the active
+    // mode (the only one of 25 that had any) and enough scrolling to reach the tail.
+    //
+    // Publishing `written` instead would be the tidy fix, but the count is load-bearing elsewhere,
+    // so leave it alone and make the window harmless: repeat the last valid entry across it. Those
+    // slots then hold a real, playable song rather than debris.
+    if (written && written < gathered) {
+        const uint32_t last = obj + kVisibleBase + (written - 1) * kEntryBytes;
+        for (uint32_t i = written; i < gathered; ++i)
+            SafeWriteBytes(obj + kVisibleBase + i * kEntryBytes,
+                           reinterpret_cast<void*>(last), kEntryBytes);
+        LogLine("[filter] cat=%lu tail %lu..%lu had no playable entry; filled from visible[%lu]",
+                (unsigned long)cat, (unsigned long)written, (unsigned long)(gathered - 1),
+                (unsigned long)(written - 1));
+    }
+
+    // An unplayable entry should be impossible -- the inject forces NM >= 1 on every song it
+    // writes -- so if one shows up, check whether master[] still holds what we indexed.
+    if (unplayable) VerifyMasterAgainstIndex(cat);
+
+    // Nothing playable at all: publish zero rather than a count with no valid entry behind it.
+    const uint32_t published = written ? gathered : 0;
+    SafeWriteBytes(obj + kObjVisCount, &published, 4);
+
+    // Restore the selection by id. The original searches this[31] entries -- the gathered count --
+    // which can read past what phase 2 wrote; bound the search to what is actually there.
+    uint32_t selected = 0;
+    for (uint32_t i = 0; i < written; ++i) {
+        const uint32_t idAddr = obj + kVisibleBase + i * kEntryBytes + kEntryIdOff;
+        char have[16];
+        NormalizeId(reinterpret_cast<const char*>(idAddr), have);
+        if (want[0] && memcmp(have, want, 16) == 0) { selected = i; break; }
+    }
+    const float scroll = (float)selected * 100.0f;
+    const uint32_t retVal = SafeRead32(obj + kObjRetVal);
+    SafeWriteBytes(obj + kObjSelected,  &selected, 4);
+    SafeWriteBytes(obj + kObjSelected2, &selected, 4);
+    SafeWriteBytes(obj + kObjActiveCat, &cat, 4);
+    SafeWriteBytes(obj + kObjScrollA,   &scroll, 4);
+    SafeWriteBytes(obj + kObjScrollB,   &scroll, 4);
+    SafeWriteBytes(obj + kObjRetCopy,   &retVal, 4);
+
+    g_gsLastCat = cat;            // so a /GS failure names the category that led to it
+    g_gsLastCount = published;
+    static uint32_t s_lastCat = 0xFFFFFFFFu;
+    if (cat != s_lastCat || missing || unplayable || gathered >= g_visibleCap) {
+        s_lastCat = cat;
+        LogLine("[filter] cat=%lu ids=%lu -> gathered=%lu written=%lu (missing=%lu unplayable=%lu)"
+                " sel=%lu cap=%lu%s",
+                (unsigned long)cat, (unsigned long)available, (unsigned long)published,
+                (unsigned long)written, (unsigned long)missing, (unsigned long)unplayable,
+                (unsigned long)selected, (unsigned long)g_visibleCap,
+                gathered >= g_visibleCap ? "  *** TRUNCATED AT CAP ***" : "");
+    }
+    return retVal;
+}
+
+extern "C" __declspec(dllexport) uint32_t __cdecl EZ2FilterCategory(uint32_t obj, uint32_t cat,
+                                                                    uint32_t keepSelection) {
+    return FilterCategoryImpl(obj, cat, keepSelection);
+}
+
+// ---- installation ------------------------------------------------------------------------------
+// The original is __thiscall(this, cat, keepSel, unused) and ends in `ret 0xC`. Its first
+// instruction is `mov eax, 0x5E1C8` -- exactly 5 bytes -- so a jmp rel32 replaces it without
+// splitting anything, and the expected bytes double as the version check.
+static const unsigned char kFilterEntry[5] = { 0xB8, 0xC8, 0xE1, 0x05, 0x00 };
+static unsigned char g_filterOriginal[5] = {};
+static bool g_filterReplaced = false;
+
+static bool InstallFilterReplacement() {
+    if (g_filterReplaced) return true;
+    void* target = Rva(0x35070);
+    if (memcmp(target, kFilterEntry, sizeof(kFilterEntry)) != 0) {
+        LogLine("[filter] replacement ABORTED: 0x35070 does not start with `mov eax,0x5E1C8`");
+        return false;
+    }
+    unsigned char* stub = static_cast<unsigned char*>(AllocExec(32));
+    if (!stub) { LogLine("[filter] replacement ABORTED: stub alloc failed"); return false; }
+    unsigned char* p = stub;
+    // esp is untouched on entry: [esp]=ret [esp+4]=cat [esp+8]=keepSel [esp+12]=unused, ecx=this
+    EmitU8(p, 0x8B); EmitU8(p, 0x44); EmitU8(p, 0x24); EmitU8(p, 0x08);  // mov eax,[esp+8]
+    EmitU8(p, 0x8B); EmitU8(p, 0x54); EmitU8(p, 0x24); EmitU8(p, 0x04);  // mov edx,[esp+4]
+    EmitU8(p, 0x50);                                                     // push eax  (keepSel)
+    EmitU8(p, 0x52);                                                     // push edx  (cat)
+    EmitU8(p, 0x51);                                                     // push ecx  (this)
+    EmitU8(p, 0xE8);
+    void* next = p + 4;
+    EmitRel32(p, next, reinterpret_cast<void*>(&EZ2FilterCategory));
+    EmitU8(p, 0x83); EmitU8(p, 0xC4); EmitU8(p, 0x0C);                   // add esp,12
+    EmitU8(p, 0xC2); EmitU8(p, 0x0C); EmitU8(p, 0x00);                   // ret 0xC
+
+    memcpy(g_filterOriginal, target, sizeof(g_filterOriginal));
+    unsigned char patch[5];
+    patch[0] = 0xE9;
+    const intptr_t rel = reinterpret_cast<intptr_t>(stub) - reinterpret_cast<intptr_t>(target) - 5;
+    memcpy(&patch[1], &rel, 4);
+    if (!WriteMemory(target, patch, sizeof(patch))) {
+        LogLine("[filter] replacement ABORTED: could not write the jmp");
+        return false;
+    }
+    g_filterReplaced = true;
+    LogLine("[filter] sub_435070 REPLACED (heap gather, hashed lookup, cap=%lu) stub=%p",
+            (unsigned long)g_visibleCap, (void*)stub);
+    return true;
+}
+
+static void RemoveFilterReplacement() {
+    if (!g_filterReplaced) return;
+    WriteMemory(Rva(0x35070), g_filterOriginal, sizeof(g_filterOriginal));
+    g_filterReplaced = false;
+}
+
+// =============================================================================================
+// /GS failure probe.
+//
+// The binary IS built with /GS -- 275 functions call __security_check_cookie at RVA 0x7882F:
+//
+//     0047882F  cmp ecx, [0x4AFCA0]     ; ecx = the cookie the epilogue read back off the frame
+//     00478835  jne 0x478838
+//     00478837  ret                     ; intact -> return to the function that called it
+//     00478838  jmp 0x4787FE            ; corrupted -> "Buffer overrun detected!" then abort(3)
+//
+// Every call site is a CALL (275 of them, zero tail-jumps), so on entry [esp] is a return address
+// INSIDE the function whose frame was smashed. The abort handler runs far too late to see it --
+// by the time ExitProcess is reached the frame is long gone, which is why the existing [EXIT]
+// stack walk only ever showed CRT frames.
+//
+// The fast path here is byte-for-byte what the original does: compare, and return if it matches.
+// Only a mismatch takes the detour, and the process is already dying at that point, so the cost of
+// logging does not matter. Diagnostic only -- it changes no behaviour.
+// =============================================================================================
+
+static void __cdecl GsFailureReport(uint32_t* espAtEntry) {
+    LogLine("[GS] ===== STACK COOKIE CORRUPTED =====");
+    LogLine("[GS] last filtered category=%ld published count=%lu",
+            (long)(int32_t)g_gsLastCat, (unsigned long)g_gsLastCount);
+    if (!espAtEntry || !CanReadPtr(espAtEntry, 4)) { LogLine("[GS] esp unreadable"); return; }
+    const uint32_t ret = espAtEntry[0];
+    LogLine("[GS] return address into the SMASHED function: %08lx (rva 0x%05lx)",
+            (unsigned long)ret, (unsigned long)(ret - 0x400000));
+    // A few slots above, so the caller chain is visible too.
+    for (int i = 1; i <= 12; ++i) {
+        if (!CanReadPtr(espAtEntry + i, 4)) break;
+        const uint32_t v = espAtEntry[i];
+        if (v > 0x401000 && v < 0x487000)
+            LogLine("[GS]   stack[+%02X] = %08lx (rva 0x%05lx, code)",
+                    i * 4, (unsigned long)v, (unsigned long)(v - 0x400000));
+    }
+    LogLine("[GS] ===================================");
+}
+
+static const unsigned char kGsCheckEntry[6] = { 0x3B, 0x0D, 0xA0, 0xFC, 0x4A, 0x00 };
+static unsigned char g_gsOriginal[6] = {};
+static bool g_gsProbed = false;
+
+static bool InstallGsFailureProbe() {
+    if (g_gsProbed) return true;
+    void* target = Rva(0x7882F);
+    if (memcmp(target, kGsCheckEntry, sizeof(kGsCheckEntry)) != 0) {
+        LogLine("[GS] probe ABORTED: 0x7882F is not `cmp ecx,[0x4AFCA0]`");
+        return false;
+    }
+    unsigned char* stub = static_cast<unsigned char*>(AllocExec(48));
+    if (!stub) { LogLine("[GS] probe ABORTED: stub alloc failed"); return false; }
+    unsigned char* p = stub;
+    for (unsigned char b : kGsCheckEntry) EmitU8(p, b);   // cmp ecx,[0x4AFCA0]
+    EmitU8(p, 0x75); EmitU8(p, 0x01);                     // jne +1 -> the report path
+    EmitU8(p, 0xC3);                                      // ret    (cookie intact: fast path)
+    EmitU8(p, 0x60);                                      // pushad
+    EmitU8(p, 0x8D); EmitU8(p, 0x44); EmitU8(p, 0x24); EmitU8(p, 0x20);  // lea eax,[esp+0x20]
+    EmitU8(p, 0x50);                                      // push eax  (esp as it was on entry)
+    EmitU8(p, 0xE8);
+    void* callNext = p + 4;
+    EmitRel32(p, callNext, reinterpret_cast<void*>(&GsFailureReport));
+    EmitU8(p, 0x83); EmitU8(p, 0xC4); EmitU8(p, 0x04);    // add esp,4
+    EmitU8(p, 0x61);                                      // popad
+    EmitU8(p, 0xE9);
+    void* jmpNext = p + 4;
+    EmitRel32(p, jmpNext, Rva(0x78838));                  // fall into the game's own failure jmp
+
+    memcpy(g_gsOriginal, target, sizeof(g_gsOriginal));
+    unsigned char patch[6];
+    patch[0] = 0xE9;
+    const intptr_t rel = reinterpret_cast<intptr_t>(stub) - reinterpret_cast<intptr_t>(target) - 5;
+    memcpy(&patch[1], &rel, 4);
+    patch[5] = 0x90;                                      // pad out the 6-byte cmp
+    if (!WriteMemory(target, patch, sizeof(patch))) {
+        LogLine("[GS] probe ABORTED: could not write the jmp");
+        return false;
+    }
+    g_gsProbed = true;
+    LogLine("[GS] failure probe armed at __security_check_cookie (0x7882F), stub=%p", (void*)stub);
+    return true;
+}
+
+static void RemoveGsFailureProbe() {
+    if (!g_gsProbed) return;
+    WriteMemory(Rva(0x7882F), g_gsOriginal, sizeof(g_gsOriginal));
+    g_gsProbed = false;
+}
+
+// =============================================================================================
+// sub_412F00 -- "copy the filename stem" -- replaced, because it computes a negative length.
+//
+//     v3 = strrchr(Str, '\\'); v3 = v3 ? v3 + 1 : Str;   // start of the filename
+//     v4 = strrchr(Str, '.');                            // the extension
+//     if (!v4) v4 = Str + strlen(Str);                   // no dot at all -> whole name
+//     result = v4 - v3;                                  // <-- SIGNED subtraction...
+//     qmemcpy(a2, v3, result);                           // ...consumed as unsigned
+//
+// The author handled "no dot anywhere" but not "the only dot is in a DIRECTORY component". For
+// a path like  System\SongSelect\CYT-2.2\icon  the last dot sits inside CYT-2.2, before the
+// filename starts, so v4 - v3 is negative, becomes ~4 GB unsigned, and qmemcpy runs off the end
+// of the caller's buffer.
+//
+// The caller that matters is sub_407E50, the .abm loader. Its destination is CHAR chText[260] at
+// ebp-0x114 with the /GS cookie immediately after it at ebp-0x10, so the very first bytes past the
+// buffer hit the cookie: "Buffer overrun detected!" and abort(3). That is precisely the crash seen
+// on the CYT-2.2 category, and it only fires on the path where opening the .abm FAILED -- which is
+// why it took a category whose folder name contains a dot AND a missing asset to surface it.
+//
+// Same signature, same __cdecl convention, so the patch is a plain 5-byte jmp: arguments stay on
+// the caller's stack exactly where they were, the result comes back in eax, and the caller still
+// cleans up. The clamp at 255 is belt and braces -- every caller's buffer is 260 bytes.
+static unsigned long g_stemNegatives = 0;
+
+extern "C" uint32_t __cdecl EZ2BasenameStem(const char* str, char* out) {
+    if (!str || !out) return 0;
+    const char* slash = strrchr(str, '\\');
+    const char* begin = slash ? slash + 1 : str;
+    const char* dot   = strrchr(str, '.');
+    if (!dot || dot < begin) {
+        // No extension on the filename itself. The original only checked for "no dot at all".
+        if (dot && dot < begin && g_stemNegatives < 8) {
+            ++g_stemNegatives;
+            LogLine("[stem] negative length averted: '%s' (dot at %ld, name starts at %ld) -- the"
+                    " original would have copied ~4GB into a 260-byte stack buffer",
+                    str, (long)(dot - str), (long)(begin - str));
+        }
+        dot = str + strlen(str);
+    }
+    size_t n = (size_t)(dot - begin);
+    if (n > 255) n = 255;
+    memcpy(out, begin, n);
+    out[n] = 0;
+    return (uint32_t)n;
+}
+
+static const unsigned char kStemEntry[5] = { 0x53, 0x56, 0x57, 0x8B, 0x7C };  // push ebx/esi/edi; mov edi,...
+static unsigned char g_stemOriginal[5] = {};
+static bool g_stemReplaced = false;
+
+static bool InstallStemFix() {
+    if (g_stemReplaced) return true;
+    void* target = Rva(0x12F00);
+    if (memcmp(target, kStemEntry, sizeof(kStemEntry)) != 0) {
+        LogLine("[stem] fix ABORTED: 0x12F00 does not start with the expected prologue");
+        return false;
+    }
+    memcpy(g_stemOriginal, target, sizeof(g_stemOriginal));
+    unsigned char patch[5];
+    patch[0] = 0xE9;
+    const intptr_t rel = reinterpret_cast<intptr_t>(&EZ2BasenameStem)
+                       - reinterpret_cast<intptr_t>(target) - 5;
+    memcpy(&patch[1], &rel, 4);
+    if (!WriteMemory(target, patch, sizeof(patch))) {
+        LogLine("[stem] fix ABORTED: could not write the jmp");
+        return false;
+    }
+    g_stemReplaced = true;
+    LogLine("[stem] sub_412F00 replaced (negative-length stem copy fixed, 5 call sites)");
+    return true;
+}
+
+static void RemoveStemFix() {
+    if (!g_stemReplaced) return;
+    WriteMemory(Rva(0x12F00), g_stemOriginal, sizeof(g_stemOriginal));
+    g_stemReplaced = false;
+}
+
 void InstallTraceHooks() {
+    InstallGsFailureProbe();
+    InstallStemFix();
+    // The replacement owns 0x35070 outright, so it has to claim those 5 bytes before the
+    // trace hook writes its own jmp over them -- and the trace hook must then stay away.
+    if (InstallFilterReplacement()) {
+        for (auto& h : g_hooks)
+            if (h.rva == 0x35070) { h.enabled = false; break; }
+    }
     if (g_traceInstalled) return;
     if (!Config().enableFunctionTrace) {
         LogLine("[trace] function trace disabled by config");
@@ -1344,7 +1955,7 @@ void InstallTraceHooks() {
     if (customCategory) {
         // HARD CEILING: the SongSelect object is a per-class POOL allocation (operator-new via
         // 0x4016a0), and the pool caps the block at ~2.3MB no matter how big a size we patch into
-        // the `push` sites. master[] is relocated +0xEFDF4 into that block, so it physically holds
+        // the `push` sites. master[] is relocated +kMasterRel into that block, so it physically holds
         // only ~1085 entries. Past that the game's songname/discsmall texture preload writes past
         // the object → crash (0x408e60). So clamp the cap to what the pool fits; per-category songs
         // are then distributed evenly in the inject so no wheel category ends up empty (that's the
@@ -1391,9 +2002,16 @@ void InstallTraceHooks() {
         if (!h.enabled) continue;
         if (InstallOne(h)) installed++;
     }
-    if (customCategory && !g_hooks[sizeof(g_hooks) / sizeof(g_hooks[0]) - 1].installed) {
+    // Custom categories only work if we own the SongSelect filter entry point, because that is
+    // where the inject runs. The last g_hooks entry IS 0x35070 -- but when the replacement claimed
+    // that function it also stood that hook down, so "hook installed" alone is no longer the right
+    // question. Either owner satisfies the requirement; testing only the hook is what silently
+    // disabled every custom category the moment the replacement went in.
+    const bool songSelectOwned =
+        g_hooks[sizeof(g_hooks) / sizeof(g_hooks[0]) - 1].installed || g_filterReplaced;
+    if (customCategory && !songSelectOwned) {
         RemoveCustomCategoryPatches();
-        LogLine("[category] new category disabled: SongSelect hook unavailable");
+        LogLine("[category] new category disabled: SongSelect entry point unavailable");
     }
     g_traceInstalled = true;
     LogLine("[trace] installed total=%u", installed);
@@ -1412,5 +2030,8 @@ void RemoveTraceHooks() {
     RemoveVersionArrayARelocation();
     RemoveVersionGuardWiden();
     RemoveSortstyleRelocation();
+    RemoveFilterReplacement();
+    RemoveGsFailureProbe();
+    RemoveStemFix();
     g_traceInstalled = false;
 }

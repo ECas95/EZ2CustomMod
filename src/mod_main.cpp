@@ -1571,6 +1571,32 @@ static void LogCrashContext(EXCEPTION_POINTERS* ep, const char* tag) {
                 LogLine("[CRASH]   [esp+%02x]=%08lx (rva=%08lx)", i*4, (unsigned long)v,
                         (v >= base + 0x1000 && v < base + 0x87000) ? (unsigned long)(v - base) : 0xffffffff);
             }
+            // Printable runs on the stack. A path built by sprintf into a fixed stack buffer is
+            // the shape of failure here, and its LENGTH is the whole question -- a %s that runs
+            // past an unterminated field produces a path far longer than the buffer holds. Walk
+            // 1 KB of stack and report every printable run of 8+ characters with its length.
+            {
+                const unsigned char* b = (const unsigned char*)sp;
+                char run[600];
+                int runLen = 0, reported = 0;
+                for (int i = 0; i < 1024 && reported < 6; ++i) {
+                    uint32_t probe = 0;
+                    if ((i & 3) == 0 && !CanReadDword((void*)(b + i), &probe)) break;
+                    const unsigned char ch = b[i];
+                    const bool printable = (ch >= 0x20 && ch < 0x7F);
+                    if (printable && runLen < (int)sizeof(run) - 1) {
+                        run[runLen++] = (char)ch;
+                        continue;
+                    }
+                    if (runLen >= 8) {
+                        run[runLen] = 0;
+                        ++reported;
+                        LogLine("[CRASH]   stack string @esp+%03x len=%d: '%.400s'",
+                                i - runLen, runLen, run);
+                    }
+                    runLen = 0;
+                }
+            }
             // EBP frame-pointer chain → reliable caller RVAs (frame = [ebp]=prev, [ebp+4]=ret).
             uint32_t fp = c->Ebp, prevfp = 0;
             for (int depth = 0; depth < 10; ++depth) {
@@ -1650,6 +1676,99 @@ static void InstallCrashLogger() {
 }
 
 
+// ---------------------------------------------------------------------------------------------
+// Freeze watchdog.
+//
+// A hang leaves no trace: no exception, no log line, nothing to read afterwards. This samples the
+// instruction pointer of every thread in the process every two seconds, and when one of them has
+// not moved out of a 64-byte window across four samples it reports where it is stuck, with a stack
+// walk. Eight seconds of a thread sitting on the same handful of instructions is a loop or a wait,
+// not work.
+//
+// Suspend/resume around the sample is unavoidable -- GetThreadContext on a running thread returns
+// nothing useful -- but it lasts microseconds and only fires every two seconds. Threads that are
+// legitimately blocked in the kernel (audio, video, the message pump waiting on input) report an
+// EIP inside a system DLL, which is why only addresses inside the game module are considered.
+struct ThreadSample { DWORD tid; uint32_t lastEip; int stuckCount; bool reported; };
+
+static HANDLE g_watchdogThread = nullptr;
+static volatile LONG g_watchdogStop = 0;
+
+static void WatchdogReport(HANDLE h, const CONTEXT& c, DWORD tid, uintptr_t base) {
+    LogLine("[hang] ===== THREAD %lu HAS NOT MOVED FOR ~8s =====", (unsigned long)tid);
+    LogLine("[hang] eip=%08lx rva=0x%05lx esp=%08lx ebp=%08lx",
+            (unsigned long)c.Eip, (unsigned long)(c.Eip - base),
+            (unsigned long)c.Esp, (unsigned long)c.Ebp);
+    LogLine("[hang] eax=%08lx ecx=%08lx edx=%08lx ebx=%08lx esi=%08lx edi=%08lx",
+            (unsigned long)c.Eax, (unsigned long)c.Ecx, (unsigned long)c.Edx,
+            (unsigned long)c.Ebx, (unsigned long)c.Esi, (unsigned long)c.Edi);
+    // Return addresses on the stack name the call chain that led into the loop.
+    uint32_t* sp = reinterpret_cast<uint32_t*>(c.Esp);
+    int shown = 0;
+    for (int i = 0; i < 256 && shown < 12; ++i) {
+        uint32_t v = 0;
+        if (!CanReadDword(sp + i, &v)) break;
+        if (v <= base + 0x1000 || v >= base + 0x87000) continue;
+        LogLine("[hang]   stack[+%03x] -> rva 0x%05lx", i * 4, (unsigned long)(v - base));
+        ++shown;
+    }
+    (void)h;
+    LogLine("[hang] ==========================================");
+}
+
+static DWORD WINAPI WatchdogProc(LPVOID) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    const DWORD self = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+    ThreadSample samples[32] = {};
+    unsigned nSamples = 0;
+    while (!InterlockedCompareExchange(&g_watchdogStop, 0, 0)) {
+        Sleep(2000);
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) continue;
+        THREADENTRY32 te = {};
+        te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te)) {
+            do {
+                if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+                if (!h) continue;
+                CONTEXT c = {};
+                c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                if (SuspendThread(h) != (DWORD)-1) {
+                    const bool got = GetThreadContext(h, &c) != 0;
+                    ResumeThread(h);
+                    if (got && c.Eip > base + 0x1000 && c.Eip < base + 0x87000) {
+                        ThreadSample* s = nullptr;
+                        for (unsigned i = 0; i < nSamples; ++i)
+                            if (samples[i].tid == te.th32ThreadID) { s = &samples[i]; break; }
+                        if (!s && nSamples < 32) { s = &samples[nSamples++]; s->tid = te.th32ThreadID; }
+                        if (s) {
+                            if ((c.Eip & ~0x3Fu) == (s->lastEip & ~0x3Fu)) ++s->stuckCount;
+                            else { s->stuckCount = 0; s->reported = false; }
+                            s->lastEip = (uint32_t)c.Eip;
+                            if (s->stuckCount >= 4 && !s->reported) {
+                                s->reported = true;
+                                WatchdogReport(h, c, te.th32ThreadID, base);
+                            }
+                        }
+                    }
+                }
+                CloseHandle(h);
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+    }
+    return 0;
+}
+
+static void StartFreezeWatchdog() {
+    if (g_watchdogThread) return;
+    g_watchdogThread = CreateThread(nullptr, 0, WatchdogProc, nullptr, 0, nullptr);
+    LogLine("[hang] freeze watchdog started (samples every 2s, reports after ~8s of no progress)");
+}
+// ---------------------------------------------------------------------------------------------
+
 static DWORD WINAPI InitThread(LPVOID) {
     WriteMarkerFile("InitThread.begin");
     SetConfig(LoadConfig());
@@ -1704,6 +1823,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     if (Config().captureExistingWindow) CaptureExistingProcessWindow();
 
     LogLine("[init] hooks installed");
+    StartFreezeWatchdog();
     WriteMarkerFile("InitThread.end");
     return 0;
 }
