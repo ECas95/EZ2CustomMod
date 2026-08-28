@@ -544,6 +544,9 @@ static DWORD g_directVideoValidFrames = 0, g_directVideoFrameFailures = 0;
 static unsigned char* g_directVideoFrameBuffer = nullptr;
 static DWORD g_directVideoFrameCapacity = 0;
 static bool g_directVideoFfmpeg = false;
+static bool g_directVideoLoop = false;      // generic pool clip: restart instead of freezing
+static DWORD g_directVideoLoopClock = 0;
+static DWORD g_directVideoLoops = 0;
 
 static void ResetDirectBmsVideoRuntime() {
     StopDirectBmsFfmpegVideo();
@@ -879,6 +882,23 @@ static void RenderDirectVideoFrame(void* self) {
                                 (unsigned long)actual, (unsigned long)expected64);
                     }
                 }
+            } else if (hr == (HRESULT)0x80040227 /* VFW_E_WRONG_STATE */ && g_directVideoLoop) {
+                // The clip ran out. The player does not rewind on its own -- it just stops
+                // handing out frames, which is why a generic clip shorter than the song left
+                // its last frame frozen on screen for the rest of the play. Restart it with
+                // the game's own stop/play so the graph state is whatever it expects.
+                // Rate-limited: if the restart itself fails, this must not spin every frame.
+                const DWORD now = GetTickCount();
+                if (now - g_directVideoLoopClock > 250) {
+                    g_directVideoLoopClock = now;
+                    auto stopVideo = reinterpret_cast<DirectVideoStop_t>(Rva(0x0b8f0));
+                    auto playVideo = reinterpret_cast<DirectVideoPlay_t>(Rva(0x0b8b0));
+                    stopVideo(self);
+                    playVideo(self, 0);
+                    if (++g_directVideoLoops <= 3)
+                        LogLine("[bga-direct] generic clip ended; looped (%lu)",
+                                (unsigned long)g_directVideoLoops);
+                }
             } else if (g_directVideoFrameFailures++ < 3) {
                 LogLine("[bga-direct] GetCurrentBuffer failed hr=0x%08lx", (unsigned long)hr);
             }
@@ -907,6 +927,9 @@ static int __fastcall HookSongPackage(void* self, void*, const char* request) {
         if (!videoPath.empty()) {
             lstrcpynA(g_directVideoPath, videoPath.c_str(), MAX_PATH);
             g_directVideoStartMs = DirectBmsVideoStartMs();
+            g_directVideoLoop = DirectBmsVideoIsFallback();
+            g_directVideoLoopClock = 0;
+            g_directVideoLoops = 0;
         }
         return 1;
     }

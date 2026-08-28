@@ -33,12 +33,17 @@ static int g_scanTotal = 0;   // song folders to process this scan — drives th
 static bool g_directBmsEnabled = false;
 static std::string g_directBmsVideoPath;
 static uint32_t g_directBmsVideoStartMs = 0;
+// True when the clip came from the generic Video\_spv pool rather than the song's own BGA.
+// Those are shorter than most songs, so they are the ones worth looping.
+static bool g_directBmsVideoFallback = false;
 
 void SetDirectBmsEnabled(bool enabled) { g_directBmsEnabled = enabled; }
 bool DirectBmsEnabled() { return g_directBmsEnabled; }
-void ResetDirectBmsVideo() { StopDirectBmsFfmpegVideo(); g_directBmsVideoPath.clear(); g_directBmsVideoStartMs = 0; }
+void ResetDirectBmsVideo() { StopDirectBmsFfmpegVideo(); g_directBmsVideoPath.clear();
+                             g_directBmsVideoStartMs = 0; g_directBmsVideoFallback = false; }
 const std::string& DirectBmsVideoPath() { return g_directBmsVideoPath; }
 uint32_t DirectBmsVideoStartMs() { return g_directBmsVideoStartMs; }
+bool DirectBmsVideoIsFallback() { return g_directBmsVideoFallback; }
 
 // Forward declarations for helpers used by the audio cache block.
 static bool fileExistsLocal(const std::string& path);
@@ -437,16 +442,35 @@ static int bmsEventToEzTrack5Key(const ParsedBmsEvent& e) {
 // 0x61..0x69 (P2), matching bmsChannelToEzTrackMode's −0x40 fold.
 static bool isLongNoteChannel(int ch) { return (ch >= 0x51 && ch <= 0x59) || (ch >= 0x61 && ch <= 0x69); }
 
+// Ticks per 4/4 measure in the .ez charts we emit.
+//
+// The shipped charts use 192, and for a long time so did we -- but BMS files are not authored on
+// that grid. Measured over 45,707 notes from 80 of the installed charts, the dominant subdivision
+// is 1/384 of a measure: 192/384 = 0.5, so every odd position lands exactly between two ticks and
+// rounds. 24% of all notes were displaced, by a mean of 4.17 ms and essentially always the full
+// half-tick. Native charts sit exactly on their grid and have none of that, which is why custom
+// charts felt harder to time than native ones at the same level.
+//
+// 384 makes the dominant case exact and halves the worst case for everything else. The engine
+// honours the field rather than assuming it -- sub_411BA0 reads the resolution from the song
+// package at +0x88 and derives ticks-per-beat as resolution/4 -- and 192 is only the value its
+// own loader writes as a default.
+static const uint32_t kEzTicksPerMeasure = 384;
+// What the shipped charts use, and therefore the unit of every tick statistic the native model
+// learned. Gaps taken from the model have to be scaled before they are applied to charts of ours.
+static const uint32_t kNativeTicksPerMeasure = 192;
+static const uint32_t kModelTickScale = kEzTicksPerMeasure / kNativeTicksPerMeasure;
+
 static uint32_t bmsTickToEzTick(const ParsedBmsForEz& bms, int measure, int index, int div) {
     double pos = 0.0;
     for (int m = 0; m < measure; ++m) {
         double scale = 1.0;
         if (m < (int)bms.measureScale.size()) scale = bms.measureScale[m];
-        pos += 192.0 * scale;
+        pos += (double)kEzTicksPerMeasure * scale;
     }
     double scale = 1.0;
     if (measure < (int)bms.measureScale.size()) scale = bms.measureScale[measure];
-    pos += ((double)index / (double)div) * 192.0 * scale;
+    pos += ((double)index / (double)div) * (double)kEzTicksPerMeasure * scale;
     if (pos < 0.0) pos = 0.0;
     return (uint32_t)(pos + 0.5);
 }
@@ -1156,13 +1180,13 @@ static std::set<uint32_t> selectAutoSpecialTicks(const std::vector<AutoTickGroup
     return selected;
 }
 
-// 192 ticks per measure, so this is an 8th note: hitting the same lane again inside that window
+// An 8th note at whatever grid we emit: hitting the same lane again inside that window
 // is a jack, and a generated chart full of them is unplayable. "lastLane" only ever remembered ONE
 // note back and its 48-point penalty was swamped by the unbounded laneUse term, so nothing actually
 // stopped a lane repeating on consecutive ticks.
-static const uint32_t kJackGapTicks = 24;
+static const uint32_t kJackGapTicks = 24 * kModelTickScale;
 // Minimum rest between the end of a long note and the start of the next long on the SAME lane.
-static const uint32_t kLongChainGapTicks = 24;
+static const uint32_t kLongChainGapTicks = 24 * kModelTickScale;
 
 static int chooseAutoLane(const std::vector<int>& candidates, uint32_t tick, int sourceTrack,
                           const std::set<int>& usedAtTick, const std::array<uint32_t,64>& blockedUntil,
@@ -1334,14 +1358,19 @@ static void ApplyModeAutoGeneration(std::vector<EzRawEventOut> (&byTrack)[64],
         secondSideShare = modelRatio(model->secondSideNotes, ordinary, secondSideShare, 0.15, 0.80);
     }
 
+    // These come out of the model in NATIVE ticks -- the shipped charts it was learned from --
+    // so they are clamped in that unit and then scaled into the grid we actually emit. Leaving them
+    // unscaled would halve every spacing rule in musical terms the moment the grid changed.
     uint32_t scratchGap = model && model->scratchGapCount ?
         static_cast<uint32_t>(model->scratchGapSum / model->scratchGapCount) : 24u;
     uint32_t pedalGap = model && model->pedalGapCount ?
         static_cast<uint32_t>(model->pedalGapSum / model->pedalGapCount) : 48u;
     if (scratchGap < 6) scratchGap = 6;
-    if (scratchGap > 192) scratchGap = 192;
+    if (scratchGap > kNativeTicksPerMeasure) scratchGap = kNativeTicksPerMeasure;
     if (pedalGap < 12) pedalGap = 12;
-    if (pedalGap > 384) pedalGap = 384;
+    if (pedalGap > kNativeTicksPerMeasure * 2) pedalGap = kNativeTicksPerMeasure * 2;
+    scratchGap *= kModelTickScale;
+    pedalGap   *= kModelTickScale;
 
     uint32_t seed = static_cast<uint32_t>(Config().autoGenerateSeed);
     for (char c : identity) seed = seed * 33u + static_cast<unsigned char>(c);
@@ -1949,20 +1978,35 @@ static bool createSsfFromResolvedAudio(const std::string& src, const std::string
     return false;
 }
 
+// A cached .ez written under a different tick grid still PLAYS correctly -- the resolution travels
+// in its header -- but it keeps the old quantisation error, so it has to be rebuilt to gain
+// anything. Reading two bytes is far cheaper than reparsing, and it means the grid can change
+// without anyone having to remember to wipe CustomCache by hand.
+static bool ezCacheMatchesGrid(const std::string& ezPath) {
+    FILE* f = fopen(ezPath.c_str(), "rb");
+    if (!f) return false;
+    unsigned char head[0x88] = {};
+    size_t got = fread(head, 1, sizeof(head), f);
+    fclose(f);
+    if (got < sizeof(head) || memcmp(head, "EZFF", 4) != 0) return false;
+    uint16_t res = (uint16_t)(head[0x86] | (head[0x87] << 8));
+    return res == (uint16_t)kEzTicksPerMeasure;
+}
+
 static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezPath,
                               const std::string& baseName, std::string* report,
                               std::vector<unsigned char>* memoryOut = nullptr) {
     ParsedBmsForEz bms;
     if (!parseBmsForEz(bmsPath, bms)) return false;
     std::vector<EzRawEventOut> byTrack[64];
-    uint32_t totalTicks = 192;
+    uint32_t totalTicks = kEzTicksPerMeasure;
     for (const auto& e : bms.events) {
         int tr = bmsEventToEzTrack5Key(e);
         if (tr < 0 || tr >= 64) continue;
         uint32_t tick = bmsTickToEzTick(bms, e.measure, e.index, e.div);
         EzRawEventOut out{tick, tr, e.wavId, 6, e.channel, 1, 0.0f};
         byTrack[tr].push_back(out);
-        if (tick + 192 > totalTicks) totalTicks = tick + 192;
+        if (tick + kEzTicksPerMeasure > totalTicks) totalTicks = tick + kEzTicksPerMeasure;
     }
 
     // Native EZ stores BPM changes as type-3 events in track 0.
@@ -1973,7 +2017,7 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
         uint32_t tick = bmsTickToEzTick(bms, te.measure, te.index, te.div);
         byTrack[0].push_back({tick, 0, 0, 0, 0, 3, (float)te.bpm});
         tempos.push_back({tick, te.bpm});
-        if (tick + 192 > totalTicks) totalTicks = tick + 192;
+        if (tick + kEzTicksPerMeasure > totalTicks) totalTicks = tick + kEzTicksPerMeasure;
     }
 
     int longNotes = 0;
@@ -2030,10 +2074,14 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
     for (int t = 0; t < 64; ++t)
         for (const auto& ev : byTrack[t]) {
             if (ev.type == 3) continue; // BPM marker, not a note
-            uint32_t endTick = ev.tick + (uint32_t)(ev.len > 192 ? ev.len : 192);
+            uint32_t endTick = ev.tick + (uint32_t)(ev.len > (int)kEzTicksPerMeasure ? ev.len : (int)kEzTicksPerMeasure);
             if (endTick > totalTicks) totalTicks = endTick;
         }
-    { uint32_t pad = (uint32_t)(3.0 * 0.8 * (bms.bpm > 0.0 ? bms.bpm : 120.0)); if (pad < 192) pad = 192; totalTicks += pad; }
+    {
+        uint32_t pad = (uint32_t)(3.0 * 0.8 * (bms.bpm > 0.0 ? bms.bpm : 120.0) * kModelTickScale);
+        if (pad < kEzTicksPerMeasure) pad = kEzTicksPerMeasure;
+        totalTicks += pad;
+    }
 
     std::stable_sort(tempos.begin(), tempos.end(), [](const auto& a, const auto& b){ return a.first < b.first; });
     double durationSeconds = 0.0;
@@ -2041,11 +2089,11 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
     uint32_t cursor = 0;
     for (const auto& tempo : tempos) {
         uint32_t tick = std::min(tempo.first, totalTicks);
-        if (tick > cursor && currentBpm > 0.0) durationSeconds += (tick - cursor) * 240.0 / (192.0 * currentBpm);
+        if (tick > cursor && currentBpm > 0.0) durationSeconds += (tick - cursor) * 240.0 / ((double)kEzTicksPerMeasure * currentBpm);
         cursor = tick;
         if (tempo.second > 0.0) currentBpm = tempo.second;
     }
-    if (totalTicks > cursor && currentBpm > 0.0) durationSeconds += (totalTicks - cursor) * 240.0 / (192.0 * currentBpm);
+    if (totalTicks > cursor && currentBpm > 0.0) durationSeconds += (totalTicks - cursor) * 240.0 / ((double)kEzTicksPerMeasure * currentBpm);
 
     std::vector<unsigned char> out;
     out.resize(0x96, 0);
@@ -2053,7 +2101,7 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
     out[4] = 0; out[5] = 8; // v23: native FNEX charts are version 8; basename must match the .ez/.es filename.
     putFixedString(out, 0x06, 0x40, baseName);
     putFixedString(out, 0x46, 0x40, bms.artist);
-    putU16(out, 0x86, 192);
+    putU16(out, 0x86, (uint16_t)kEzTicksPerMeasure);
     putFloat(out, 0x88, (float)bms.bpm);
     putU16(out, 0x8c, 64);
     putU32(out, 0x8e, totalTicks);
@@ -2505,7 +2553,8 @@ static void GeneratePlayableCacheV10(const CustomBmsSong& song, bool materialize
         // scan was re-parsing these). The mtime check invalidates the cache when the user swaps a BMS
         // (same folder/id, new content) — otherwise stale .ez kept old levels/notes. Was a plain
         // exists-check; that froze edits until the CustomCache folder was manually deleted.
-        if (!materializeAudio && cacheIsFresh(ezPath, src) && cacheIsFresh(eziPath, src)) { emitted++; continue; }
+        if (!materializeAudio && cacheIsFresh(ezPath, src) && cacheIsFresh(eziPath, src) &&
+            ezCacheMatchesGrid(ezPath)) { emitted++; continue; }
         // materializeAudio pass only needs to (re)write the keysound .ssf via the EZI loop;
         // the .ez chart is already on disk from the up-front pass, so skip re-parsing it.
         bool okEz = materializeAudio ? true : generateEzFromBms(src, ezPath, base, &report);
@@ -2581,9 +2630,13 @@ static float directFloat(const unsigned char* p) {
 
 static bool decodeDirectEz(const std::vector<unsigned char>& ez,
                            std::vector<DirectRawEvent> (&tracks)[64],
-                           uint32_t (&trackMax)[64], float& bpm, float& seconds) {
+                           uint32_t (&trackMax)[64], float& bpm, float& seconds, uint32_t& resolution) {
     if (ez.size() < 0x96 || memcmp(ez.data(), "EZFF", 4) != 0 || directU16(ez.data() + 0x8c) != 64)
         return false;
+    // Ticks per measure travels with the chart rather than being assumed, so charts cached under an
+    // older grid keep playing correctly instead of running at the wrong speed.
+    resolution = directU16(ez.data() + 0x86);
+    if (resolution == 0) resolution = kNativeTicksPerMeasure;
     bpm = directFloat(ez.data() + 0x88);
     seconds = directFloat(ez.data() + 0x92);
     size_t off = 0x96;
@@ -2827,7 +2880,7 @@ static void selectDirectBmsVideo(const CustomBmsSong& song, const ParsedBmsForEz
         }
     }
     if (selected.empty()) findFirstDirectVideo(song.songDir, 0, selected);
-    if (selected.empty()) selectRandomBgaPoolVideo(selected);
+    g_directBmsVideoFallback = selected.empty() && selectRandomBgaPoolVideo(selected);
     if (selected.empty()) {
         LogLine("[bga-direct] no playable video id='%s'", song.id.c_str());
         return;
@@ -2866,7 +2919,8 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
     std::vector<DirectRawEvent> tracks[64];
     uint32_t trackMax[64]{};
     float bpm = 120.0f, seconds = 0.0f;
-    if (!decodeDirectEz(ez, tracks, trackMax, bpm, seconds)) {
+    uint32_t resolution = kNativeTicksPerMeasure;
+    if (!decodeDirectEz(ez, tracks, trackMax, bpm, seconds, resolution)) {
         LogLine("[direct] EZ-memory selfcheck failed id='%s'", song->id.c_str());
         return false;
     }
@@ -2943,7 +2997,7 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
     memset(object + 0x1d1c, 0, 0x32000 * 4);
     lstrcpynA(reinterpret_cast<char*>(object + 8), selected.title.c_str(), 64);
     lstrcpynA(reinterpret_cast<char*>(object + 0x48), selected.artist.c_str(), 64);
-    *reinterpret_cast<uint32_t*>(object + 0x88) = 192;
+    *reinterpret_cast<uint32_t*>(object + 0x88) = resolution;
     *reinterpret_cast<float*>(object + 0x8c) = bpm;
     *reinterpret_cast<float*>(object + 0x90) = seconds;
     *reinterpret_cast<uint32_t*>(object + 0x94) = 0;

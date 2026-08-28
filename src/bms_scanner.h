@@ -108,6 +108,7 @@ bool DirectBmsEnabled();
 void ResetDirectBmsVideo();
 const std::string& DirectBmsVideoPath();
 uint32_t DirectBmsVideoStartMs();
+bool DirectBmsVideoIsFallback();   // clip came from the generic pool, so it should loop
 bool StartDirectBmsFfmpegVideo(const std::string& path);
 bool ReadDirectBmsFfmpegFrame(void* buffer, uint32_t bytes);
 void StopDirectBmsFfmpegVideo();
