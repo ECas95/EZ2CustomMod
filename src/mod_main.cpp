@@ -1786,7 +1786,7 @@ static DWORD WINAPI WatchdogProc(LPVOID) {
 }
 
 static void StartFreezeWatchdog() {
-    if (g_watchdogThread) return;
+    if (g_watchdogThread || !Config().hangWatchdog) return;
     g_watchdogThread = CreateThread(nullptr, 0, WatchdogProc, nullptr, 0, nullptr);
     LogLine("[hang] freeze watchdog started (samples every 2s, reports after ~8s of no progress)");
 }

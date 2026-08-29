@@ -1938,8 +1938,18 @@ static void RemoveStemFix() {
 }
 
 void InstallTraceHooks() {
-    InstallGsFailureProbe();
+    // The stem fix is a correctness patch for a real defect in the original, so it always goes
+    // in. The /GS probe is pure diagnostics and is opt-in.
+    if (Config().gsProbe) InstallGsFailureProbe();
     InstallStemFix();
+    // Judge hooks fire per judgement and their stub costs pushad + a 0x214-byte frame +
+    // fxsave/fxrstor on every hit -- paid even when the handler's first act is to return
+    // because tracing is off. Decide here instead, so an unwanted hook is never patched in.
+    if (!Config().traceJudge) {
+        for (auto& h : g_hooks)
+            if (h.rva == 0x26500 || h.rva == 0x26700 || h.rva == 0x268C0 || h.rva == 0x26AB0)
+                h.enabled = false;
+    }
     // The replacement owns 0x35070 outright, so it has to claim those 5 bytes before the
     // trace hook writes its own jmp over them -- and the trace hook must then stay away.
     if (InstallFilterReplacement()) {

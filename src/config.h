@@ -8,6 +8,12 @@ struct ModConfig {
     bool traceFileApi = false;
     bool traceBmsScan = false;
     bool traceJudge = false;
+    // Diagnostics that cost something on the target machine, so both default to OFF.
+    // gsProbe sits on the return path of 275 functions; hangWatchdog suspends and resumes
+    // every thread in the process every two seconds, which on a single-core cabinet is a
+    // stutter you can feel.
+    bool gsProbe = false;
+    bool hangWatchdog = false;
     bool enableFunctionTrace = true;
     bool altEnter = true;
     bool borderlessOnly = true;
