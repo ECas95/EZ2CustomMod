@@ -109,6 +109,12 @@ void ResetDirectBmsVideo();
 const std::string& DirectBmsVideoPath();
 uint32_t DirectBmsVideoStartMs();
 bool DirectBmsVideoIsFallback();   // clip came from the generic pool, so it should loop
+
+// Committed memory, largest free block, GDI/USER handles, and the ten biggest regions.
+// Cheap enough to call on a category change, far too slow for a frame.
+void ReportProcessFootprint(const char* why);
+// Committed VirtualAlloc calls by size band, to attribute growth the 1MB log cannot see.
+void ReportAllocHistogram(const char* why);
 bool StartDirectBmsFfmpegVideo(const std::string& path);
 bool ReadDirectBmsFfmpegFrame(void* buffer, uint32_t bytes);
 void StopDirectBmsFfmpegVideo();

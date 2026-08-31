@@ -280,6 +280,11 @@ static uint32_t g_gsLastCount = 0;
 // 0x400000 puts the array at obj+0x400000, about 2 MB clear of the highest field anywhere in the
 // decompilation, and the offsets our own arrays use (0x110000..0x1131FC) sit in a 1 MB hole that
 // no field touches.
+// SongSelect entry layout, shared by the inject, the filter and the songname window.
+static const uint32_t kEntryBytes    = 0x374;   // 884
+static const uint32_t kEntryIdOff    = 0x10C;
+static const uint32_t kEntryLevelOff = 0x214;
+static const uint32_t kVisibleBase   = 300;     // obj+300, stride kEntryBytes
 static const uint32_t kMasterOrigBase = 0x5E2BC;
 static const uint32_t kMasterHome     = 0x400000;                        // where master[] now lives
 static const uint32_t kMasterRel      = kMasterHome - kMasterOrigBase;   // 0x3A1D44
@@ -417,7 +422,18 @@ static std::vector<std::string> CustomCategoriesForModeOrLargest(const std::stri
 // ( == ecx+0x5e3c8 for i=0 ). So custom songs must ALSO exist in master[] with their id.
 static const uint32_t kCatCountTableBase = 0x03789bd4;
 static const uint32_t kCatNameTableBase  = 0x03789c90;
-static const uint32_t kCatNameStride = 0x1b4; // entries per category
+// Ids per category.
+//
+// The shipped table holds 436 -- the same 436 that bounded the filter's stack array -- and our copy
+// used to match it. It does not have to: the table lives in memory we allocate, the replacement
+// filter is the only thing that reads it, and the two native walkers with the 6976-byte stride
+// baked in (rva 0x28FA7, 0x69E70) work on the game's own copy, not ours.
+//
+// 872 is not a round number, it is the exact ceiling: visible[] starts at obj+300 and the first
+// live object field above it is obj+0xBC57C, so 300 + 872*884 = 0xBC44C fits with 304 bytes to
+// spare while 873 would overrun it. Pinned in master_layout_test.
+static const uint32_t kNativeCatNameStride = 0x1b4;   // 436, what the game's own table holds
+static const uint32_t kCatNameStride = 872;           // ours
 static const uint32_t kCatNameSize   = 0x10;  // bytes per id string
 // When the capacity patch ran, the game's filter (FUN_00435070 @ 0x35093/0x35112) reads these
 // category globals from a SHIFTED base (+0x56*(cap-436)); our inject writes the same shifted base.
@@ -441,7 +457,12 @@ static void EnsureCategoryTablesRelocated() {
     if (!cnt || !ids) { LogLine("[category] reloc alloc FAILED"); return; }
     uint32_t shift = CatShift();
     memcpy(cnt, reinterpret_cast<void*>(kCatCountTableBase + shift), 47u * 4u);
-    memcpy(ids, reinterpret_cast<void*>(kCatNameTableBase  + shift), 47u * kCatNameStride * kCatNameSize);
+    // Row by row: source rows are kNativeCatNameStride apart, ours are kCatNameStride apart.
+    for (uint32_t nc = 0; nc < 47u; ++nc)
+        memcpy(reinterpret_cast<unsigned char*>(ids) + (size_t)nc * kCatNameStride * kCatNameSize,
+               reinterpret_cast<unsigned char*>(kCatNameTableBase + shift)
+                   + (size_t)nc * kNativeCatNameStride * kCatNameSize,
+               kNativeCatNameStride * kCatNameSize);
     uint32_t c = reinterpret_cast<uint32_t>(cnt), i = reinterpret_cast<uint32_t>(ids);
     bool ok = WriteMemory(Rva(0x35093), &c, 4) && WriteMemory(Rva(0x35112), &i, 4);
     g_catCountBuf = c; g_catIdBuf = i;
@@ -458,8 +479,11 @@ static void RefreshRelocatedNativeCategoryTables() {
     // divides by that count on category change → STATUS_INTEGER_DIVIDE_BY_ZERO (0xc0000094).
     uint32_t shift = CatShift();
     std::memcpy(reinterpret_cast<void*>(g_catCountBuf), reinterpret_cast<void*>(kCatCountTableBase + shift), 47u * 4u);
-    std::memcpy(reinterpret_cast<void*>(g_catIdBuf), reinterpret_cast<void*>(kCatNameTableBase + shift),
-                47u * kCatNameStride * kCatNameSize);
+    for (uint32_t nc = 0; nc < 47u; ++nc)
+        memcpy(reinterpret_cast<unsigned char*>(g_catIdBuf) + (size_t)nc * kCatNameStride * kCatNameSize,
+               reinterpret_cast<unsigned char*>(kCatNameTableBase + shift)
+                   + (size_t)nc * kNativeCatNameStride * kCatNameSize,
+               kNativeCatNameStride * kCatNameSize);
 }
 
 // One-shot: append custom songs to the master array and populate the native category
@@ -590,8 +614,18 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
         char idbuf[0x20] = {};
         strncpy(idbuf, s.id.c_str(), sizeof(idbuf) - 1);
         SafeWriteBytes(entry + 0x10C, idbuf, (uint32_t)strlen(idbuf) + 1); // id (disc/songname use this; abs 568)
-        uint32_t noSongname = 0;
-        SafeWriteBytes(entry + 0x004, &noSongname, 4);
+        // Every custom entry is seeded from a copy of master[0] -- a NATIVE song -- so it arrives
+        // carrying that song's texture pointers. Two of them are per-entry and get drawn directly
+        // out of the record, so they have to be cleared or the native art shows through:
+        //   +0x000  the small disc, which sub_431AE0 draws for the whole change-song animation.
+        //           Left seeded, every custom song animated in with master[0]'s disc.
+        //   +0x004  the song name.
+        // Cleared rather than filled: the wheel window loads the real ones for the entries that can
+        // actually be seen, and an empty slot draws nothing, which is the right thing to show while
+        // it has not arrived yet.
+        uint32_t noTexture = 0;
+        SafeWriteBytes(entry + 0x000, &noTexture, 4);
+        SafeWriteBytes(entry + 0x004, &noTexture, 4);
         const uint32_t lvlOff[4] = {0x214, 0x220, 0x22C, 0x238};
         int lvl[4] = {s.levelNM, s.levelHD, s.levelSHD, s.levelEX};
         // CRITICAL: the song-list filter (FUN_00435070) copies an entry into the visible display
@@ -629,7 +663,9 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     // 0x4448fe + C++ unwind frames). So cap per-category at 256 (clear margin under the working 285).
     // ponytail: raise toward the real limit once found (bisect), or relocate the render's per-category
     // structure like we did for master[]/the category tables. A folder with more than this shows 256.
-    const uint32_t kSafePerCat = 436u; // the filter's display stack array holds 436 entries (its max)
+    // Raised with the visible array: the replacement filter builds its gather list on the heap,
+    // so 436 was only ever the size of the stack array it no longer uses.
+    const uint32_t kSafePerCat = 872u;
     uint32_t perCat = (budget >= (uint32_t)allSongs.size()) ? kSafePerCat
                                                             : (numCats ? budget / numCats : 0);
     if (perCat == 0) perCat = 1;
@@ -760,6 +796,132 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     }
 }
 
+// GDI object headroom.
+//
+// Every songname texture the game loads costs a GDI object, and its texture pool is a bump
+// allocator with no free path -- so browsing categories only ever adds. A process gets 10,000 GDI
+// objects by default, and 52 categories of up to 400 songs is more than twice that. The measured
+// failure looked like this:
+//
+//     [mem] render failed: committed=3296MB largestFreeBlock=15MB regions=43375 gdiObjects=9999
+//     [mem] render failed: committed=3296MB largestFreeBlock=15MB regions=43379 gdiObjects=10000
+//
+// pegged at exactly the limit. Past it every allocation fails at once: the game's textures, our
+// rendering, even GdiplusStartup -- which is why GDI+ appeared to fail "for memory reasons" and
+// sent me looking in the wrong place.
+//
+// Stopping short of the wall turns a hard abort into songs whose name does not draw. That is a bad
+// outcome and it is still enormously better than losing the session, and it is what makes the
+// difference recoverable rather than terminal.
+//
+// The real capacity fix is not in this process: GDIProcessHandleQuota under
+// HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows raises the per-process ceiling as
+// far as 65,536. Evicting textures would be better still, but the loader caches them by filename
+// and freeing one without invalidating that cache leaves a dangling pointer.
+static const uint32_t kGdiObjectLimit  = 10000;   // the Windows default
+static const uint32_t kGdiSafeHeadroom = 1200;    // room for the wheel, the video path and the CRT
+
+static uint32_t GdiObjectsInUse() {
+    return (uint32_t)GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+}
+
+static bool GdiHeadroomAvailable(uint32_t want) {
+    const uint32_t used = GdiObjectsInUse();
+    if (used == 0) return true;                    // query unavailable; do not block on it
+    return used + want + kGdiSafeHeadroom <= kGdiObjectLimit;
+}
+
+// Per-entry wheel textures, loaded for what can actually be seen.
+//
+// There are TWO of them, and a missing one shows up as a different bug each time:
+//
+//   entry+0x000  the small disc. sub_431AE0 draws this while the disc is under 176px -- which is
+//                the whole change-song animation -- and only switches to the shared full-size
+//                "HotSpotDisc" texture once it settles. No custom song ever had one, so the slot
+//                kept whatever a native song left there and every transition flashed that disc.
+//   entry+0x004  the song name.
+//
+// Both come from files the mod already redirects into the per-song cache, and neither is ever
+// requested by name: the game reads the slot directly, so nothing loads them unless we do.
+//
+// The whole category used to be loaded at once. Measured, that is exactly one GDI object per song,
+// never released, because the game's texture pool is a bump allocator:
+//
+//     category=98 requested=400 loaded=400 gdi=2232(+400)
+//     category=97 requested=287 loaded=287 gdi=2519(+287)
+//     category=96 requested=300 loaded=300 gdi=2819(+300)
+//
+// A process gets 10,000. Twenty-five categories browsed and the budget is gone, every later
+// category loads nothing, and every song name goes blank -- which is what "textures stopped
+// showing" was.
+//
+// Eviction is not available: the loader caches textures in a binary tree keyed by filename
+// (sub_414460), so removing or renaming a node breaks the search for everything else. What IS
+// available is not loading them in the first place. The wheel draws a couple of dozen entries, so
+// a window around the selection is all that has to exist, and the current build proved a null
+// texture slot draws a blank name rather than crashing.
+//
+// The window is written into the VISIBLE array rather than master[], because the filter copies
+// master into visible when the category changes -- anything written to master afterwards would
+// never reach the renderer. Re-entering a category reloads, but a reload of a name already in the
+// game's cache is a tree lookup that returns the existing texture and costs no new object.
+static const uint32_t kSongnameWindow = 32;    // the wheel shows ~12; each entry now costs TWO
+                                              // textures, so the window is sized to keep a whole
+                                              // browsing session well inside the GDI budget
+
+static uint32_t g_snObject = 0;
+static uint32_t g_snLastSelected = 0xFFFFFFFFu;
+
+static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible, const char* why) {
+    if (!obj || !visible || visible > 436) return;
+    const uint32_t gfxCtx = SafeRead32(0x1b2f054);
+    if (!gfxCtx) return;
+    // The wheel is CIRCULAR: with the cursor near the top of the list the rows drawn above it are
+    // the last entries of the category, not blank space. A window clamped at 0 leaves exactly those
+    // rows without a texture, which is why the list looked empty above the selection and filled in
+    // only once the cursor had moved far enough to reach them. Walking an offset and taking it
+    // modulo the count covers the wrap.
+    const int32_t half = (int32_t)(kSongnameWindow / 2);
+    // One validation for the whole array instead of one per entry: CanReadPtr is a VirtualQuery and
+    // this runs whenever the selection moves.
+    if (!CanReadPtr(reinterpret_cast<void*>(obj + kVisibleBase), visible * kEntryBytes)) return;
+
+    typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
+    LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
+    unsigned long loaded = 0, discs = 0, blocked = 0;
+    for (int32_t k = -half; k <= half; ++k) {
+        const uint32_t i = (uint32_t)(((int32_t)selected + k + (int32_t)visible * 2) % (int32_t)visible);
+        const uint32_t entry = obj + kVisibleBase + i * kEntryBytes;
+        uint32_t* const nameSlot = reinterpret_cast<uint32_t*>(entry + 0x004);
+        uint32_t* const discSlot = reinterpret_cast<uint32_t*>(entry + 0x000);
+        if (*nameSlot && *discSlot) continue;                          // both already filled
+        const char* id = reinterpret_cast<const char*>(entry + kEntryIdOff);
+        if (id[0] != 'b' || id[1] != 'm' || id[2] != 's') continue;     // native songs: not ours
+        if (!GdiHeadroomAvailable(2)) { ++blocked; break; }
+        char request[MAX_PATH] = {};
+        if (!*nameSlot) {
+            snprintf(request, sizeof(request), "system\\songname\\%.31s.bmp", id);
+            loadTex(gfxCtx, request, nameSlot, nullptr);
+            if (*nameSlot) ++loaded;
+        }
+        if (!*discSlot) {
+            snprintf(request, sizeof(request), "system\\discsmall\\%.31s.bmp", id);
+            loadTex(gfxCtx, request, discSlot, nullptr);
+            if (*discSlot) ++discs;
+        }
+    }
+    if (loaded || discs || blocked) {
+        static unsigned long s_total = 0;
+        s_total += loaded + discs;
+        static unsigned s_lines = 0;
+        if (++s_lines <= 40 || blocked)
+            LogLine("[wheeltex] %s sel=%lu of %lu +/-%ld names=%lu discs=%lu blocked=%lu "
+                    "sessionTotal=%lu gdi=%lu",
+                    why, (unsigned long)selected, (unsigned long)visible, (long)half,
+                    loaded, discs, blocked, s_total, (unsigned long)GdiObjectsInUse());
+    }
+}
+
 static void LoadCustomCategorySongnames(uint32_t ecx, uint32_t categoryParam) {
     if (ecx != g_lazySongnameObject || categoryParam < 47) return;
     size_t categoryIndex = (size_t)(categoryParam - 47);
@@ -767,25 +929,18 @@ static void LoadCustomCategorySongnames(uint32_t ecx, uint32_t categoryParam) {
     uint32_t gfxCtx = SafeRead32(0x1b2f054);
     if (!gfxCtx) return;
 
-    DWORD started = GetTickCount();
-    // Keep one native-owned texture per song in categories actually visited. Sharing aliases across
-    // entries survived one SongSelect but corrupted ownership when that object was destroyed/recreated.
-    typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
-    LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
-    unsigned long loaded = 0;
-    for (const auto& item : g_lazySongnames[categoryIndex]) {
-        char request[MAX_PATH] = {};
-        snprintf(request, sizeof(request), "system\\songname\\%s.bmp", item.id.c_str());
-        loadTex(gfxCtx, request, reinterpret_cast<void*>(item.masterEntry + 0x004), nullptr);
-        if (SafeRead32(item.masterEntry + 0x004)) ++loaded;
-    }
+    // The bulk load is gone. It cost one GDI object per song in the category and they were never
+    // released; the window above loads what the wheel can draw and grows as the selection moves.
+    // The bookkeeping is still marked so the rest of the flow is unchanged.
     g_lazySongnameLoaded[categoryIndex] = 1;
+    g_snObject = 0;
+    g_snLastSelected = 0xFFFFFFFFu;
     std::vector<std::string> categories = CustomCategoriesForModeOrLargest(GetActiveMode());
     const char* name = categoryIndex < categories.size() ? categories[categoryIndex].c_str() : "?";
-    LogLine("[assets-lazy] category=%lu name='%s' requested=%lu loaded=%lu loadMs=%lu categoryCache=1",
+    LogLine("[assets-lazy] category=%lu name='%s' songs=%lu -- windowed load, gdi=%lu",
             (unsigned long)categoryParam, name,
-            (unsigned long)g_lazySongnames[categoryIndex].size(), loaded,
-            (unsigned long)(GetTickCount() - started));
+            (unsigned long)g_lazySongnames[categoryIndex].size(),
+            (unsigned long)GdiObjectsInUse());
 }
 
 // NOTE: there is NO separate "staging buffer". Disassembly of EZ2B.exe (the
@@ -1036,6 +1191,13 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
                 static bool logged = false;
                 if (!logged) { logged = true; LogLine("[rank] custom Top-5 suppressed id='%.15s' selected=%lu", id, (unsigned long)selected); }
             }
+        }
+        // Selection-driven songname loading. This runs every frame, so it does nothing at all
+        // unless the highlighted entry changed -- one comparison in the common case.
+        if (regs->ecx != g_snObject || selected != g_snLastSelected) {
+            g_snObject = regs->ecx;
+            g_snLastSelected = selected;
+            LoadSongnameWindow(regs->ecx, selected, visible, "scroll");
         }
         return; // called every frame; never trace-spam this renderer
     }
@@ -1419,10 +1581,6 @@ static void RemoveCustomCategoryPatches() {
 // for writes instead. Raising the cap is a one-line change once the probe reports it clean.
 // =============================================================================================
 
-static const uint32_t kEntryBytes    = 0x374;   // 884
-static const uint32_t kEntryIdOff    = 0x10C;
-static const uint32_t kEntryLevelOff = 0x214;
-static const uint32_t kVisibleBase   = 300;     // obj+300, stride kEntryBytes
 static const uint32_t kMasterOrig    = 0x5E2BC;
 static const uint32_t kSelectedIdVar = 0x1B2EB04;
 
@@ -1437,7 +1595,7 @@ static const uint32_t kObjRetCopy     = 36 * 4;   // 0x90
 static const uint32_t kObjScrollA     = 49 * 4;   // 0xC4
 static const uint32_t kObjScrollB     = 51 * 4;   // 0xCC
 
-static uint32_t g_visibleCap = 436;   // see the note above before raising this
+static uint32_t g_visibleCap = 872;   // the exact ceiling; see kCatNameStride and master_layout_test
 
 // ---- case-insensitive id index over master[] --------------------------------------------------
 // Ids are at most 15 characters in a 16-byte field. Keys are stored lowercased in our own memory
@@ -1689,6 +1847,14 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
         NormalizeId(reinterpret_cast<const char*>(idAddr), have);
         if (want[0] && memcmp(have, want, 16) == 0) { selected = i; break; }
     }
+    // visible[] has just been rebuilt from master[], where the songname slot is zero, so every
+    // texture pointer the previous occupant of this array had is gone. Repopulating here rather than
+    // in the lazy preload matters: that one returns early for a category it has already seen, so a
+    // second visit used to leave the whole list nameless.
+    g_snObject = obj;
+    g_snLastSelected = selected;
+    LoadSongnameWindow(obj, selected, written, "category");
+
     const float scroll = (float)selected * 100.0f;
     const uint32_t retVal = SafeRead32(obj + kObjRetVal);
     SafeWriteBytes(obj + kObjSelected,  &selected, 4);
@@ -1698,6 +1864,18 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
     SafeWriteBytes(obj + kObjScrollB,   &scroll, 4);
     SafeWriteBytes(obj + kObjRetCopy,   &retVal, 4);
 
+    // The footprint at scan time was a healthy 791MB; the 3,296MB that broke rendering appeared
+    // later, while browsing. Sampling every few category changes is what shows which of the two
+    // it is -- a steady climb per category, or one big step somewhere.
+    {
+        static uint32_t s_changes = 0;
+        if ((s_changes++ % 5) == 0) {
+            char why[48];
+            snprintf(why, sizeof(why), "category change #%lu", (unsigned long)s_changes);
+            ReportProcessFootprint(why);
+            ReportAllocHistogram(why);
+        }
+    }
     g_gsLastCat = cat;            // so a /GS failure names the category that led to it
     g_gsLastCount = published;
     static uint32_t s_lastCat = 0xFFFFFFFFu;

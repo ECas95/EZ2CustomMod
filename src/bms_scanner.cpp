@@ -3234,11 +3234,14 @@ static bool GenerateBmpFile(const std::string& path, int w, int h,
                     oldFont = (HFONT)SelectObject(hdc, font);
                     SIZE size{};
                     GetTextExtentPoint32A(hdc, text.c_str(), (int)text.size(), &size);
-                    if (size.cx <= r.right - r.left && size.cy <= r.bottom - r.top) break;
+                    if (px <= 8 || (size.cx <= r.right - r.left && size.cy <= r.bottom - r.top)) break;
                     SelectObject(hdc, oldFont);
                     DeleteObject(font);
                     font = nullptr;
                 }
+                // The loop used to fall out with no font when even 8px was too wide, and then
+                // return -- drawing NOTHING. That is why long titles came up blank in the wheel
+                // instead of merely small. 8px is the floor; DT_END_ELLIPSIS trims what is left.
                 if (!font) return;
                 if (!plain) {                          // drop shadow only in styled mode
                     RECT shadow = r; OffsetRect(&shadow, 1, 1);
@@ -3255,11 +3258,51 @@ static bool GenerateBmpFile(const std::string& path, int w, int h,
             // plain: category(16h)=11; songname/totalresult(32h)=14 −10% → 13 (bold+smaller,
             // less pixelated in-game). styled keeps the larger bold size.
             int maxPx = plain ? (h <= 16 ? 11 : 13) : (h <= 16 ? 12 : h <= 32 ? 21 : 26);
+
+            // A song title too wide for one line gets two rather than being shrunk into
+            // illegibility or, past the 8px floor, clipped to an ellipsis. The canvas already has
+            // the room -- native songname art is 256x32 with a single 10px band at y 13..22, so a
+            // second 13px line fits inside it without touching either edge.
+            //
+            // The decision is measured, not guessed from a character count: the DC and the font are
+            // both right here, so ask GDI whether the string fits and split only when it does not.
+            // The split point is the word boundary that leaves the two halves most even, which
+            // keeps the second line from being a lone trailing word.
+            std::string l1 = line1, l2 = line2;
+            const int avail = (plain ? w - 2 : w - 3) - 3;
+            if (l2.empty() && h >= 32 && !l1.empty()) {
+                HFONT probe = CreateFontA(-maxPx, 0, 0, 0, plain ? plainWeight : FW_BOLD, FALSE,
+                                          FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+                                          CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                          DEFAULT_PITCH | FF_SWISS, "Arial");
+                HFONT prev = (HFONT)SelectObject(hdc, probe);
+                SIZE whole{};
+                GetTextExtentPoint32A(hdc, l1.c_str(), (int)l1.size(), &whole);
+                if (whole.cx > avail) {
+                    size_t best = std::string::npos;
+                    size_t bestDelta = l1.size();
+                    for (size_t i = 0; i < l1.size(); ++i) {
+                        if (l1[i] != ' ') continue;
+                        const size_t left = i, right = l1.size() - i - 1;
+                        const size_t delta = left > right ? left - right : right - left;
+                        if (delta < bestDelta) { bestDelta = delta; best = i; }
+                    }
+                    if (best != std::string::npos) {
+                        l2 = l1.substr(best + 1);
+                        l1 = l1.substr(0, best);
+                    }
+                }
+                SelectObject(hdc, prev);
+                DeleteObject(probe);
+            }
+
             // plain right-aligned: full-width rect, small right margin.
-            RECT r1 = {3, 1, plain ? w - 2 : w - 3, line2.empty() ? h - 1 : h / 2};
+            RECT r1 = {3, 1, plain ? w - 2 : w - 3, l2.empty() ? h - 1 : h / 2};
             RECT r2 = {3, h / 2, plain ? w - 2 : w - 3, h - 1};
-            drawLine(line1, r1, maxPx);
-            drawLine(line2, r2, std::max(8, maxPx - 3));
+            drawLine(l1, r1, maxPx);
+            // Both lines get the same size when the split was ours: they are one title, and a
+            // smaller second line reads as a subtitle. Only a caller-supplied line2 is stepped down.
+            drawLine(l2, r2, line2.empty() ? maxPx : std::max(8, maxPx - 3));
         }
 
         // Retrieve bottom-up pixel data (standard BMP storage)
@@ -3364,9 +3407,31 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
     // are all-caps with no descenders, so a line box overhanging the canvas costs nothing.
     // The loop also always ends holding a font -- the old one returned with font==nullptr when the
     // text was too long even at 6px, silently rendering an empty sprite instead of an elided one.
-    auto draw = [&](const std::wstring& txt, RECT r, int maxPx, COLORREF col) {
+    // condense: fit by narrowing the glyphs instead of shrinking them.
+    //
+    // The wheel row is drawn at roughly a third of the sprite's width, and a stroke only survives
+    // that downscale if it is at least two pixels wide. Dropping the point size to make a long name
+    // fit takes the strokes to one pixel: "ARC.SW" came out perfectly legible in the bitmap at 10px
+    // and then vanished completely on screen, while its shorter neighbours -- still at 13px, still
+    // two pixels thick -- were fine. Holding the height and squeezing the width keeps the weight.
+    auto draw = [&](const std::wstring& txt, RECT r, int maxPx, COLORREF col, bool condense = false) {
         if (txt.empty()) return;
         HFONT font = nullptr, oldFont = nullptr;
+        if (condense) {
+            int width = 0;                       // 0 = the face's own proportions
+            for (;;) {
+                font = CreateFontW(-maxPx, width, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                   DEFAULT_PITCH | FF_SWISS, L"Arial");
+                oldFont = (HFONT)SelectObject(hdc, font);
+                RECT calc = r; DrawTextW(hdc, txt.c_str(), -1, &calc, DT_CALCRECT | DT_SINGLELINE);
+                // The floor is a real one: past about a third of the height the glyphs stop being
+                // distinguishable from each other, and ellipsis is the better answer.
+                if ((calc.right - calc.left) <= (r.right - r.left) || width == maxPx / 3) break;
+                SelectObject(hdc, oldFont); DeleteObject(font); font = nullptr;
+                width = width ? width - 1 : maxPx * 2 / 3;
+            }
+        } else {
         for (int px = maxPx < 6 ? 6 : maxPx; ; --px) {
             font = CreateFontW(-px, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
@@ -3375,6 +3440,7 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
             RECT calc = r; DrawTextW(hdc, txt.c_str(), -1, &calc, DT_CALCRECT | DT_SINGLELINE);
             if (px <= 6 || (calc.right - calc.left) <= (r.right - r.left)) break;
             SelectObject(hdc, oldFont); DeleteObject(font); font = nullptr;
+        }
         }
         const UINT fmt = (alignRight ? DT_RIGHT : DT_CENTER) | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
         // The native 256x64 art has symmetric antialiasing and no drop shadow; only the cramped
@@ -3392,10 +3458,24 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
     // this slot uses. With no details.txt both are empty and the slot renders blank on purpose,
     // rather than falling back to the folder name: a raw "PIU.1" in the song panel is noise. The
     // texture is still produced (empty) because a missing file leaves a null slot.
-    if (!twoLine) {
-        // One line over the whole canvas. Native category_NN.abm is 128x16 with its ink in y 2..12,
-        // i.e. 11px caps, which Arial Bold reaches at an em of about h-1.
-        draw(Utf8ToWide(category), RECT{2, 0, w - (alignRight ? 3 : 2), h}, h - 1, RGB(235,235,235));
+    if (!twoLine && alignRight) {
+        // The label under the song title: one right-aligned line over the whole canvas. Native
+        // category_NN.abm is 128x16 with its ink in y 2..12, i.e. 11px caps, which Arial Bold
+        // reaches at an em of about h-1.
+        draw(Utf8ToWide(category), RECT{2, 0, w - 3, h}, h - 1, RGB(235,235,235));
+    } else if (!twoLine) {
+        // A wheel tab. The sprite is 128px but the game draws the row at roughly 45px of pitch, so
+        // what matters is the INK width, not the canvas. Native names are three characters and come
+        // out 21-27px wide; ours run to seven and reached 59px, which is why they ran into each
+        // other on screen.
+        //
+        // Narrowing the box rather than the font is deliberate: the fit loop only shrinks text that
+        // does not fit, so short names keep full size and native proportions while long ones step
+        // down on their own. A 40px box measures: OTH 25px, ANX 27px, ARC.1 36px, ARC.SW 40px --
+        // all inside the pitch, with the short ones untouched.
+        const int box = 40;
+        const int pad = (w - box) / 2 > 0 ? (w - box) / 2 : 2;
+        draw(Utf8ToWide(category), RECT{pad, 0, w - pad, h}, 13, RGB(235,235,235), true);
     } else {
         // Category sprite: BOTH lines live in this one texture, exactly like the native art --
         // the name in white over a smaller subtitle in orange. It is only 16px tall because every
@@ -3692,6 +3772,139 @@ static bool isArtworkImage(const std::string& f) {
     return endsWith(f, ".png") || endsWith(f, ".jpg") || endsWith(f, ".jpeg") || endsWith(f, ".bmp");
 }
 
+
+
+// What the process has left, for the moment rendering starts failing.
+//
+// GDI+ startup and plain GDI began failing together, which rules out the GDI handle table (that
+// would not touch GdiplusStartup) and points at address space. Guessing has already cost several
+// rounds here, so this reports the numbers instead: committed private bytes from a VirtualQuery
+// walk, the largest free block left, and the GDI/USER handle counts for contrast. All of it is
+// XP-safe -- VirtualQuery and GetGuiResources both date to NT4/2000.
+struct ProcessFootprint {
+    uint64_t committedBytes;
+    uint64_t largestFreeBytes;
+    uint32_t regions;
+    uint32_t gdiObjects;
+    uint32_t userObjects;
+};
+
+static ProcessFootprint MeasureProcessFootprint() {
+    ProcessFootprint f{};
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    unsigned char* p = (unsigned char*)si.lpMinimumApplicationAddress;
+    unsigned char* end = (unsigned char*)si.lpMaximumApplicationAddress;
+    MEMORY_BASIC_INFORMATION mbi{};
+    while (p < end && VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        if (mbi.State == MEM_COMMIT) f.committedBytes += mbi.RegionSize;
+        else if (mbi.State == MEM_FREE && mbi.RegionSize > f.largestFreeBytes)
+            f.largestFreeBytes = mbi.RegionSize;
+        ++f.regions;
+        unsigned char* next = (unsigned char*)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= p) break;
+        p = next;
+    }
+    f.gdiObjects  = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+    f.userObjects = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+    return f;
+}
+
+static void LogLargestRegions(const char* why);
+static inline void LogLargestRegionsFwd(const char* why) { LogLargestRegions(why); }
+
+static void LogProcessFootprint(const char* why);
+void ReportProcessFootprint(const char* why) { LogProcessFootprint(why); }
+
+static void LogProcessFootprint(const char* why) {
+    const ProcessFootprint f = MeasureProcessFootprint();
+    LogLine("[mem] %s: committed=%luMB largestFreeBlock=%luMB regions=%lu gdiObjects=%lu userObjects=%lu",
+            why, (unsigned long)(f.committedBytes / 1048576),
+            (unsigned long)(f.largestFreeBytes / 1048576),
+            (unsigned long)f.regions, (unsigned long)f.gdiObjects, (unsigned long)f.userObjects);
+    LogLargestRegionsFwd(why);
+}
+
+// The ten largest committed allocations, so a commit figure can be attributed rather than guessed
+// at. Reservations are reported separately: a 512 MB reserve costs address space but no memory, and
+// on a 32-bit target the difference decides whether the process fits at all.
+static void LogLargestRegions(const char* why) {
+    struct Region { uintptr_t base; uint64_t bytes; uint32_t protect; uint32_t type; bool committed; };
+    std::vector<Region> regions;
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    unsigned char* p = (unsigned char*)si.lpMinimumApplicationAddress;
+    unsigned char* end = (unsigned char*)si.lpMaximumApplicationAddress;
+    MEMORY_BASIC_INFORMATION mbi{};
+    uint64_t reserved = 0, imageBytes = 0, mappedBytes = 0, privateBytes = 0;
+    while (p < end && VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        if (mbi.State == MEM_COMMIT) {
+            regions.push_back({(uintptr_t)mbi.BaseAddress, (uint64_t)mbi.RegionSize,
+                               mbi.Protect, mbi.Type, true});
+            if (mbi.Type == MEM_IMAGE)        imageBytes   += mbi.RegionSize;
+            else if (mbi.Type == MEM_MAPPED)  mappedBytes  += mbi.RegionSize;
+            else                              privateBytes += mbi.RegionSize;
+        } else if (mbi.State == MEM_RESERVE) {
+            reserved += mbi.RegionSize;
+        }
+        unsigned char* next = (unsigned char*)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= p) break;
+        p = next;
+    }
+    std::sort(regions.begin(), regions.end(),
+              [](const Region& a, const Region& b) { return a.bytes > b.bytes; });
+    LogLine("[mem] %s breakdown: private=%luMB image=%luMB mapped=%luMB reservedOnly=%luMB",
+            why, (unsigned long)(privateBytes / 1048576), (unsigned long)(imageBytes / 1048576),
+            (unsigned long)(mappedBytes / 1048576), (unsigned long)(reserved / 1048576));
+    const size_t show = regions.size() < 10 ? regions.size() : 10;
+    for (size_t i = 0; i < show; ++i) {
+        const char* kind = regions[i].type == MEM_IMAGE ? "image"
+                         : regions[i].type == MEM_MAPPED ? "mapped" : "private";
+        LogLine("[mem]   #%u %08lx %6luMB %s prot=%lx", (unsigned)(i + 1),
+                (unsigned long)regions[i].base, (unsigned long)(regions[i].bytes / 1048576),
+                kind, (unsigned long)regions[i].protect);
+    }
+}
+
+// A valid .abm built without touching GDI, for when rendering one is not possible.
+//
+// Asset generation goes through GDI: GetDC, CreateCompatibleDC, CreateDIBSection. Every one of
+// those can fail, and a process only gets 10,000 GDI handles. When they do fail the caller has no
+// way to draw anything -- but it still must not leave the file missing, because the game's loader
+// treats a .abm that will not open as a licence to run off the end of a 260-byte stack buffer
+// (sub_407E50 -> sub_412F00 -> sub_407B60). A flat rectangle is a poor songname; a missing file is
+// a crash. This writes the rectangle: header plus a memset, no handles of any kind.
+static void writeSmallTextFileLocal(const std::string& path, const char* text) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return;
+    fwrite(text, 1, strlen(text), f);
+    fclose(f);
+}
+
+static bool WriteFlatAbmFile(const std::string& abmPath, int w, int h, int bpp, unsigned char level) {
+    if (w <= 0 || h <= 0 || (bpp != 16 && bpp != 24)) return false;
+    const int bytesPerPixel = bpp / 8;
+    const int rowBytes = ((w * bytesPerPixel + 3) & ~3);
+    const size_t pixelBytes = (size_t)rowBytes * (size_t)h;
+    std::vector<unsigned char> out(54 + pixelBytes, level);
+    BITMAPFILEHEADER bfh{};
+    bfh.bfType = 0x4D42;
+    bfh.bfOffBits = 54;
+    bfh.bfSize = (DWORD)out.size();
+    BITMAPINFOHEADER bih{};
+    bih.biSize = sizeof(bih);
+    bih.biWidth = w;
+    bih.biHeight = h;
+    bih.biPlanes = 1;
+    bih.biBitCount = (WORD)bpp;
+    bih.biCompression = BI_RGB;
+    bih.biSizeImage = (DWORD)pixelBytes;
+    memcpy(out.data(), &bfh, sizeof(bfh));
+    memcpy(out.data() + sizeof(bfh), &bih, sizeof(bih));
+    if (!AbmFromBmpBytes(out)) return false;
+    return writeBinaryFile(abmPath, out);
+}
+
 static void GenerateVisualAssetCache(const CustomBmsSong& song, const char* onlyRole = nullptr) {
     if (song.cacheDir.empty()) return;
     const bool all = onlyRole == nullptr;
@@ -3714,10 +3927,23 @@ static void GenerateVisualAssetCache(const CustomBmsSong& song, const char* only
     if (wantResult) ensureCacheSubdir(song.cacheDir, "resultdisc");
     if (wantName) ensureCacheSubdir(song.cacheDir, "songname");
 
-    ULONG_PTR gdipToken = 0;
-    Gdiplus::GdiplusStartupInput gdipInput;
-    bool gdipStarted = (wantArtwork || wantName) &&
-        Gdiplus::GdiplusStartup(&gdipToken, &gdipInput, nullptr) == Gdiplus::Ok;
+    // GDI+ used to be started and shut down inside this function, which runs ONCE PER SONG. A
+    // 168-song category preload therefore span GDI+ up and down 168 times -- 719 ms of it in the
+    // last log, against 47-188 ms when categories were smaller -- and left generation failing in a
+    // contiguous run of 91 songs once the churn caught up with it. One token for the life of the
+    // process costs nothing and removes both the stall and the failures.
+    static ULONG_PTR s_gdipToken = 0;
+    static bool s_gdipStarted = false;
+    if ((wantArtwork || wantName) && !s_gdipStarted) {
+        Gdiplus::GdiplusStartupInput gdipInput;
+        s_gdipStarted = Gdiplus::GdiplusStartup(&s_gdipToken, &gdipInput, nullptr) == Gdiplus::Ok;
+        if (!s_gdipStarted) {
+            static bool s_reported = false;
+            LogLine("[assets] GDI+ startup FAILED; art will fall back to flat tiles");
+            if (!s_reported) { s_reported = true; LogProcessFootprint("GDI+ startup refused"); }
+        }
+    }
+    const bool gdipStarted = s_gdipStarted;
     std::string artworkPath;
     UINT artworkW = 0, artworkH = 0;
     uint64_t largestPixels = 0;
@@ -3742,20 +3968,60 @@ static void GenerateVisualAssetCache(const CustomBmsSong& song, const char* only
     auto gen = [&](const char* sub, int w, int h, bool circular, int bpp, const std::string& text = std::string()) {
         std::string bmp = JoinPath(JoinPath(song.cacheDir, sub), song.id + ".bmp");
         std::string abm = replaceExtensionLocal(bmp, ".abm");
-        if (fileExistsLocal(abm)) return 0;
+        const std::string marker = JoinPath(JoinPath(song.cacheDir, sub), song.id + ".fallback");
+        const bool placeholder = fileExistsLocal(marker);
+        if (fileExistsLocal(abm) && !placeholder) return 0;
+        if (placeholder) DeleteFileA(marker.c_str());   // about to try for a real one
         return GenerateVisualPair(bmp, w, h, RGB(0,0,0), text.empty() ? RGB(180,245,255) : RGB(255,255,255),
                                   text, "", text.empty() ? artwork.get() : nullptr, false, circular, bpp);
     };
 
-    int created = 0;
-    if (artwork) {
-        if (wantDisc) created += gen("disc", 256, 256, true, 24);
-        if (wantDiscSmall) created += gen("discsmall", 128, 128, true, 24);
-        if (wantEye) created += gen("eyecatch", 1024, 512, false, 24);
-        if (wantResult) created += gen("resultdisc", 128, 128, true, 16);
+    // gen() returns 0 both when the asset was already cached and when rendering failed, so the
+    // only trustworthy check is whether the file is there afterwards. Anything still missing gets a
+    // flat tile, because the game cannot survive being told to open an .abm that is not there.
+    int created = 0, rescued = 0;
+    auto ensureOrFlatten = [&](const char* sub, int w, int h, int bpp) {
+        const std::string dir = JoinPath(song.cacheDir, sub);
+        const std::string abm = JoinPath(dir, song.id + ".abm");
+        if (fileExistsLocal(abm)) return;
+        if (WriteFlatAbmFile(abm, w, h, bpp, 0)) {
+            ++rescued;
+            // A flat tile is a placeholder, not a result. Marking it means the next visit re-renders
+            // it properly instead of the cache treating one transient out-of-memory blip as this
+            // song's permanent artwork -- which is what "textures disappear and never come back"
+            // would look like from the wheel.
+            writeSmallTextFileLocal(JoinPath(dir, song.id + ".fallback"), "1");
+            static unsigned s_reported = 0;
+            if (s_reported < 3) { ++s_reported; LogProcessFootprint("render failed"); }
+            LogLine("[assets] RENDER FAILED id='%s' role='%s' -- flat %dx%d tile written and marked "
+                    "for retry", song.id.c_str(), sub, w, h);
+        } else {
+            LogLine("[assets] RENDER FAILED id='%s' role='%s' and the fallback could not be written",
+                    song.id.c_str(), sub);
+        }
+    };
+
+    // 1,095 of the installed songs ship no image at all, and these four roles used to sit inside
+    // an  if (artwork)  -- so for every one of them the game was left asking for an .abm that was
+    // never going to exist. gen() already renders TEXT when it is given some, falling back to the
+    // artwork only when the text is empty, so an artless song gets its title on the disc instead of
+    // nothing at all. Readable beats black, and both beat a missing file.
+    {
+        const std::string label = artwork ? std::string() : (song.title.empty() ? song.id : song.title);
+        if (wantDisc)      created += gen("disc", 256, 256, true, 24, label);
+        if (wantDiscSmall) created += gen("discsmall", 128, 128, true, 24, label);
+        if (wantEye)       created += gen("eyecatch", 1024, 512, false, 24, label);
+        if (wantResult)    created += gen("resultdisc", 128, 128, true, 16, label);
     }
-    if (wantName)
+    if (wantName) {
         created += gen("songname", 256, 32, false, 24, song.title.empty() ? song.id : song.title);
+        ensureOrFlatten("songname", 256, 32, 24);
+    }
+    // Art roles only exist when there was source artwork to build them from; the game asks for them
+    // by name regardless, so the same guarantee applies.
+    if (wantDisc)      ensureOrFlatten("disc", 256, 256, 24);
+    if (wantDiscSmall) ensureOrFlatten("discsmall", 128, 128, 24);
+    if (wantResult)    ensureOrFlatten("resultdisc", 128, 128, 16);
 
     // Legacy disk fallback only. The validated direct profile opens BMSData video in place.
     if (wantVideo && !g_directBmsEnabled && !song.videoFiles.empty()) {
@@ -3771,10 +4037,10 @@ static void GenerateVisualAssetCache(const CustomBmsSong& song, const char* only
         if (!fileExistsLocal(iniPath))
             FnexWriteEncryptedTextFile(iniPath, "PlayDelayTime = 35\r\nPlayStartPos = 0", FnexCryptoKind::Ini);
     }
-    LogLine("[assets] lazy id='%s' role='%s' source='%s' size=%ux%u created=%d",
-            song.id.c_str(), all ? "all" : role.c_str(), artworkPath.c_str(), artworkW, artworkH, created);
-    artwork.reset();
-    if (gdipStarted) Gdiplus::GdiplusShutdown(gdipToken);
+    LogLine("[assets] lazy id='%s' role='%s' source='%s' size=%ux%u created=%d rescued=%d",
+            song.id.c_str(), all ? "all" : role.c_str(), artworkPath.c_str(), artworkW, artworkH,
+            created, rescued);
+    artwork.reset();   // GDI+ itself stays up: see the startup note above
 }
 
 std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& request) {
@@ -4339,6 +4605,7 @@ void ScanBMSData() {
         WaitAllVideoJobs();
         PrepareBgaPool();
     }
+    LogProcessFootprint("scan complete");
     LogLine("[bms] indexed custom songs=%lu activeMode='%s' idmap=%lu entries scanMs=%lu",
             static_cast<unsigned long>(g_songs.size()), g_activeMode.c_str(), (unsigned long)g_idMap.size(),
             static_cast<unsigned long>(GetTickCount() - scanStart));
