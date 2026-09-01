@@ -118,6 +118,29 @@ static const uint32_t kSortBiasedOrig = 0xBFFC8;   // [base + cat*4], cat 19..46
 static const uint32_t kSortReloc      = 0x113000;  // clear of A at 0x112000; 128 entries = 512 bytes
 static const uint32_t kSortNativeLo   = 19;        // first category served out of the array
 static const uint32_t kSortNativeHi   = 46;        // last native one
+
+// Where custom categories start in the wheel.
+//
+// The game ships 47 categories, and decoding their Sortimage tiles shows only some are real:
+//
+//     00..02   HOT, NEW, ALL            meta views
+//     03..18   1st, S/E, 2nd .. NT, TT  the 16 game versions -- the only ones with their own songs
+//     19..36   LV1 .. LV18+             level views: the same library re-sorted
+//     37..46   ABC, DEF .. YZ+, OTH     alphabetical views: likewise
+//
+// The last 28 hold no songs of their own, and at 19k+ custom songs an "ABC" view is a liability
+// rather than a feature -- they are also where the LV-category crash came from. Handing their
+// slots to custom categories takes the ceiling from 80 to 108 without moving a single byte of
+// native data: 0..18 stay exactly where the game's own loader put them.
+//
+// This lines up with what is already here: version labels occupy 0..kVerNativeCount-1 (= 0..18)
+// and the sortstyle natives are exactly kSortNativeLo..kSortNativeHi (= 19..46). So slot 19 is
+// both the first slot we take and the first slot those arrays already expect us to own.
+//
+// SLOT is not FILENAME. Custom tiles keep their category_48+ / sortstyle_47+ names, because the
+// native files category_01..47 still exist on disk and renumbering would collide with them.
+static const uint32_t kCustomCatBase  = 19;        // first wheel slot we own (was 47)
+static const uint32_t kWheelMax       = 127;       // signed imm8 ceiling in the gate instructions
 static CategoryMemoryEdit g_sortEdits[] = {
     {0x44820, kSortBiasedOrig, kSortReloc, 0, 4, false},
     {0x449BC, kSortBiasedOrig, kSortReloc, 0, 4, false},
@@ -464,9 +487,11 @@ static void EnsureCategoryTablesRelocated() {
     void* ids = VirtualAlloc(nullptr, kCats * kCatNameStride * kCatNameSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!cnt || !ids) { LogLine("[category] reloc alloc FAILED"); return; }
     uint32_t shift = CatShift();
-    memcpy(cnt, reinterpret_cast<void*>(kCatCountTableBase + shift), 47u * 4u);
+    memcpy(cnt, reinterpret_cast<void*>(kCatCountTableBase + shift), kCustomCatBase * 4u);
     // Row by row: source rows are kNativeCatNameStride apart, ours are kCatNameStride apart.
-    for (uint32_t nc = 0; nc < 47u; ++nc)
+    // Only 0..kCustomCatBase-1: rows 19..46 are the dropped LV/alphabetical views and those slots
+    // now belong to custom categories.
+    for (uint32_t nc = 0; nc < kCustomCatBase; ++nc)
         memcpy(reinterpret_cast<unsigned char*>(ids) + (size_t)nc * kCatNameStride * kCatNameSize,
                reinterpret_cast<unsigned char*>(kCatNameTableBase + shift)
                    + (size_t)nc * kNativeCatNameStride * kCatNameSize,
@@ -480,14 +505,14 @@ static void EnsureCategoryTablesRelocated() {
 
 static void RefreshRelocatedNativeCategoryTables() {
     if (!g_catCountBuf || !g_catIdBuf) return;
-    // Native categories 0..46 can change per mode, so re-sync them from the live native globals (using
-    // the same CatShift() base the one-shot relocation copied from). Slots 47+ are custom categories,
+    // Native categories 0..18 can change per mode, so re-sync them from the live native globals (using
+    // the same CatShift() base the one-shot relocation copied from). Slots 19+ are custom categories,
     // OWNED by InjectCustomSongsIntoSongSelect which runs right after — do NOT zero them here, or the
     // second SongSelect build (mode switch) wipes every custom category to count 0 → the game's filter
     // divides by that count on category change → STATUS_INTEGER_DIVIDE_BY_ZERO (0xc0000094).
     uint32_t shift = CatShift();
-    std::memcpy(reinterpret_cast<void*>(g_catCountBuf), reinterpret_cast<void*>(kCatCountTableBase + shift), 47u * 4u);
-    for (uint32_t nc = 0; nc < 47u; ++nc)
+    std::memcpy(reinterpret_cast<void*>(g_catCountBuf), reinterpret_cast<void*>(kCatCountTableBase + shift), kCustomCatBase * 4u);
+    for (uint32_t nc = 0; nc < kCustomCatBase; ++nc)
         memcpy(reinterpret_cast<unsigned char*>(g_catIdBuf) + (size_t)nc * kCatNameStride * kCatNameSize,
                reinterpret_cast<unsigned char*>(kCatNameTableBase + shift)
                    + (size_t)nc * kNativeCatNameStride * kCatNameSize,
@@ -686,8 +711,11 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
                                                             : (numCats ? budget / numCats : 0);
     if (perCat == 0) perCat = 1;
     if (perCat > kSafePerCat) perCat = kSafePerCat;
-    for (size_t ci = 0; ci < categories.size() && (47 + ci) < 256; ++ci) {
-        const uint32_t cat = 47 + (uint32_t)ci;
+    // This is where the category's song list actually lands, so it has to use the SAME base as the
+    // icons, counts and overlays -- writing lists at 47 while the wheel draws slot 19 gives a row of
+    // categories that exist and are empty.
+    for (size_t ci = 0; ci < categories.size() && (kCustomCatBase + ci) < 256; ++ci) {
+        const uint32_t cat = kCustomCatBase + (uint32_t)ci;
         uint32_t k = 0, available = 0;
         for (const auto& song : allSongs) {
             if (_stricmp(song.category.c_str(), categories[ci].c_str()) != 0) continue;
@@ -699,7 +727,7 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
             // 1) master[slot]: id + level floats only (entry zero-init by the game). versionNN =
             // 19+categoryIndex so the version splash matches the category (Version_NN.abm via redirect).
             uint32_t entry = masterBase + slot * kEntrySize;
-            writeEntry(entry, song, slot, 19 + (int)ci);
+            writeEntry(entry, song, slot, (int)kVerNativeCount + (int)ci);
             g_lazySongnames[ci].push_back({entry, song.id});
             // 2) native category table: id string + advance
             char idbuf[kCatNameSize] = {};
@@ -781,7 +809,7 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     {
         std::string leaks;
         uint32_t leakTotal = 0;
-        for (uint32_t c = 0; c < 47; ++c) {
+        for (uint32_t c = 0; c < kCustomCatBase; ++c) {
             uint32_t cnt = SafeRead32(CatCountTable() + c * 4);
             if (!cnt || cnt > kCatNameStride) continue;
             uint32_t hits = 0;
@@ -951,8 +979,8 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
 }
 
 static void LoadCustomCategorySongnames(uint32_t ecx, uint32_t categoryParam) {
-    if (ecx != g_lazySongnameObject || categoryParam < 47) return;
-    size_t categoryIndex = (size_t)(categoryParam - 47);
+    if (ecx != g_lazySongnameObject || categoryParam < kCustomCatBase) return;
+    size_t categoryIndex = (size_t)(categoryParam - kCustomCatBase);
     if (categoryIndex >= g_lazySongnames.size() || g_lazySongnameLoaded[categoryIndex]) return;
     uint32_t gfxCtx = SafeRead32(0x1b2f054);
     if (!gfxCtx) return;
@@ -1053,10 +1081,10 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
         uint32_t gfxCtx = SafeRead32(0x1b2f054);
         if (gfxCtx) {
             for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
-                int catNum = 48 + (int)c;             // native uses 01..47, custom start at 48
+                int catNum = 48 + (int)c;             // FILENAME: native files are 01..47 on disk
                 char fn[80];
                 snprintf(fn, sizeof(fn), "System\\SongSelect\\Sortimage\\category_%02d.bmp", catNum);
-                uint32_t slot = 47 + c;
+                uint32_t slot = kCustomCatBase + c;   // SLOT: we now start at 19, not 47
                 // Small array = the tab row (short folder name). Big array = the large centre
                 // label, which gets its own asset with the full details.txt name.
                 loadTex(gfxCtx, fn, reinterpret_cast<void*>(obj + g_catTexSmallBase + slot * 4), nullptr);
@@ -1139,35 +1167,35 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
             // frees. Indexing is by category now that the 0xBFFC8 bias is gone, so slot 19..46
             // holds what sortstyle[2..29] used to and 47.. holds ours.
             if (g_sortRelocated) {
-                const uint32_t nSort = kSortNativeHi - kSortNativeLo + 1;
-                if (CanReadPtr(reinterpret_cast<void*>(obj + kSortBiasedOrig + kSortNativeLo * 4),
-                               nSort * 4))
-                    SafeWriteBytes(obj + kSortReloc + kSortNativeLo * 4,
-                                   reinterpret_cast<void*>(obj + kSortBiasedOrig + kSortNativeLo * 4),
-                                   nSort * 4);
+                // The native overlays lived in exactly the slots we now own (19..46 = the LV and
+                // alphabetical views), so there is nothing left to copy -- copying them would
+                // overwrite our own categories with the tiles of the views we dropped.
                 static uint32_t s_sortFilledFor = 0;
-                bool sortLost = g_customCategoryCount && !SafeRead32(obj + kSortReloc + 47 * 4);
+                bool sortLost = g_customCategoryCount &&
+                                !SafeRead32(obj + kSortReloc + kCustomCatBase * 4);
                 if (s_sortFilledFor != obj || sortLost) {
                     s_sortFilledFor = obj;
                     unsigned long sok = 0;
                     for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
-                        const uint32_t cat = 47 + c;
+                        const uint32_t slot = kCustomCatBase + c;   // where it goes
+                        const uint32_t file = 47 + c;               // what it is called on disk
                         char sf[128] = {};
                         snprintf(sf, sizeof(sf),
                                  "System\\SongSelect\\V_View\\sortstyle\\sortstyle_%02lu.bmp",
-                                 (unsigned long)cat);
+                                 (unsigned long)file);
                         loadTex(gfxCtx, sf,
-                                reinterpret_cast<void*>(obj + kSortReloc + cat * 4), nullptr);
-                        if (SafeRead32(obj + kSortReloc + cat * 4)) ++sok;
+                                reinterpret_cast<void*>(obj + kSortReloc + slot * 4), nullptr);
+                        if (SafeRead32(obj + kSortReloc + slot * 4)) ++sok;
                     }
-                    LogLine("[sortstyle] %lu natives copied (cat 19..46) + %lu/%lu custom loaded",
-                            (unsigned long)nSort, sok, (unsigned long)g_customCategoryCount);
+                    LogLine("[sortstyle] %lu/%lu custom loaded into slots %lu.. (natives 19..46 dropped)",
+                            sok, (unsigned long)g_customCategoryCount,
+                            (unsigned long)kCustomCatBase);
                 }
             }
-            LogLine("[category] loaded %lu wheel icons into relocated slots 47.. small=%08lx big=%08lx",
-                    (unsigned long)g_customCategoryCount,
-                    (unsigned long)SafeRead32(obj + g_catTexSmallBase + 47 * 4),
-                    (unsigned long)SafeRead32(obj + g_catTexBigBase + 47 * 4));
+            LogLine("[category] loaded %lu wheel icons into relocated slots %lu.. small=%08lx big=%08lx",
+                    (unsigned long)g_customCategoryCount, (unsigned long)kCustomCatBase,
+                    (unsigned long)SafeRead32(obj + g_catTexSmallBase + kCustomCatBase * 4),
+                    (unsigned long)SafeRead32(obj + g_catTexBigBase + kCustomCatBase * 4));
         }
     }
 }
@@ -1483,7 +1511,8 @@ static void RemoveCustomCategoryPatches();
 
 static bool InstallCustomCategoryPatches() {
     std::vector<std::string> categories = CustomCategoriesForModeOrLargest(std::string());
-    g_customCategoryCount = (uint32_t)std::min<size_t>(categories.size(), 80);
+    // 127 wheel slots minus the natives we keep. Was a bare 80 (47 + 80 = 127).
+    g_customCategoryCount = (uint32_t)std::min<size_t>(categories.size(), kWheelMax - kCustomCatBase);
     if (g_customCategoryCount == 0) return true;
     static const unsigned char top5Prologue[] = {0x83, 0xEC, 0x10, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x14};
     if (std::memcmp(Rva(0x33D50), top5Prologue, sizeof(top5Prologue)) != 0) {
@@ -1496,7 +1525,7 @@ static bool InstallCustomCategoryPatches() {
     // now ONLY extend the loop count + geometry (9 immediates) and leave the object's own
     // texture array intact. Slots 47/48 of that object array are filled per-object in the
     // inject (copied from a native slot), so the render reads a valid handle → no crash.
-    const uint32_t categoryCount = 47 + g_customCategoryCount;
+    const uint32_t categoryCount = kCustomCatBase + g_customCategoryCount;
     const uint32_t lastCategory = categoryCount - 1;
     g_categoryEdits[0].replacement = categoryCount;   // loader count (load 49 icons)
     g_categoryEdits[1].replacement = categoryCount;   // renderer count
@@ -1516,7 +1545,7 @@ static bool InstallCustomCategoryPatches() {
         g_categoryEdits[11].replacement = g_catTexBigBase;   // big base → free tail
         g_categoryEdits[12].replacement = g_catTexBigBase;
     } else {
-        g_categoryEdits[1].replacement  = 47;                // no growth → can't relocate
+        g_categoryEdits[1].replacement  = 47;                // no growth → keep all 47 natives
         g_categoryEdits[9].replacement  = g_categoryEdits[9].expected;  // no-op (write back)
         g_categoryEdits[10].replacement = g_categoryEdits[10].expected;
         g_categoryEdits[11].replacement = g_categoryEdits[11].expected;
@@ -1553,7 +1582,10 @@ static bool InstallCustomCategoryPatches() {
             static_cast<unsigned long>(lastCategory), (g_capacityPatched && g_catTexSmallBase) ? 1 : 0,
             (unsigned long)g_catTexSmallBase, (unsigned long)g_catTexBigBase);
     if (categories.size() > g_customCategoryCount) {
-        LogLine("[category] ignored categories=%lu signed-wheel-limit=127", static_cast<unsigned long>(categories.size() - g_customCategoryCount));
+        LogLine("[category] ignored categories=%lu -- wheel holds %lu (limit %lu minus %lu natives kept)",
+            static_cast<unsigned long>(categories.size() - g_customCategoryCount),
+            static_cast<unsigned long>(kWheelMax - kCustomCatBase),
+            (unsigned long)kWheelMax, (unsigned long)kCustomCatBase);
     }
     return true;
 }
