@@ -307,6 +307,14 @@ static uint32_t g_gsLastCount = 0;
 static const uint32_t kEntryBytes    = 0x374;   // 884
 static const uint32_t kEntryIdOff    = 0x10C;
 static const uint32_t kEntryLevelOff = 0x214;
+// A difficulty block is 12 bytes: level, then two BPM floats. Four of them, one per slot.
+//     NM  0x214  0x218  0x21C
+//     HD  0x220  0x224  0x228
+//     SHD 0x22C  0x230  0x234
+//     EX  0x238  0x23C  0x240
+// The wheel's BPM readout draws the NM pair; see writeEntry for where those offsets come from.
+static const uint32_t kEntryBpmOff[4] = { 0x218, 0x224, 0x230, 0x23C };
+
 static const uint32_t kVisibleBase   = 300;     // obj+300, stride kEntryBytes
 static const uint32_t kMasterOrigBase = 0x5E2BC;
 static const uint32_t kMasterHome     = 0x400000;                        // where master[] now lives
@@ -676,6 +684,33 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
         // falling back to the lowest available difficulty.
         if (lvl[0] <= 0) lvl[0] = (lvl[1] > 0) ? lvl[1] : (lvl[2] > 0) ? lvl[2] : (lvl[3] > 0) ? lvl[3] : 1;
         for (int i = 0; i < 4; ++i) { float f = (float)(lvl[i] < 0 ? 0 : lvl[i]); SafeWriteBytes(entry + lvlOff[i], &f, 4); }
+
+        // BPM. Same failure as the small disc above: the record is seeded from master[0], so every
+        // custom song inherited BABY DANCE's 111 and the whole library read 111 in the wheel.
+        //
+        // The offsets come from the readout, sub_434080:
+        //
+        //     sub_434080((int *)this, ..., *(_DWORD *)(this + 132), ...);   // a4 = obj+0x84, the
+        //     v26 = *((float *)v8 + 210);                                   // selected index
+        //     sprintf(v30, "%3.2f", v26);                                   // bpm_NN.bmp digits
+        //
+        // `this` there is the OBJECT, not the array, and the entry array starts at obj+300 -- so
+        // dword 210 is obj + 884*sel + 840, which is entry + 0x21C, not 0x21C's dword index. The
+        // first attempt at this wrote 0x344/0x348 by forgetting to subtract that 300, which is why
+        // it changed nothing.
+        //
+        // Landing on 0x218/0x21C also makes the record make sense: the difficulty blocks are 12
+        // bytes of {level, bpm, bpm}, which is exactly why the scanner carries four BPM values.
+        const float bpmv[4] = { s.bpmNM, s.bpmHD, s.bpmSHD, s.bpmEX };
+        float firstBpm = 0.0f;
+        for (int i = 0; i < 4; ++i) if (bpmv[i] > 0.0f) { firstBpm = bpmv[i]; break; }
+        if (firstBpm > 0.0f) {
+            for (int i = 0; i < 4; ++i) {
+                const float f = bpmv[i] > 0.0f ? bpmv[i] : firstBpm;
+                SafeWriteBytes(entry + kEntryBpmOff[i], &f, 4);       // the pair the readout draws
+                SafeWriteBytes(entry + kEntryBpmOff[i] + 4, &f, 4);
+            }
+        }
     };
 
     EnsureCategoryTablesRelocated(); // move category tables off the native globals before writing customs
