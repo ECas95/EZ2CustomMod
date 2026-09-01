@@ -74,15 +74,26 @@ static LPVOID WINAPI HookVirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWOR
     // The object alloc is VirtualAlloc(NULL, ~0x20f2cc, MEM_COMMIT) — addr==NULL implies reserve,
     // so don't require the MEM_RESERVE flag (the game passes MEM_COMMIT alone).
     bool inflate = addr == nullptr && size >= 0x200000 && size <= 0x220000;
-    LPVOID r = RealVirtualAlloc(addr, inflate ? (SIZE_T)(16u*1024u*1024u) : size, type, prot);
+    // Size it from the patched capacity so the buffer follows the library. This was a fixed 16MB,
+    // which held 14234 entries -- and the capacity patch was free to ask for more than that, with
+    // the shortfall coming out as songs silently missing from the end of the list.
+    SIZE_T want = size;
+    if (inflate) {
+        want = RequiredObjectBytes();
+        if (want < (SIZE_T)(16u*1024u*1024u)) want = (SIZE_T)(16u*1024u*1024u);  // floor
+    }
+    LPVOID r = RealVirtualAlloc(addr, want, type, prot);
     if (r && (type & MEM_COMMIT)) {
         const int b = AllocBucket(size);
         InterlockedIncrement(&g_allocCount[b]);
         InterlockedExchangeAdd(&g_allocMB[b], (LONG)(size / 1048576));
     }
-    if (size >= 0x100000)
-        LogLine("[valloc] req=0x%lx%s type=0x%lx -> %p", (unsigned long)size, inflate ? " ->8MB" : "",
+    if (size >= 0x100000) {
+        char grew[48] = "";
+        if (inflate) _snprintf(grew, sizeof(grew) - 1, " ->%luMB", (unsigned long)(want / 1048576));
+        LogLine("[valloc] req=0x%lx%s type=0x%lx -> %p", (unsigned long)size, grew,
                 (unsigned long)type, r);
+    }
     return r;
 }
 

@@ -291,6 +291,13 @@ static const uint32_t kMasterRel      = kMasterHome - kMasterOrigBase;   // 0x3A
 static bool g_capacityPatched = false;     // master-array cap raised + relocated (+kMasterRel)
 static uint32_t g_songCapacity = 436;      // raised by InstallSongCapacityPatches
 
+// master[] sits at kMasterHome inside the object and runs g_songCapacity entries from there, so
+// this is the whole object. The 1MB tail is headroom for the fields that live past the array.
+unsigned int RequiredObjectBytes() {
+    if (!g_capacityPatched) return 0;
+    return kMasterHome + g_songCapacity * kEntryBytes + 0x100000;
+}
+
 // Relocated category texture arrays (object-relative). The native arrays are EXACTLY 47
 // entries: small at +0xbc4b8, big at +0xc0084, and the field right after small (+0xbc574)
 // is live render state. To add custom slots we move BOTH arrays into the object's free tail,
@@ -562,7 +569,15 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
             got = p + 0x1000;
         }
         uint32_t committedCap = (got > masterBase) ? (uint32_t)((got - masterBase) / kEntrySize) : 0;
-        if (committedCap < kCapacity) kCapacity = committedCap;
+        if (committedCap < kCapacity) {
+            // Losing songs here is invisible from the wheel -- the list just ends early -- so it has
+            // to be loud in the log. Sizing the object from g_songCapacity should keep it from ever
+            // firing; if it does, the object came back smaller than asked for.
+            LogLine("[grow] TRUNCATED: object holds %lu entries but capacity is %lu - %lu songs dropped",
+                    (unsigned long)committedCap, (unsigned long)kCapacity,
+                    (unsigned long)(kCapacity - committedCap));
+            kCapacity = committedCap;
+        }
         static uint32_t s_grow = 0;
         if (s_grow++ < 3) {
             MEMORY_BASIC_INFORMATION mbi{};
@@ -1359,7 +1374,9 @@ static bool InstallSongCapacityPatches(uint32_t newCap) {
     // native category tables; the inject relocates them to our own buffer (EnsureCategoryTablesRelocated)
     // and repoints the filter there, so custom categories don't overrun the native 47-slot region.
     // Group C — songs parsed during category init (16-bit field; write low word only).
-    { uint16_t n = (uint16_t)newCap; ok &= WriteMemory(Rva(0x35F54), &n, 2); }
+    // Full dword: the instruction is `mov edi, 0x1b4` (BF B4 01 00 00) so the immediate is four
+    // bytes wide. Writing only the low word capped this at 65535 and truncated in silence above it.
+    ok &= w32(0x35F54, newCap);
     // Group D — RELOCATE master/song arrays by +REL (the crux: moves them off the state var).
     for (uintptr_t off : {0x3515Bu, 0x375B9u}) ok &= w32(off, 0x5E2BC + REL);
     for (uintptr_t off : {0x35118u, 0x35F80u, 0x360EFu, 0x36198u}) ok &= w32(off, 0x5E3C8 + REL);
