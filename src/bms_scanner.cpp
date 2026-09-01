@@ -3823,6 +3823,7 @@ static ProcessFootprint MeasureProcessFootprint() {
 }
 
 static void LogLargestRegions(const char* why);
+static void LogMemoryAttribution(const char* why);
 static inline void LogLargestRegionsFwd(const char* why) { LogLargestRegions(why); }
 
 static void LogProcessFootprint(const char* why);
@@ -3835,11 +3836,107 @@ static void LogProcessFootprint(const char* why) {
             (unsigned long)(f.largestFreeBytes / 1048576),
             (unsigned long)f.regions, (unsigned long)f.gdiObjects, (unsigned long)f.userObjects);
     LogLargestRegionsFwd(why);
+    LogMemoryAttribution(why);
 }
 
 // The ten largest committed allocations, so a commit figure can be attributed rather than guessed
 // at. Reservations are reported separately: a 512 MB reserve costs address space but no memory, and
 // on a 32-bit target the difference decides whether the process fits at all.
+// Who owns the committed memory.
+//
+// The region walk below says HOW MUCH is committed and of what kind, but not who asked for it, and
+// that is the whole question: the largest single thing in this process is a 512MB private region
+// that never appeared in the VirtualAlloc log. It could not have: our hook patches the IAT of
+// EZ2B.exe, so a DLL calling VirtualAlloc through its own IAT is invisible -- and a HEAP growing is
+// invisible to IAT hooking altogether, because ntdll does not import the function, it implements it.
+//
+// So instead of hooking more, attribute what is already there:
+//
+//   - MEM_IMAGE   -> the module loaded at that base
+//   - MEM_MAPPED  -> the file behind it, via GetMappedFileName (psapi, XP-safe, loaded by name so
+//                    it never becomes a hard import)
+//   - MEM_PRIVATE -> a process heap if its base is one, otherwise a raw VirtualAlloc
+//
+// A 512MB region that turns out to be a heap and a 512MB region that turns out to be one
+// VirtualAlloc call are completely different bugs, and this is what tells them apart.
+static void LogMemoryAttribution(const char* why) {
+    typedef DWORD (WINAPI *GetMappedFileNameA_t)(HANDLE, LPVOID, LPSTR, DWORD);
+    static GetMappedFileNameA_t s_mappedName = nullptr;
+    static bool s_tried = false;
+    if (!s_tried) {
+        s_tried = true;
+        // psapi.dll on XP; kernel32 forwards it on later Windows under a K32 name.
+        HMODULE psapi = LoadLibraryA("psapi.dll");
+        if (psapi)
+            s_mappedName = (GetMappedFileNameA_t)GetProcAddress(psapi, "GetMappedFileNameA");
+        if (!s_mappedName) {
+            HMODULE k32 = GetModuleHandleA("kernel32.dll");
+            if (k32)
+                s_mappedName = (GetMappedFileNameA_t)GetProcAddress(k32, "K32GetMappedFileNameA");
+        }
+    }
+
+    HANDLE heaps[64] = {};
+    const DWORD heapCount = GetProcessHeaps(64, heaps);
+
+    struct Owned { uintptr_t base; uint64_t bytes; const char* kind; char name[MAX_PATH]; };
+    std::vector<Owned> owned;
+    uint64_t heapBytes = 0, imageBytes = 0, mappedBytes = 0, anonBytes = 0;
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    unsigned char* p = (unsigned char*)si.lpMinimumApplicationAddress;
+    unsigned char* end = (unsigned char*)si.lpMaximumApplicationAddress;
+    MEMORY_BASIC_INFORMATION mbi{};
+    const HANDLE self = GetCurrentProcess();
+    while (p < end && VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        unsigned char* next = (unsigned char*)mbi.BaseAddress + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT) {
+            Owned o{};
+            o.base = (uintptr_t)mbi.AllocationBase ? (uintptr_t)mbi.AllocationBase
+                                                   : (uintptr_t)mbi.BaseAddress;
+            o.bytes = (uint64_t)mbi.RegionSize;
+            if (mbi.Type == MEM_IMAGE) {
+                o.kind = "image";
+                imageBytes += o.bytes;
+                GetModuleFileNameA((HMODULE)o.base, o.name, sizeof(o.name));
+            } else if (mbi.Type == MEM_MAPPED) {
+                o.kind = "mapped";
+                mappedBytes += o.bytes;
+                if (s_mappedName) s_mappedName(self, mbi.BaseAddress, o.name, sizeof(o.name));
+            } else {
+                o.kind = "anon";
+                bool isHeap = false;
+                for (DWORD h = 0; h < heapCount; ++h)
+                    if ((uintptr_t)heaps[h] == o.base) { isHeap = true; break; }
+                if (isHeap) { o.kind = "heap"; heapBytes += o.bytes; }
+                else        { anonBytes += o.bytes; }
+            }
+            // Fold consecutive regions of one allocation into a single row.
+            if (!owned.empty() && owned.back().base == o.base) owned.back().bytes += o.bytes;
+            else owned.push_back(o);
+        }
+        if (next <= p) break;
+        p = next;
+    }
+
+    LogLine("[mem] %s owners: heap=%luMB image=%luMB mapped=%luMB anon=%luMB (%lu heaps)",
+            why, (unsigned long)(heapBytes / 1048576), (unsigned long)(imageBytes / 1048576),
+            (unsigned long)(mappedBytes / 1048576), (unsigned long)(anonBytes / 1048576),
+            (unsigned long)heapCount);
+
+    std::sort(owned.begin(), owned.end(),
+              [](const Owned& a, const Owned& b) { return a.bytes > b.bytes; });
+    const size_t show = owned.size() < 12 ? owned.size() : 12;
+    for (size_t i = 0; i < show; ++i) {
+        const char* nm = owned[i].name[0] ? owned[i].name : "";
+        const char* tail = nm;
+        for (const char* c = nm; *c; ++c) if (*c == '\\' || *c == '/') tail = c + 1;
+        LogLine("[mem]   %-6s %08lx %6luMB %s", owned[i].kind,
+                (unsigned long)owned[i].base, (unsigned long)(owned[i].bytes / 1048576), tail);
+    }
+}
+
 static void LogLargestRegions(const char* why) {
     struct Region { uintptr_t base; uint64_t bytes; uint32_t protect; uint32_t type; bool committed; };
     std::vector<Region> regions;
@@ -4456,6 +4553,10 @@ static void scanFlatSongFolder(const std::string& mode, const std::string& modeF
         FinalizeSongBinDifficultyFields(song);
         song.title = stripDifficultyTag(song.title); // songname is per-song: drop "[EASY]" etc.
         for (const auto& chart : song.chartMeta) {
+            // One line per chart: 64262 of them at this library size. Gated like its neighbours,
+            // with a sample kept so the shape is still visible without TraceBMSScan.
+            static unsigned long s_assigned = 0;
+            if (Config().traceBmsScan || s_assigned++ < 100)
             LogLine("[bms] assigned id='%s' chart='%s' slot=%d suffix='%s' playLevel='%s'",
                     song.id.c_str(), chart.file.c_str(), chart.slot, suffixForSlot(chart.slot), chart.playLevel.c_str());
         }
@@ -4470,6 +4571,9 @@ static void scanFlatSongFolder(const std::string& mode, const std::string& modeF
         // Direct bridge keeps selector metadata in memory. Chart events and PCM are
         // materialized only inside the game's objects when the song starts.
         g_songs.push_back(song);
+        // Likewise, one per song: 19271 lines. The totals are logged once at the end.
+        static unsigned long s_found = 0;
+        if (Config().traceBmsScan || s_found++ < 100)
         LogLine("[bms] found song id='%s' mode='%s' category='%s' title='%s' artist='%s' charts=%lu audio=%lu images=%lu videos=%lu levelNM=%d levelHD=%d levelSHD=%d levelEX=%d cache='%s'",
             song.id.c_str(), song.mode.c_str(), song.category.c_str(), song.title.c_str(), song.artist.c_str(),
             static_cast<unsigned long>(song.charts.size()), static_cast<unsigned long>(song.audioFiles.size()),

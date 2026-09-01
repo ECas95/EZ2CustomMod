@@ -1993,13 +1993,15 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
     // later, while browsing. Sampling every few category changes is what shows which of the two
     // it is -- a steady climb per category, or one big step somewhere.
     {
+        // Every change, not every fifth. The growth we are chasing appeared somewhere between two
+        // samples five apart, which is exactly the resolution that hid it; a full region walk costs
+        // a few milliseconds against a human pressing a button.
         static uint32_t s_changes = 0;
-        if ((s_changes++ % 5) == 0) {
-            char why[48];
-            snprintf(why, sizeof(why), "category change #%lu", (unsigned long)s_changes);
-            ReportProcessFootprint(why);
-            ReportAllocHistogram(why);
-        }
+        ++s_changes;
+        char why[64];
+        snprintf(why, sizeof(why), "category change #%lu", (unsigned long)s_changes);
+        ReportProcessFootprint(why);
+        ReportAllocHistogram(why);
     }
     g_gsLastCat = cat;            // so a /GS failure names the category that led to it
     g_gsLastCount = published;
