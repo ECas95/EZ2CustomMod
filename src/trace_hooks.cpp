@@ -290,6 +290,7 @@ static const uint32_t kMasterHome     = 0x400000;                        // wher
 static const uint32_t kMasterRel      = kMasterHome - kMasterOrigBase;   // 0x3A1D44
 static bool g_capacityPatched = false;     // master-array cap raised + relocated (+kMasterRel)
 static uint32_t g_songCapacity = 436;      // raised by InstallSongCapacityPatches
+static uint32_t g_visibleCap = 872;        // per-category ceiling; see kCatNameStride and master_layout_test
 
 // master[] sits at kMasterHome inside the object and runs g_songCapacity entries from there, so
 // this is the whole object. The 1MB tail is headroom for the fields that live past the array.
@@ -888,7 +889,15 @@ static uint32_t g_snObject = 0;
 static uint32_t g_snLastSelected = 0xFFFFFFFFu;
 
 static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible, const char* why) {
-    if (!obj || !visible || visible > 436) return;
+    // `selected` arrives straight off the renderer's stack and is NOT always a valid row: entering a
+    // native category (LV1, LV2, ...) hands us a frame whose [esp+12] still holds something else.
+    // Unvalidated it reached the modulo below as a large signed value, the remainder came out
+    // NEGATIVE, and the entry pointer landed 584 bytes UNDER the object -- a read of entry+0x004 at
+    // index -1, which is the LV-category crash (c0000005 reading obj-580).
+    //
+    // The Top-5 branch in the same hook already guards exactly this way; the songname branch did not.
+    if (!obj || !visible || visible > g_visibleCap) return;   // was a stale literal 436 vs the 872 cap
+    if (selected >= visible) return;
     const uint32_t gfxCtx = SafeRead32(0x1b2f054);
     if (!gfxCtx) return;
     // The wheel is CIRCULAR: with the cursor near the top of the list the rows drawn above it are
@@ -905,7 +914,11 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
     LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
     unsigned long loaded = 0, discs = 0, blocked = 0;
     for (int32_t k = -half; k <= half; ++k) {
-        const uint32_t i = (uint32_t)(((int32_t)selected + k + (int32_t)visible * 2) % (int32_t)visible);
+        // Unconditionally non-negative: `+ visible * 2` only ever compensated for k, so any
+        // selected that was out of range still produced a negative remainder.
+        int32_t raw = ((int32_t)selected + k) % (int32_t)visible;
+        if (raw < 0) raw += (int32_t)visible;
+        const uint32_t i = (uint32_t)raw;
         const uint32_t entry = obj + kVisibleBase + i * kEntryBytes;
         uint32_t* const nameSlot = reinterpret_cast<uint32_t*>(entry + 0x004);
         uint32_t* const discSlot = reinterpret_cast<uint32_t*>(entry + 0x000);
@@ -1209,7 +1222,9 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
         }
         // Selection-driven songname loading. This runs every frame, so it does nothing at all
         // unless the highlighted entry changed -- one comparison in the common case.
-        if (regs->ecx != g_snObject || selected != g_snLastSelected) {
+        // Same `selected < visible` precondition the Top-5 branch above checks -- without it a
+        // stale frame value was forwarded into the window loader as a row index.
+        if (selected < visible && (regs->ecx != g_snObject || selected != g_snLastSelected)) {
             g_snObject = regs->ecx;
             g_snLastSelected = selected;
             LoadSongnameWindow(regs->ecx, selected, visible, "scroll");
@@ -1612,7 +1627,7 @@ static const uint32_t kObjRetCopy     = 36 * 4;   // 0x90
 static const uint32_t kObjScrollA     = 49 * 4;   // 0xC4
 static const uint32_t kObjScrollB     = 51 * 4;   // 0xCC
 
-static uint32_t g_visibleCap = 872;   // the exact ceiling; see kCatNameStride and master_layout_test
+// (definition moved up next to g_songCapacity -- LoadSongnameWindow needs it and sits above.)
 
 // ---- case-insensitive id index over master[] --------------------------------------------------
 // Ids are at most 15 characters in a 16-byte field. Keys are stored lowercased in our own memory
