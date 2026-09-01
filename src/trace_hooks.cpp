@@ -909,7 +909,25 @@ static bool GdiHeadroomAvailable(uint32_t want) {
 // master into visible when the category changes -- anything written to master afterwards would
 // never reach the renderer. Re-entering a category reloads, but a reload of a name already in the
 // game's cache is a tree lookup that returns the existing texture and costs no new object.
-static const uint32_t kSongnameWindow = 32;    // the wheel shows ~12; each entry now costs TWO
+// Measured, not guessed: browsing 110 categories took the process from 840MB to 2551MB, and the
+// GDI count landed on 6973 against the 7040 this window predicts (32 entries x 2 textures x 110).
+// At 251KB of surface per texture, walking all 126 categories costs 1979MB -- which alone exhausts
+// XP's 2GB. Nothing frees, because the game's texture pool is a bump allocator keyed by filename.
+//
+// So load less. Two separate windows, because the two textures cost differently and are used
+// differently:
+//
+//   names  the wheel draws about 12 rows, and a name is ~24KB on disk. 16 covers the rows with
+//          margin for the wrap; 32 was paying 2.7x for rows nobody draws.
+//   discs  the small disc is only drawn by the change-song animation (sub_431AE0, under 176px),
+//          so it is needed around the cursor, not across the whole list -- and at ~48KB it is the
+//          expensive one. A band of 7 covers the animation.
+//
+// Together: 16 names + 7 discs per category instead of 32 + 32, and no visible difference. Leaving
+// the assets at their current dimensions is deliberate; shrinking discsmall from 128x128 would show,
+// since it is drawn at up to 176px.
+static const uint32_t kSongnameWindow = 16;    // rows that get a NAME
+static const uint32_t kDiscWindow     = 7;     // rows around the cursor that get a DISC
                                               // textures, so the window is sized to keep a whole
                                               // browsing session well inside the GDI budget
 
@@ -936,7 +954,8 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
     // rows without a texture, which is why the list looked empty above the selection and filled in
     // only once the cursor had moved far enough to reach them. Walking an offset and taking it
     // modulo the count covers the wrap.
-    const int32_t half = (int32_t)(kSongnameWindow / 2);
+    const int32_t half     = (int32_t)(kSongnameWindow / 2);
+    const int32_t discHalf = (int32_t)(kDiscWindow / 2);
     // One validation for the whole array instead of one per entry: CanReadPtr is a VirtualQuery and
     // this runs whenever the selection moves.
     if (!CanReadPtr(reinterpret_cast<void*>(obj + kVisibleBase), visible * kEntryBytes)) return;
@@ -954,7 +973,10 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
         const uint32_t entry = obj + kVisibleBase + i * kEntryBytes;
         uint32_t* const nameSlot = reinterpret_cast<uint32_t*>(entry + 0x004);
         uint32_t* const discSlot = reinterpret_cast<uint32_t*>(entry + 0x000);
-        if (*nameSlot && *discSlot) continue;                          // both already filled
+        // Outside the disc band this row only ever needs its name, so a filled name is enough
+        // to skip it -- testing both would keep re-walking rows whose disc we deliberately skip.
+        const bool wantDisc = (k >= -discHalf && k <= discHalf);
+        if (*nameSlot && (!wantDisc || *discSlot)) continue;
         const char* id = reinterpret_cast<const char*>(entry + kEntryIdOff);
         if (id[0] != 'b' || id[1] != 'm' || id[2] != 's') continue;     // native songs: not ours
         if (!GdiHeadroomAvailable(2)) { ++blocked; break; }
@@ -964,7 +986,7 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
             loadTex(gfxCtx, request, nameSlot, nullptr);
             if (*nameSlot) ++loaded;
         }
-        if (!*discSlot) {
+        if (wantDisc && !*discSlot) {
             snprintf(request, sizeof(request), "system\\discsmall\\%.31s.bmp", id);
             loadTex(gfxCtx, request, discSlot, nullptr);
             if (*discSlot) ++discs;
