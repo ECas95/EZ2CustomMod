@@ -916,6 +916,9 @@ static const uint32_t kSongnameWindow = 32;    // the wheel shows ~12; each entr
 static uint32_t g_snObject = 0;
 static uint32_t g_snLastSelected = 0xFFFFFFFFu;
 
+// Defined with the filter, below; the per-frame hook re-rolls through it.
+static void RollRandomRow(uint32_t obj, uint32_t count);
+
 static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible, const char* why) {
     // `selected` arrives straight off the renderer's stack and is NOT always a valid row: entering a
     // native category (LV1, LV2, ...) hands us a frame whose [esp+12] still holds something else.
@@ -947,6 +950,7 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
         int32_t raw = ((int32_t)selected + k) % (int32_t)visible;
         if (raw < 0) raw += (int32_t)visible;
         const uint32_t i = (uint32_t)raw;
+        if (i == 0) continue;      // the RANDOM row; RollRandomRow owns both its texture slots
         const uint32_t entry = obj + kVisibleBase + i * kEntryBytes;
         uint32_t* const nameSlot = reinterpret_cast<uint32_t*>(entry + 0x004);
         uint32_t* const discSlot = reinterpret_cast<uint32_t*>(entry + 0x000);
@@ -1253,6 +1257,8 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
         // Same `selected < visible` precondition the Top-5 branch above checks -- without it a
         // stale frame value was forwarded into the window loader as a row index.
         if (selected < visible && (regs->ecx != g_snObject || selected != g_snLastSelected)) {
+            // Arriving on the RANDOM row rolls it again, so moving off and back is a re-roll.
+            if (selected == 0 && visible > 1) RollRandomRow(regs->ecx, visible - 1);
             g_snObject = regs->ecx;
             g_snLastSelected = selected;
             LoadSongnameWindow(regs->ecx, selected, visible, "scroll");
@@ -1810,6 +1816,49 @@ static void VerifyMasterAgainstIndex(uint32_t cat) {
                 (unsigned long)cat, (unsigned long)g_midx.count);
 }
 
+// ---- the RANDOM row ---------------------------------------------------------------------------
+//
+// Every category gets a row at the top that plays a song picked at random from that same category.
+//
+// It is NOT a fake song. visible[0] holds a byte-for-byte copy of a real entry -- id, levels,
+// version, everything -- so the moment the player confirms it the game loads that song through its
+// normal path. Nothing has to intercept the confirmation, which is what made this worth doing
+// properly: a synthetic record would have to satisfy every pointer the renderer walks, and we have
+// already been bitten by exactly that (the BABY DANCE disc came from a record we only half-filled).
+//
+// The only thing that differs from a normal row is the songname texture, which is swapped for a
+// tile reading "RANDOM" so the row does not simply look like a duplicate of whatever it rolled.
+// The small-disc slot is left at zero on purpose: it draws nothing, and the roll stays a surprise
+// until the song starts.
+static uint32_t g_randomTex = 0;       // the "RANDOM" songname texture, loaded once
+static uint32_t g_randomRolls = 0;
+
+// Copy one of the rows already written into visible[] over row 0, then mark it.
+// `count` is how many real rows follow it, at indices 1..count.
+static void RollRandomRow(uint32_t obj, uint32_t count) {
+    if (!count) return;
+    const uint32_t pick = 1 + (uint32_t)(rand() % (int)count);
+    const uint32_t src  = obj + kVisibleBase + pick * kEntryBytes;
+    const uint32_t dst  = obj + kVisibleBase;
+    if (!CanReadPtr(reinterpret_cast<void*>(src), kEntryBytes)) return;
+    SafeWriteBytes(dst, reinterpret_cast<void*>(src), kEntryBytes);
+
+    // Load the tile on first use: the texture pool is a bump allocator, so this must happen once
+    // for the process, not once per category.
+    if (!g_randomTex) {
+        const uint32_t gfxCtx = SafeRead32(0x1b2f054);
+        if (gfxCtx) {
+            typedef int(__thiscall* LoadTexFn)(uint32_t, const char*, void*, const char*);
+            LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
+            loadTex(gfxCtx, "system\\songname\\bmsrandom.bmp", &g_randomTex, nullptr);
+        }
+    }
+    uint32_t zero = 0;
+    SafeWriteBytes(dst + 0x004, &g_randomTex, 4);   // songname -> "RANDOM"
+    SafeWriteBytes(dst + 0x000, &zero, 4);          // small disc -> nothing, keep the roll hidden
+    ++g_randomRolls;
+}
+
 // ---- the filter itself ------------------------------------------------------------------------
 static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSelection) {
     SongSelectPreFilter(obj, cat);
@@ -1847,7 +1896,9 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
     const uint32_t gathered = (uint32_t)s_gathered.size();
 
     // Phase 2 -- copy across the entries that have a chart for the active mode.
-    uint32_t written = 0;
+    // Row 0 is reserved for RANDOM, so the real songs start at 1. Writing them there directly costs
+    // nothing; inserting afterwards would mean shifting up to 872 records of 884 bytes each.
+    uint32_t written = 1;
     for (uint32_t g = 0; g < gathered; ++g) {
         const uint32_t entry = masterBase + s_gathered[g] * kEntryBytes;
         float level = 0.0f;
@@ -1902,10 +1953,20 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
     const uint32_t published = written ? gathered : 0;
     SafeWriteBytes(obj + kObjVisCount, &published, 4);
 
+    // Fill the reserved row, or drop it: a category with no playable song has nothing to roll,
+    // and a lone RANDOM row that resolves to nothing is worse than no row at all.
+    if (written > 1) {
+        RollRandomRow(obj, written - 1);
+    } else {
+        written = 0;
+    }
+
     // Restore the selection by id. The original searches this[31] entries -- the gathered count --
     // which can read past what phase 2 wrote; bound the search to what is actually there.
+    // Starts at 1: row 0 carries a copy of some real song's id, and matching it there would land
+    // the cursor on RANDOM every time that song happened to be the one rolled.
     uint32_t selected = 0;
-    for (uint32_t i = 0; i < written; ++i) {
+    for (uint32_t i = 1; i < written; ++i) {
         const uint32_t idAddr = obj + kVisibleBase + i * kEntryBytes + kEntryIdOff;
         char have[16];
         NormalizeId(reinterpret_cast<const char*>(idAddr), have);

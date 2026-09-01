@@ -126,7 +126,10 @@ std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& 
 
 // Category sprites are produced in memory and handed to the game through the file hooks; nothing
 // is written to disk for them. kind selects which of the three the game asked for.
-enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3 };
+enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3,
+       // The songname tile for the RANDOM row the filter puts at the top of every category.
+       // Category-independent: it says the same thing everywhere, so it ignores the index.
+       kCatAbmRandom = 4 };
 bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int kind,
                               std::vector<unsigned char>& out);
 

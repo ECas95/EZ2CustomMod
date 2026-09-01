@@ -3385,9 +3385,13 @@ static bool SongTitleLess(const CustomBmsSong& a, const CustomBmsSong& b) {
 // line that has to fill the whole 16px the way the native tabs do, and inferring it from alignRight
 // left the tab boxed into the top 10px with a 10px font, which is why the custom tabs came out
 // visibly smaller than "OTH" next to them.
+// maxPxOverride: 0 keeps each branch's own sizing. The right-aligned branch fills the canvas
+// (h-1), which is right for a 128x16 version label but enormous on a 256x32 songname -- 31px
+// against the 13px the game's own song titles use. Callers drawing into a songname slot pass 13.
 static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string& category,
                               const std::string& subtext, int w = 128, int h = 16,
-                              bool alignRight = true, bool twoLine = false) {
+                              bool alignRight = true, bool twoLine = false,
+                              int maxPxOverride = 0) {
     HDC screen = GetDC(NULL);
     if (!screen) return false;
     HDC hdc = CreateCompatibleDC(screen);
@@ -3463,7 +3467,8 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
         // The label under the song title: one right-aligned line over the whole canvas. Native
         // category_NN.abm is 128x16 with its ink in y 2..12, i.e. 11px caps, which Arial Bold
         // reaches at an em of about h-1.
-        draw(Utf8ToWide(category), RECT{2, 0, w - 3, h}, h - 1, RGB(235,235,235));
+        draw(Utf8ToWide(category), RECT{2, 0, w - 3, h},
+             maxPxOverride ? maxPxOverride : h - 1, RGB(235,235,235));
     } else if (!twoLine) {
         // A wheel tab. The sprite is 128px but the game draws the row at roughly 45px of pitch, so
         // what matters is the INK width, not the canvas. Native names are three characters and come
@@ -3542,6 +3547,12 @@ static bool ReadCategoryDetails(const std::string& mode, const std::string& cate
 
 bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int kind,
                               std::vector<unsigned char>& out) {
+    // The RANDOM tile belongs to no category, so it is built before the lookup that would
+    // reject it. 256x32 right-aligned is the shape of native songname art.
+    if (kind == kCatAbmRandom)
+        return RenderSplashBytes(out, "RANDOM", std::string(), 256, 32, true, false, 13) &&
+               AbmFromBmpBytes(out);
+
     std::vector<std::string> cats = GetCustomBmsCategoriesForMode(mode);
     if (categoryIndex >= cats.size()) return false;
     std::string cat, sub;

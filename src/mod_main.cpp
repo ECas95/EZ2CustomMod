@@ -1491,6 +1491,17 @@ static HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPS
     // the read hooks know how to serve.
     if (name && (creation == OPEN_EXISTING || creation == OPEN_ALWAYS)) {
         std::string lower = LowerAscii(name);
+        // The RANDOM row's songname. It is not a song, so it has no cache directory to redirect
+        // to -- the tile is built in RAM on request, exactly like the category sprites below.
+        // trace_hooks asks for this once and keeps the texture handle.
+        if (lower.find("bmsrandom") != std::string::npos) {
+            HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmRandom);
+            if (vh != INVALID_HANDLE_VALUE) {
+                static bool logged = false;
+                if (!logged) { logged = true; LogLine("[random] songname tile served from memory"); }
+                return vh;
+            }
+        }
         if (lower.find("songselect") != std::string::npos) {
             std::string mode = GetActiveMode();
             if (mode.empty()) mode = "5keyOnly";
