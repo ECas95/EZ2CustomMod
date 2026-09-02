@@ -21,6 +21,8 @@ struct TraceHook {
     unsigned char original[32] = {};
     bool installed = false;
     unsigned long hitCount = 0;
+    uint32_t      judgeObject = 0;   // which gameplay object the judge sample below belongs to
+    unsigned long judgeHits = 0;
 };
 
 // PUSHAD layout at ESP after PUSHAD on x86:
@@ -1346,7 +1348,35 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
     if (inTrace) return;
     inTrace = true;
 
+    // The judge sample is per SONG, not per session. hitCount is cumulative, so with one budget of
+    // 20 the first song played consumed all of them and the second -- the one being compared
+    // against -- logged nothing at all. Each judge object gets its own 20.
     unsigned long n = h->hitCount;
+    if (isJudge && regs) {
+        if (regs->ecx != h->judgeObject) {
+            h->judgeObject = regs->ecx;
+            h->judgeHits = 0;
+            // The judgement windows are a table inside this object, not constants in the code:
+            //
+            //     v18 = a1 + 92 * a5 + 20;              // a5 is the literal 1 at every call site
+            //     v6  = a2 + 24 * v5 + 28;              // v5 = 1 early, 2 late
+            //     result = 5; while (v4 > *v6) { --result; --v6; if (result < 0) return 0; }
+            //
+            // so five thresholds are walked downward for each direction. A table of zeros makes
+            // that loop fall straight through to "no judgement", which is what an unhittable note
+            // looks like from the player side. Dumped once per song so a custom and a native chart
+            // can be compared side by side instead of guessed at.
+            if (h->rva == 0x26500) {
+                char line[256] = {};
+                int at = 0;
+                for (uint32_t off = 140; off <= 192 && at < 200; off += 4)
+                    at += snprintf(line + at, sizeof(line) - at, "%lu:%ld ",
+                                   (unsigned long)off, (long)SafeRead32(regs->ecx + off));
+                LogLine("[judge] obj=%08lx windows %s", (unsigned long)regs->ecx, line);
+            }
+        }
+        n = ++h->judgeHits;
+    }
     if (n <= 20 || (n % 1000) == 0 || !isJudge) {
         LogKnownFunctionArgs(h, regs, n);
     }

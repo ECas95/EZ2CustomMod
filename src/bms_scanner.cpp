@@ -2220,6 +2220,28 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
         uint32_t pad = (uint32_t)(3.0 * 0.8 * (bms.bpm > 0.0 ? bms.bpm : 120.0) * kModelTickScale);
         if (pad < kEzTicksPerMeasure) pad = kEzTicksPerMeasure;
         totalTicks += pad;
+
+        // Declaring the longer chart in the header was not enough: the stage still ended the moment
+        // the last note was consumed, which on a chart finishing in a long note meant the result
+        // screen arrived while it was still being held. So the padding is given something to hold
+        // on to -- one BPM marker at the padded end.
+        //
+        // Type 3 is the BPM event, not a note: the engine advances through it and never judges it,
+        // so this buys the reaction room without adding anything playable. It goes on the track
+        // that already carries the tempo markers, so nothing else has to know about it.
+        int tempoTrack = -1;
+        for (int t = 0; t < 64 && tempoTrack < 0; ++t)
+            for (const auto& ev : byTrack[t])
+                if (ev.type == 3) { tempoTrack = t; break; }
+        if (tempoTrack < 0) tempoTrack = 0;
+        double tailBpm = bms.bpm > 0.0 ? bms.bpm : 120.0;
+        if (!tempos.empty()) tailBpm = tempos.back().second;
+        EzRawEventOut tail{};
+        tail.tick = totalTicks > 1 ? totalTicks - 1 : 0;
+        tail.type = 3;
+        tail.track = tempoTrack;
+        tail.bpm   = (float)tailBpm;
+        byTrack[tempoTrack].push_back(tail);
     }
 
     std::stable_sort(tempos.begin(), tempos.end(), [](const auto& a, const auto& b){ return a.first < b.first; });
