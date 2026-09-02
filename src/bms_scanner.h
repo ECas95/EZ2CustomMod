@@ -124,12 +124,20 @@ void StopDirectBmsFfmpegVideo();
 std::string ResolveDirectBmsVisual(const CustomBmsSong& song, const std::string& request);
 std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& request);
 
+// Song-select BGA preview: decode a few seconds of a song's video into raw BGR24 frames.
+bool DecodeBgaPreview(const std::string& videoPath, int size, int fps, int seconds,
+                      std::vector<unsigned char>& frames, uint32_t& frameCount);
+std::string BgaVideoPathForSong(const std::string& id);
+
 // Category sprites are produced in memory and handed to the game through the file hooks; nothing
 // is written to disk for them. kind selects which of the three the game asked for.
 enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3,
        // The songname tile for the RANDOM row the filter puts at the top of every category.
        // Category-independent: it says the same thing everywhere, so it ignores the index.
-       kCatAbmRandom = 4 };
+       kCatAbmRandom = 4,
+       // A blank 256x256 for the BGA preview to build its texture on. It exists so the preview
+       // never has to borrow a texture the game also uses -- see EnsurePreviewSurface.
+       kCatAbmPreviewBase = 5 };
 bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int kind,
                               std::vector<unsigned char>& out);
 

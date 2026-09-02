@@ -1694,8 +1694,12 @@ static bool MediaFoundationAvailable() {
 // ponytail: needs an XP-capable ffmpeg build (<=3.x) in the game dir on XP; modern builds are Vista+.
 static std::string FfmpegExePath(bool& modernOut); // fwd decl (defined near ConvertVideoToSpv)
 
+// inputArgs land before -i. That matters for -ss: after the input it is an output seek, which
+// decodes and discards everything up to the mark -- on a 70MB BGA that is seconds of work for a
+// six-second preview.
 static bool startFfmpegPipe(const std::string& src, const std::string& outputArgs,
-                            PROCESS_INFORMATION& process, HANDLE& readPipe, bool realtime = false) {
+                            PROCESS_INFORMATION& process, HANDLE& readPipe, bool realtime = false,
+                            const std::string& inputArgs = std::string()) {
     bool modern = false;
     std::string ff = FfmpegExePath(modern);
     if (ff.empty()) return false;
@@ -1717,6 +1721,7 @@ static bool startFfmpegPipe(const std::string& src, const std::string& outputArg
     startup.hStdError = nul;
     startup.hStdOutput = writePipe;
     std::string command = "\"" + ff + "\" -y -v 0" + (realtime ? " -re" : "") +
+                          (inputArgs.empty() ? std::string() : " " + inputArgs) +
                           " -i \"" + src + "\" " + outputArgs;
     std::vector<char> mutableCommand(command.begin(), command.end());
     mutableCommand.push_back(0);
@@ -1758,6 +1763,138 @@ static bool ffmpegDecodePcmLocal(const std::string& src, uint32_t maxSeconds,
     LogLine("[audio] ffmpeg PCM src='%s' bytes=%lu rc=%lu ok=%d",
             src.c_str(), (unsigned long)pcm.size(), (unsigned long)code, ok ? 1 : 0);
     return ok;
+}
+
+
+// Decode a short chunk of a BGA video into raw BGR24 frames, all of them, into one buffer.
+//
+// The song-select preview loops six seconds of video inside a 256x256 disc. Decoding that once into
+// RAM and looping the buffer is what keeps it affordable: the alternative is holding an ffmpeg
+// process and a decoder open for as long as the cursor sits on the song, and BGA sources here have
+// a median size of 73MB. 60 frames of 256x256x3 is 11.8MB, allocated once and reused for every
+// song, so the cost does not grow with the library.
+//
+// Seeks past the intro by default -- BGA videos usually open on a title card, which makes a poor
+// preview -- and falls back to the start when the file turns out to be shorter than the seek.
+bool DecodeBgaPreview(const std::string& videoPath, int size, int fps, int seconds,
+                      std::vector<unsigned char>& frames, uint32_t& frameCount) {
+    frames.clear();
+    frameCount = 0;
+    if (videoPath.empty() || size <= 0 || fps <= 0 || seconds <= 0) return false;
+
+    const size_t frameBytes = (size_t)size * (size_t)size * 3u;
+    const size_t wanted = frameBytes * (size_t)(fps * seconds);
+
+    char out[256];
+    snprintf(out, sizeof(out),
+             // -s, not -vf: the XP-compatible ffmpeg we ship is SVN-r11870 from 2008 and predates
+             // libavfilter, so it rejects -vf outright and produces nothing. -s works in both eras.
+             "-t %d -s %dx%d -r %d -an -f rawvideo -pix_fmt bgr24 -",
+             seconds, size, size, fps);
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        // First pass skips the intro; second starts at zero for anything too short for that.
+        const std::string inputArgs = attempt == 0 ? "-ss 10" : "";
+        PROCESS_INFORMATION process{};
+        HANDLE pipe = nullptr;
+        if (!startFfmpegPipe(videoPath, out, process, pipe, false, inputArgs)) return false;
+        CloseHandle(process.hThread);
+
+        frames.clear();
+        frames.reserve(wanted);
+        unsigned char chunk[64 * 1024];
+        DWORD got = 0;
+        while (frames.size() < wanted && ReadFile(pipe, chunk, sizeof(chunk), &got, nullptr) && got)
+            frames.insert(frames.end(), chunk, chunk + got);
+        CloseHandle(pipe);
+        WaitForSingleObject(process.hProcess, 3000);
+        CloseHandle(process.hProcess);
+
+        frames.resize((frames.size() / frameBytes) * frameBytes);   // drop a torn tail
+        frameCount = (uint32_t)(frames.size() / frameBytes);
+
+        // The disc is a circle, the video is a square, and the corners were showing as a hard
+        // rectangle around it. Native disc art is a circle of radius 125 centred on a 256x256
+        // canvas with everything outside it black -- measured, and identical across every shipped
+        // disc -- so match that exactly.
+        //
+        // Done here rather than per blit: once per song instead of ten times a second, forever.
+        if (frameCount) {
+            const int r = (size * 125) / 256;             // the shipped discs' radius, scaled
+            const int cx = size / 2, cy = size / 2;
+            const int r2 = r * r;
+            for (uint32_t f = 0; f < frameCount; ++f) {
+                unsigned char* px = frames.data() + (size_t)f * frameBytes;
+                for (int y = 0; y < size; ++y) {
+                    const int dy = y - cy, dy2 = dy * dy;
+                    unsigned char* row = px + (size_t)y * size * 3;
+                    for (int x = 0; x < size; ++x) {
+                        const int dx = x - cx;
+                        if (dx * dx + dy2 > r2) { row[x*3] = row[x*3+1] = row[x*3+2] = 0; }
+                    }
+                }
+            }
+        }
+        if (frameCount >= 2) {
+            LogLine("[preview] decoded '%s' %ux%d frames=%lu (%.1f MB)%s",
+                    videoPath.c_str(), (unsigned)size, size,
+                    (unsigned long)frameCount, frames.size() / 1048576.0,
+                    attempt ? " [from start]" : "");
+            return true;
+        }
+    }
+    frames.clear();
+    frameCount = 0;
+    LogLine("[preview] no frames from '%s'", fileNameOnlyLocal(videoPath).c_str());
+    return false;
+}
+
+// The BGA video a song would play, or empty when it has none.
+//
+// Two places to look. Custom songs carry their own file in the song folder. Native ones use the
+// game's layout, which the loader spells out:
+//
+//     sprintf(this + 184, "%s\\Video\\%s\\%s.spv", Buffer, String1, String1);
+//
+// and .spv is not a format of its own -- it is ASF/WMV under another extension (magic 30 26 B2 75),
+// which is why the same decode path handles both. 153 native songs have one.
+//
+// A preview only ever shows a song's OWN video. Video\_spv holds 21 shared clips that the gameplay
+// path hands to songs with no BGA of their own (selectRandomBgaPoolVideo), and those are wallpaper,
+// not this song -- showing one as a preview tells the player something false about the song.
+//
+// Tracing the three routes here says a pooled clip cannot reach this function: videoFiles only ever
+// collects files found inside the song's folder, and the .spv cache step is gated on that list being
+// non-empty. It was reported happening anyway, so rather than trust the trace, the rule is enforced
+// where it matters and the resolved path is logged -- if one still arrives, the log now names it.
+static bool IsSharedBgaPoolClip(const std::string& path) {
+    std::string low = path;
+    std::transform(low.begin(), low.end(), low.begin(),
+                   [](unsigned char c) { return (char)tolower(c); });
+    return low.find("\\_spv\\") != std::string::npos ||
+           low.find("/_spv/")    != std::string::npos;
+}
+
+std::string BgaVideoPathForSong(const std::string& id) {
+    for (const auto& s : g_songs) {
+        if (_stricmp(s.id.c_str(), id.c_str()) != 0) continue;
+        for (const auto& v : s.videoFiles) {
+            std::string p = JoinPath(s.songDir, v);
+            if (IsSharedBgaPoolClip(p)) {
+                LogLine("[preview] id='%s' refusing shared pool clip '%s'", id.c_str(), p.c_str());
+                continue;
+            }
+            return p;
+        }
+        return std::string();
+    }
+    // Not one of ours, so it is a native song: Video\<id>\<id>.spv off the game directory.
+    std::string spv = JoinPath(JoinPath(JoinPath(GetExeDirectory(), "Video"), id), id + ".spv");
+    if (IsSharedBgaPoolClip(spv)) return std::string();
+    FILE* probe = fopen(spv.c_str(), "rb");
+    if (!probe) return std::string();
+    fclose(probe);
+    return spv;
 }
 
 static HANDLE g_ffmpegVideoProcess = nullptr;
@@ -3551,6 +3688,11 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
     // reject it. 256x32 right-aligned is the shape of native songname art.
     if (kind == kCatAbmRandom)
         return RenderSplashBytes(out, "RANDOM", std::string(), 256, 32, true, false, 13) &&
+               AbmFromBmpBytes(out);
+
+    // Empty text on the standard black ground: a plain 256x256 tile, the disc's own geometry.
+    if (kind == kCatAbmPreviewBase)
+        return RenderSplashBytes(out, std::string(), std::string(), 256, 256, true, false) &&
                AbmFromBmpBytes(out);
 
     std::vector<std::string> cats = GetCustomBmsCategoriesForMode(mode);

@@ -1311,6 +1311,15 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
         }
         // Selection-driven songname loading. This runs every frame, so it does nothing at all
         // unless the highlighted entry changed -- one comparison in the common case.
+        // BGA preview: the disc slot follows whatever the cursor is resting on. Runs every
+        // frame because it has to hold obj+260 against the game's own disc reloads, but it does
+        // nothing at all until the cursor has been still for a moment.
+        if (selected < visible) {
+            const char* selId = reinterpret_cast<const char*>(
+                regs->ecx + kVisibleBase + selected * kEntryBytes + kEntryIdOff);
+            BgaPreviewTick(regs->ecx, selId);
+        }
+
         // Same `selected < visible` precondition the Top-5 branch above checks -- without it a
         // stale frame value was forwarded into the window loader as a row index.
         if (selected < visible && (regs->ecx != g_snObject || selected != g_snLastSelected)) {
@@ -1918,6 +1927,7 @@ static void RollRandomRow(uint32_t obj, uint32_t count) {
 
 // ---- the filter itself ------------------------------------------------------------------------
 static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSelection) {
+    BgaPreviewStop(obj);       // the list is about to be rebuilt under the preview
     SongSelectPreFilter(obj, cat);
     ProbeVacatedMaster(obj);
 

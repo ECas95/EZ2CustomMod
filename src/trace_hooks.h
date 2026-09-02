@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 void InstallTraceHooks();
 void RemoveTraceHooks();
@@ -8,3 +9,7 @@ void RemoveTraceHooks();
 // constant -- the two numbers used to be independent, and the buffer holding less than the patched
 // capacity dropped songs off the end of the list with nothing in the log.
 unsigned int RequiredObjectBytes();
+
+// Song-select BGA preview, driven from the per-frame renderer hook. Defined in mod_main.
+void BgaPreviewTick(uint32_t obj, const char* selectedId);
+void BgaPreviewStop(uint32_t obj);

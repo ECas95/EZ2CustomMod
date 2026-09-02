@@ -598,6 +598,254 @@ static DWORD g_directVideoStartMs = 0;
 static DWORD g_directVideoTargetW = 640, g_directVideoTargetH = 480;
 static DWORD g_directVideoCropX = 0, g_directVideoCropY = 0;
 static DWORD g_directVideoCropW = 0, g_directVideoCropH = 0;
+
+// ---- song-select BGA preview -------------------------------------------------------------------
+//
+// The selected song's disc is a single texture slot on the object, obj+260, filled by
+//
+//     sprintf(Buffer, "system\\disc\\%s.bmp", (const char *)(this + 884 * a2 + 568));
+//     sub_408E80(*(_DWORD **)ArgList, "HotSpotDisc", Buffer, this + 260);
+//
+// -- a NAMED load, so the game reuses that slot per song rather than accumulating. That makes it
+// the right place to put a preview: one slot, one surface, and the original pointer comes back
+// when the cursor moves.
+//
+// What is deliberately NOT done here: painting into the song's own disc texture. The texture pool
+// is a bump allocator with no eviction, so overwriting a disc destroys that song's art for the rest
+// of the process. Everything below draws into a surface we own and swaps the pointer instead.
+//
+// Cost is fixed, not per-song: one 256x256 surface and one frame buffer (~22MB at 10fps x 12s),
+// reused for every preview. That matters here more than usual -- browsing already costs the process
+// hundreds of megabytes in wheel textures, and this must not scale with the library on top of that.
+static const int      kPreviewSize    = 256;      // matches initdisc.abm and the disc geometry
+static const int      kPreviewFps     = 10;
+// 12s at 10fps is 120 frames, 22.5MB. Measured: the decode still takes ~420ms, the same as six
+// seconds did -- the cost is process spawn and seek, not the length -- so the whole price of the
+// longer loop is the extra 11MB, and that stays fixed no matter how big the library grows.
+static const int      kPreviewSeconds = 12;
+static const DWORD    kPreviewDwellMs = 400;      // how long the cursor must rest before starting
+
+static void*    g_previewTexture = nullptr;       // our texture object, slotted into obj+260
+static void*    g_previewSurface = nullptr;       // the surface we paint frames into
+static bool     g_previewInitTried = false;
+static std::vector<unsigned char> g_previewFrames;
+static uint32_t g_previewFrameCount = 0;
+static uint32_t g_previewIndex = 0;
+static DWORD    g_previewNextFrameMs = 0;
+static DWORD    g_previewDwellSince = 0;
+static std::string g_previewWantId;               // what the cursor is resting on
+static std::string g_previewHaveId;               // what the frame buffer holds
+static uint32_t g_previewObj = 0;
+static uint32_t g_previewSavedSlot = 0;           // the disc pointer we displaced
+static bool     g_previewSlotSwapped = false;
+static HANDLE   g_previewThread = nullptr;
+static volatile LONG g_previewDecoding = 0;
+static std::string g_previewDecodePath;
+static std::string g_previewDecodeId;
+
+static const uint32_t kObjDiscSlot = 260;         // "HotSpotDisc"
+
+// Build the surface once. The texture object is created from initdisc.abm purely to get a real
+// 256x256 24bpp texture of the right shape; its surface is then replaced by ours, which is the
+// same swap the gameplay BGA path does.
+static bool EnsurePreviewSurface() {
+    if (g_previewTexture && g_previewSurface) return true;
+    if (g_previewInitTried) return false;
+    g_previewInitTried = true;
+
+    void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
+    if (!renderer) { g_previewInitTried = false; return false; }   // song select not up yet
+
+    auto loadTexture   = reinterpret_cast<DirectLoadTexture_t>(Rva(0x08d00));
+    auto createSurface = reinterpret_cast<DirectCreateSurface_t>(Rva(0x07450));
+
+    // A name nothing else in the game ever requests. The first version of this built on
+    // initdisc.bmp, which the game loads too -- and since the texture pool is keyed by filename,
+    // that handed us a SHARED texture whose surface we then released out from under the game.
+    // That is the SBX crash: a freed surface, its vtable pointer read back as null, and the
+    // ReleaseDC lookup at vt[26] faulting on address 0x68.
+    void* texture = nullptr;
+    if (!loadTexture(renderer, "system\\disc\\bmspreviewbase.bmp", &texture, "bms-preview-disc") ||
+        !texture) {
+        LogLine("[preview] base texture failed");
+        return false;
+    }
+    int desc[31]{};
+    void* surface = createSurface(renderer, desc, kPreviewSize, kPreviewSize, 0);
+    if (!surface) { LogLine("[preview] CreateSurface %dx%d failed", kPreviewSize, kPreviewSize); return false; }
+
+    void* old = *reinterpret_cast<void**>(texture);
+    if (old && old != surface) {
+        void** vt = *reinterpret_cast<void***>(old);
+        auto release = reinterpret_cast<DirectSurfaceRelease_t>(vt[2]);
+        *reinterpret_cast<void**>(texture) = surface;
+        release(old);
+    } else {
+        *reinterpret_cast<void**>(texture) = surface;
+    }
+    g_previewTexture = texture;
+    g_previewSurface = surface;
+    LogLine("[preview] surface ready %dx%d texture=%p", kPreviewSize, kPreviewSize, texture);
+    return true;
+}
+
+static DWORD WINAPI PreviewDecodeThread(LPVOID) {
+    std::vector<unsigned char> frames;
+    uint32_t count = 0;
+    DecodeBgaPreview(g_previewDecodePath, kPreviewSize, kPreviewFps, kPreviewSeconds, frames, count);
+    g_previewFrames.swap(frames);
+    g_previewFrameCount = count;
+    g_previewIndex = 0;
+    g_previewHaveId = count ? g_previewDecodeId : std::string();
+    InterlockedExchange(&g_previewDecoding, 0);
+    return 0;
+}
+
+// Put the song's own disc back.
+//
+// `onObj` is the object the caller is looking at right now. The restore only happens when that is
+// still the object we swapped on -- leaving song select FREES it, and writing the saved pointer
+// back into freed memory is the menu round-trip crash: a write to obj+0x104, which is exactly
+// kObjDiscSlot on an object that no longer exists.
+//
+// Pass 0 for "no object in hand", which drops the bookkeeping without writing anything.
+static void PreviewRestoreSlot(uint32_t onObj) {
+    if (g_previewSlotSwapped && g_previewObj && onObj == g_previewObj)
+        *reinterpret_cast<uint32_t*>(g_previewObj + kObjDiscSlot) = g_previewSavedSlot;
+    g_previewSlotSwapped = false;
+    g_previewSavedSlot = 0;
+}
+
+// True when the surface still looks like a live COM object. DirectDraw surfaces can be lost --
+// a mode switch, a device reset, the wrapper recreating them -- and the preview has to notice
+// rather than call through a stale vtable.
+static bool PreviewSurfaceUsable() {
+    if (!g_previewSurface) return false;
+    if (IsBadReadPtr(g_previewSurface, sizeof(void*))) return false;
+    void** vt = *reinterpret_cast<void***>(g_previewSurface);
+    if (!vt || IsBadReadPtr(vt, 27 * sizeof(void*))) return false;
+    return vt[17] && vt[26];
+}
+
+static void PreviewBlitFrame() {
+    const size_t frameBytes = (size_t)kPreviewSize * kPreviewSize * 3u;
+    if (g_previewIndex >= g_previewFrameCount) g_previewIndex = 0;
+    const unsigned char* px = g_previewFrames.data() + (size_t)g_previewIndex * frameBytes;
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = kPreviewSize;
+    info.bmiHeader.biHeight = -kPreviewSize;      // ffmpeg gives us top-down rows
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 24;
+    info.bmiHeader.biCompression = BI_RGB;
+    info.bmiHeader.biSizeImage = (DWORD)frameBytes;
+
+    void** vt = *reinterpret_cast<void***>(g_previewSurface);
+    auto getDC     = reinterpret_cast<DirectSurfaceGetDC_t>(vt[17]);
+    auto releaseDC = reinterpret_cast<DirectSurfaceReleaseDC_t>(vt[26]);
+    HDC dc = nullptr;
+    if (SUCCEEDED(getDC(g_previewSurface, &dc)) && dc) {
+        SetStretchBltMode(dc, COLORONCOLOR);
+        StretchDIBits(dc, 0, 0, kPreviewSize, kPreviewSize, 0, 0, kPreviewSize, kPreviewSize,
+                      px, &info, DIB_RGB_COLORS, SRCCOPY);
+        releaseDC(g_previewSurface, dc);
+    }
+    ++g_previewIndex;
+}
+
+// Called every frame from the song-select renderer hook with whatever the cursor is on.
+void BgaPreviewTick(uint32_t obj, const char* selectedId) {
+    if (!Config().bgaPreview) return;
+    const std::string id = selectedId ? selectedId : "";
+
+    // The cursor moved: put the disc back and start the dwell timer again. Restoring FIRST means a
+    // fast scroll never leaves someone else's video sitting in the slot.
+    if (obj != g_previewObj) {
+        // A different SongSelect object: the previous one has been destroyed. Nothing of ours
+        // survives that -- the texture pool is rebuilt with it, which is the same reset that used
+        // to blank the version labels on a menu round-trip -- so drop everything and start clean.
+        PreviewRestoreSlot(0);                 // 0: do not write to the object that just died
+        g_previewTexture = nullptr;
+        g_previewSurface = nullptr;
+        g_previewInitTried = false;
+        g_previewHaveId.clear();
+        g_previewFrameCount = 0;
+        g_previewObj = obj;
+        g_previewWantId = id;
+        g_previewDwellSince = GetTickCount();
+        return;
+    }
+    if (id != g_previewWantId) {
+        PreviewRestoreSlot(obj);
+        g_previewWantId = id;
+        g_previewDwellSince = GetTickCount();
+        return;
+    }
+    // Native ids are welcome here: they keep their BGA in Video\<id>\<id>.spv, which is the same
+    // ASF/WMV the custom ones use. Rejecting anything not starting with "bms" was why the preview
+    // only ever appeared on custom songs.
+    if (id.empty()) return;
+    if (GetTickCount() - g_previewDwellSince < kPreviewDwellMs) return;   // still settling
+
+    // Decode once per song, off the game's thread: ffmpeg takes hundreds of milliseconds and the
+    // wheel must keep animating through it.
+    if (g_previewHaveId != id) {
+        if (InterlockedCompareExchange(&g_previewDecoding, 1, 0) != 0) return;  // already running
+        std::string path = BgaVideoPathForSong(id);
+        if (path.empty()) {                       // no BGA: nothing to preview, and that is fine
+            g_previewHaveId = id;
+            g_previewFrameCount = 0;
+            InterlockedExchange(&g_previewDecoding, 0);
+            return;
+        }
+        g_previewDecodePath = path;
+        g_previewDecodeId = id;
+        if (g_previewThread) { CloseHandle(g_previewThread); g_previewThread = nullptr; }
+        g_previewThread = CreateThread(nullptr, 0, PreviewDecodeThread, nullptr, 0, nullptr);
+        if (!g_previewThread) InterlockedExchange(&g_previewDecoding, 0);
+        return;
+    }
+    if (!g_previewFrameCount || InterlockedCompareExchange(&g_previewDecoding, 0, 0)) return;
+    if (!EnsurePreviewSurface()) return;
+    if (!PreviewSurfaceUsable()) {
+        // Drop everything and let it be rebuilt: holding a dead surface is how this crashed.
+        PreviewRestoreSlot(obj);
+        g_previewSurface = nullptr;
+        g_previewTexture = nullptr;
+        g_previewInitTried = false;
+        static unsigned s_lost = 0;
+        if (s_lost++ < 5) LogLine("[preview] surface lost; rebuilding");
+        return;
+    }
+
+    // Hold the slot every tick rather than only on the swap: the game refills obj+260 whenever it
+    // reloads the disc, and that would otherwise silently end the preview mid-loop.
+    if (!g_previewSlotSwapped) {
+        g_previewSavedSlot = *reinterpret_cast<uint32_t*>(obj + kObjDiscSlot);
+        g_previewSlotSwapped = true;
+        g_previewNextFrameMs = 0;
+        static bool logged = false;
+        if (!logged) { logged = true; LogLine("[preview] first preview running id='%s'", id.c_str()); }
+    }
+    *reinterpret_cast<uint32_t*>(obj + kObjDiscSlot) = reinterpret_cast<uint32_t>(g_previewTexture);
+
+    const DWORD now = GetTickCount();
+    if (now >= g_previewNextFrameMs) {
+        PreviewBlitFrame();
+        g_previewNextFrameMs = now + (DWORD)(1000 / kPreviewFps);
+    }
+}
+
+// The list is about to be rebuilt under the preview. `obj` is the object the caller holds, so
+// the disc pointer goes back only if that is still the one we swapped on.
+void BgaPreviewStop(uint32_t obj) {
+    PreviewRestoreSlot(obj);
+    g_previewWantId.clear();
+    g_previewHaveId.clear();
+    g_previewFrameCount = 0;
+}
+
 static DWORD g_directVideoValidFrames = 0, g_directVideoFrameFailures = 0;
 static unsigned char* g_directVideoFrameBuffer = nullptr;
 static DWORD g_directVideoFrameCapacity = 0;
@@ -1494,6 +1742,10 @@ static HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPS
         // The RANDOM row's songname. It is not a song, so it has no cache directory to redirect
         // to -- the tile is built in RAM on request, exactly like the category sprites below.
         // trace_hooks asks for this once and keeps the texture handle.
+        if (lower.find("bmspreviewbase") != std::string::npos) {
+            HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmPreviewBase);
+            if (vh != INVALID_HANDLE_VALUE) return vh;
+        }
         if (lower.find("bmsrandom") != std::string::npos) {
             HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmRandom);
             if (vh != INVALID_HANDLE_VALUE) {
