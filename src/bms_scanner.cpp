@@ -1849,6 +1849,7 @@ bool DecodeBgaPreview(const std::string& videoPath, int size, int fps, int secon
     return false;
 }
 
+
 // The BGA video a song would play, or empty when it has none.
 //
 // Two places to look. Custom songs carry their own file in the song folder. Native ones use the
@@ -3246,6 +3247,94 @@ static std::wstring widePathLocal(const std::string& path) {
     return out;
 }
 
+// GDI+ for callers outside the asset pipeline, whose own token lives in a function static. One
+// token for the life of the process, same as there.
+static bool EnsureGdiplusStarted() {
+    static ULONG_PTR s_token = 0;
+    static int s_state = -1;
+    if (s_state < 0) {
+        Gdiplus::GdiplusStartupInput input;
+        s_state = Gdiplus::GdiplusStartup(&s_token, &input, nullptr) == Gdiplus::Ok ? 1 : 0;
+        if (!s_state) LogLine("[overlay] GDI+ startup failed; category overlays disabled");
+    }
+    return s_state == 1;
+}
+
+// Decode any image GDI+ can read into raw BGR24 at an exact size, the layout StretchDIBits wants.
+// Used for the per-category bg.png / ico.png overlays, which are drawn into surfaces we own.
+bool RenderImageToBgr(const std::string& path, int w, int h, std::vector<unsigned char>& out) {
+    out.clear();
+    if (w <= 0 || h <= 0) return false;
+    if (!EnsureGdiplusStarted()) return false;
+
+    Gdiplus::Image img(widePathLocal(path).c_str());
+    if (img.GetLastStatus() != Gdiplus::Ok || img.GetWidth() == 0) return false;
+
+    HDC screen = GetDC(NULL);
+    HDC hdc = CreateCompatibleDC(screen);
+    BITMAPINFOHEADER bih{};
+    bih.biSize = sizeof(bih); bih.biWidth = w; bih.biHeight = -h;   // top-down
+    bih.biPlanes = 1; bih.biBitCount = 24; bih.biCompression = BI_RGB;
+    BITMAPINFO bi{}; bi.bmiHeader = bih;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    bool ok = false;
+    if (bmp) {
+        HBITMAP oldb = (HBITMAP)SelectObject(hdc, bmp);
+        RECT full = {0, 0, w, h};
+        HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(hdc, &full, black);
+        DeleteObject(black);
+        {
+            Gdiplus::Graphics g(hdc);
+            g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            ok = g.DrawImage(&img, Gdiplus::Rect(0, 0, w, h),
+                             0, 0, (INT)img.GetWidth(), (INT)img.GetHeight(),
+                             Gdiplus::UnitPixel) == Gdiplus::Ok;
+        }
+        if (ok) {
+            const int stride = ((w * 3 + 3) & ~3);
+            out.assign((size_t)stride * h, 0);
+            BITMAPINFOHEADER bu = bih; bu.biHeight = h; bu.biSizeImage = (DWORD)out.size();
+            ok = GetDIBits(hdc, bmp, 0, h, out.data(), (BITMAPINFO*)&bu, DIB_RGB_COLORS) != 0;
+            // GetDIBits with a positive height hands rows back bottom-up; flip to top-down so the
+            // blit matches the negative-height BITMAPINFO it will be given.
+            if (ok) {
+                std::vector<unsigned char> flipped(out.size());
+                for (int y = 0; y < h; ++y)
+                    memcpy(&flipped[(size_t)y * stride], &out[(size_t)(h - 1 - y) * stride], stride);
+                out.swap(flipped);
+            }
+        }
+        SelectObject(hdc, oldb);
+        DeleteObject(bmp);
+    }
+    DeleteDC(hdc);
+    ReleaseDC(NULL, screen);
+    if (!ok) out.clear();
+    return ok;
+}
+
+// BMSData\<modeFolder>\<category>\bg.png (or ico.png), when the folder has one.
+std::string CategoryOverlayPath(const std::string& mode, const std::string& category,
+                                const char* which) {
+    for (const auto& s : g_songs) {
+        if (_stricmp(s.mode.c_str(), mode.c_str()) != 0) continue;
+        if (_stricmp(s.category.c_str(), category.c_str()) != 0) continue;
+        std::string dir = s.songDir;                       // ...\<category>\<song>
+        size_t slash = dir.find_last_of("\\/");
+        if (slash == std::string::npos) return std::string();
+        dir.erase(slash);                                  // ...\<category>
+        std::string p = JoinPath(dir, std::string(which) + ".png");
+        FILE* f = fopen(p.c_str(), "rb");
+        if (!f) return std::string();
+        fclose(f);
+        return p;
+    }
+    return std::string();
+}
+
+
 // Generate the required BMP inside the DLL using native GDI/GDI+.
 static bool GenerateBmpFile(const std::string& path, int w, int h,
                              COLORREF bgColor, COLORREF fgColor,
@@ -3528,7 +3617,7 @@ static bool SongTitleLess(const CustomBmsSong& a, const CustomBmsSong& b) {
 static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string& category,
                               const std::string& subtext, int w = 128, int h = 16,
                               bool alignRight = true, bool twoLine = false,
-                              int maxPxOverride = 0) {
+                              int maxPxOverride = 0, COLORREF inkOverride = 0) {
     HDC screen = GetDC(NULL);
     if (!screen) return false;
     HDC hdc = CreateCompatibleDC(screen);
@@ -3605,7 +3694,8 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
         // category_NN.abm is 128x16 with its ink in y 2..12, i.e. 11px caps, which Arial Bold
         // reaches at an em of about h-1.
         draw(Utf8ToWide(category), RECT{2, 0, w - 3, h},
-             maxPxOverride ? maxPxOverride : h - 1, RGB(235,235,235));
+             maxPxOverride ? maxPxOverride : h - 1,
+             inkOverride ? inkOverride : RGB(235,235,235));
     } else if (!twoLine) {
         // A wheel tab. The sprite is 128px but the game draws the row at roughly 45px of pitch, so
         // what matters is the INK width, not the canvas. Native names are three characters and come
@@ -3687,12 +3777,19 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
     // The RANDOM tile belongs to no category, so it is built before the lookup that would
     // reject it. 256x32 right-aligned is the shape of native songname art.
     if (kind == kCatAbmRandom)
-        return RenderSplashBytes(out, "RANDOM", std::string(), 256, 32, true, false, 13) &&
+        return RenderSplashBytes(out, "RANDOM", std::string(), 256, 32, true, false, 13,
+                                 RGB(255, 174, 0)) &&
                AbmFromBmpBytes(out);
 
     // Empty text on the standard black ground: a plain 256x256 tile, the disc's own geometry.
     if (kind == kCatAbmPreviewBase)
         return RenderSplashBytes(out, std::string(), std::string(), 256, 256, true, false) &&
+               AbmFromBmpBytes(out);
+    if (kind == kCatAbmOverlayBg)
+        return RenderSplashBytes(out, std::string(), std::string(), 640, 480, true, false) &&
+               AbmFromBmpBytes(out);
+    if (kind == kCatAbmOverlayIco)
+        return RenderSplashBytes(out, std::string(), std::string(), 480, 480, true, false) &&
                AbmFromBmpBytes(out);
 
     std::vector<std::string> cats = GetCustomBmsCategoriesForMode(mode);

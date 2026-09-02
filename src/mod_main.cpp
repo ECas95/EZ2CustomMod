@@ -599,6 +599,220 @@ static DWORD g_directVideoTargetW = 640, g_directVideoTargetH = 480;
 static DWORD g_directVideoCropX = 0, g_directVideoCropY = 0;
 static DWORD g_directVideoCropW = 0, g_directVideoCropH = 0;
 
+
+// ---- per-category bg.png / ico.png overlays ----------------------------------------------------
+//
+// Drawn OVER the game's own animated background, not instead of it. That distinction is what makes
+// this cheap: songselect_bg.str is a 75-frame loop of 512x512 tiles, and replacing it by redirecting
+// those frames would cost ~59MB of texture per category, because the pool keys on filename and never
+// frees. Two surfaces of our own, refilled on category change, cost 1.6MB for the whole session.
+//
+// Both go through the game's own sprite blitter:
+//
+//     sub_403F80(ctx, texture, xBits, yBits, w, h, argb)
+//
+// x and y arrive as float BIT PATTERNS in int slots (the decompiler shows 1130692608 for 229.0),
+// w and h as real floats, and the last argument is an ARGB modulation colour -- the 40 plain calls
+// pass -1, which is 0xFFFFFFFF. So 75% opacity is not something to implement: it is 0xBFFFFFFF.
+static const uint32_t kRenderCtx   = 0x1B2E320;   // *(_DWORD ***)ArgList
+static const uint32_t kBgArgb      = 0x80FFFFFFu; // 50% alpha, no tint
+static const uint32_t kIcoArgb     = 0xFFFFFFFFu;
+static const int      kBgW = 640, kBgH = 480;     // the game's base resolution
+static const int      kIcoSrc = 480;              // ico.png is square
+static const int      kIcoDraw = 64;              // how big it lands in the corner
+static const int      kIcoPad  = 6;
+
+typedef int (__thiscall* DrawSpriteFn)(void* ctx, uint32_t tex, uint32_t xBits, uint32_t yBits,
+                                       float w, float h, uint32_t argb);
+
+// sub_40A490(ctx, src, dst) -- SetRenderState 19 and 20, which are SRCBLEND and DESTBLEND.
+//
+// The modulation alpha alone changed nothing because the blend factors around our draw are the
+// game's default pair, (2,1) = ONE, ZERO: a straight opaque copy, where the source alpha has no
+// effect at all. The four call sites in the binary only ever use (2,1) opaque, (2,2) additive and
+// (9,6); there is no ALPHABLENDENABLE setter anywhere, so blending is on and it is these two that
+// decide. (5,6) is SRCALPHA / INVSRCALPHA -- ordinary transparency -- and the pair is put back to
+// (2,1) afterwards so nothing the HUD draws next inherits it.
+typedef int (__thiscall* SetBlendFn)(void* ctx, int src, int dst);
+static const int kBlendOne = 2, kBlendZero = 1, kBlendSrcAlpha = 5, kBlendInvSrcAlpha = 6;
+
+static void*    g_ovBgTex = nullptr;
+static void*    g_ovBgSurf = nullptr;
+static void*    g_ovIcoTex = nullptr;
+static void*    g_ovIcoSurf = nullptr;
+static bool     g_ovInitTried = false;
+static std::string g_ovCategory;      // what the surfaces currently hold
+static std::string g_ovWantCategory;  // what the wheel is showing
+static bool     g_ovHaveBg = false, g_ovHaveIco = false;
+
+static uint32_t FloatBits(float f) { uint32_t v; memcpy(&v, &f, 4); return v; }
+
+// altName is the pool's key when one is given, so the two overlays MUST pass different names.
+// Sharing it handed both calls the same texture object -- the diagnostic caught it as
+// bgTex == icoTex == 27f940f0, which would have drawn the icon's contents as the background.
+static bool MakeOverlaySurface(void* renderer, const char* baseName, const char* altName,
+                               int w, int h, void** texOut, void** surfOut) {
+    auto loadTexture   = reinterpret_cast<DirectLoadTexture_t>(Rva(0x08d00));
+    auto createSurface = reinterpret_cast<DirectCreateSurface_t>(Rva(0x07450));
+    void* texture = nullptr;
+    if (!loadTexture(renderer, baseName, &texture, altName) || !texture) return false;
+    int desc[31]{};
+    void* surface = createSurface(renderer, desc, w, h, 0);
+    if (!surface) return false;
+    *reinterpret_cast<void**>(texture) = surface;   // not released; see RepointOverlayTexture
+    *texOut = texture;
+    *surfOut = surface;
+    return true;
+}
+
+// Re-point a pooled texture at a surface we own. loadTexture returns the existing entry when the
+// pool still has this filename and a fresh one when it does not, so this is cheap in the common
+// case and self-healing after a reset.
+static bool RepointOverlayTexture(void* renderer, const char* baseName, const char* altName,
+                                  void* surface, void** texOut) {
+    auto loadTexture = reinterpret_cast<DirectLoadTexture_t>(Rva(0x08d00));
+    void* texture = nullptr;
+    if (!loadTexture(renderer, baseName, &texture, altName) || !texture) return false;
+    // The displaced surface is NOT released. It looks like a leak and it is a small one -- a couple
+    // of tiles for the life of the process -- but releasing it is what crashed at pc=00000000:
+    // after the pool is rebuilt the pointer here is recycled memory, its vtable is not a vtable,
+    // and vt[2] is not a function. We did not create that surface and cannot know whether anything
+    // else still holds it, so it is not ours to free.
+    *reinterpret_cast<void**>(texture) = surface;
+    *texOut = texture;
+    return true;
+}
+
+// Our texture is only usable while it still points at our own surface. When the pool is rebuilt the
+// object is recycled for something else -- which is how the song's disc ended up being drawn as the
+// background -- and this is the cheapest reliable way to notice.
+static bool OverlayTexUsable(void* tex, void* surf) {
+    if (!tex || !surf || IsBadReadPtr(tex, sizeof(void*))) return false;
+    return *reinterpret_cast<void**>(tex) == surf;
+}
+
+// Playing a song rebuilds the texture pool WITHOUT recreating the SongSelect object -- the log
+// shows the same ecx=40620000 before and after -- so tying this to the object pointer never fired.
+// The visible result was peculiar and worth remembering: the surfaces are ours and survived, so
+// the blit kept reporting success, while the texture objects the pool owned were freed underneath
+// and the draw silently produced nothing.
+//
+// So the textures are re-acquired on every category change instead of being cached for the session.
+static void RefreshOverlayTextures() {
+    if (!g_ovBgSurf || !g_ovIcoSurf) return;
+    void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
+    if (!renderer) return;
+    RepointOverlayTexture(renderer, "system\\disc\\bmsoverlaybg.bmp",  "bms-overlay-bg",
+                          g_ovBgSurf,  &g_ovBgTex);
+    RepointOverlayTexture(renderer, "system\\disc\\bmsoverlayico.bmp", "bms-overlay-ico",
+                          g_ovIcoSurf, &g_ovIcoTex);
+}
+
+static bool EnsureOverlaySurfaces() {
+    if (g_ovBgTex && g_ovIcoTex) return true;
+    if (g_ovInitTried) return false;
+    void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
+    if (!renderer) return false;                 // song select not up yet; try again next frame
+    g_ovInitTried = true;
+    // Base tiles nothing else requests -- the same lesson as the preview, where building on the
+    // game's own initdisc.bmp handed us a shared texture and freeing its surface crashed SBX.
+    bool ok = MakeOverlaySurface(renderer, "system\\disc\\bmsoverlaybg.bmp", "bms-overlay-bg",
+                                 kBgW, kBgH, &g_ovBgTex, &g_ovBgSurf) &&
+              MakeOverlaySurface(renderer, "system\\disc\\bmsoverlayico.bmp", "bms-overlay-ico",
+                                 kIcoSrc, kIcoSrc, &g_ovIcoTex, &g_ovIcoSurf);
+    LogLine("[overlay] surfaces %s", ok ? "ready" : "FAILED");
+    return ok;
+}
+
+static bool BlitImageToSurface(void* surface, const std::string& png, int w, int h) {
+    std::vector<unsigned char> px;
+    if (!RenderImageToBgr(png, w, h, px) || px.empty()) return false;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -h;                 // RenderImageToBgr hands back top-down
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 24;
+    info.bmiHeader.biCompression = BI_RGB;
+    info.bmiHeader.biSizeImage = (DWORD)px.size();
+    void** vt = *reinterpret_cast<void***>(surface);
+    HDC dc = nullptr;
+    if (FAILED(reinterpret_cast<DirectSurfaceGetDC_t>(vt[17])(surface, &dc)) || !dc) return false;
+    SetStretchBltMode(dc, COLORONCOLOR);
+    const int copied = StretchDIBits(dc, 0, 0, w, h, 0, 0, w, h, px.data(), &info,
+                                     DIB_RGB_COLORS, SRCCOPY);
+    reinterpret_cast<DirectSurfaceReleaseDC_t>(vt[26])(surface, dc);
+    return copied != 0 && (DWORD)copied != GDI_ERROR;
+}
+
+// Told by the filter which category the wheel moved to.
+void CategoryOverlaySetCategory(const char* name) {
+    g_ovWantCategory = name ? name : "";
+}
+
+// Called at the top of the song-select frame draw, so everything it renders lands on top.
+void CategoryOverlayDraw() {
+    if (!Config().categoryOverlay) return;
+    if (!EnsureOverlaySurfaces()) return;
+
+    {   // one-shot: what the draw actually sees, so a silent no-op names its own cause
+        static unsigned s_diag = 0;
+        if (s_diag++ < 3)
+            LogLine("[overlay] tick want='%s' have='%s' bgTex=%p icoTex=%p",
+                    g_ovWantCategory.c_str(), g_ovCategory.c_str(), g_ovBgTex, g_ovIcoTex);
+    }
+    if (g_ovCategory != g_ovWantCategory) {
+        g_ovCategory = g_ovWantCategory;
+        g_ovHaveBg = g_ovHaveIco = false;
+        RefreshOverlayTextures();   // the pool may have been rebuilt since the last category
+        if (!g_ovCategory.empty()) {
+            const std::string mode = GetActiveMode();
+            const std::string bg  = CategoryOverlayPath(mode, g_ovCategory, "bg");
+            const std::string ico = CategoryOverlayPath(mode, g_ovCategory, "ico");
+            // A category with no files just keeps the stock screen: nothing is drawn, nothing fails.
+            if (!bg.empty())  g_ovHaveBg  = BlitImageToSurface(g_ovBgSurf,  bg,  kBgW,   kBgH);
+            if (!ico.empty()) g_ovHaveIco = BlitImageToSurface(g_ovIcoSurf, ico, kIcoSrc, kIcoSrc);
+            LogLine("[overlay] category='%s' bg=%d ico=%d", g_ovCategory.c_str(),
+                    (int)g_ovHaveBg, (int)g_ovHaveIco);
+        }
+    }
+    if (!g_ovHaveBg && !g_ovHaveIco) return;
+
+    // A pool rebuild can land between category changes -- playing a song does exactly that -- so
+    // the textures are checked every frame, not only when the category moves.
+    if (!OverlayTexUsable(g_ovBgTex, g_ovBgSurf) || !OverlayTexUsable(g_ovIcoTex, g_ovIcoSurf)) {
+        RefreshOverlayTextures();
+        if (!OverlayTexUsable(g_ovBgTex, g_ovBgSurf) || !OverlayTexUsable(g_ovIcoTex, g_ovIcoSurf)) {
+            static unsigned s_lost = 0;
+            if (s_lost++ < 5) LogLine("[overlay] textures lost and not recoverable this frame");
+            return;
+        }
+    }
+
+    auto draw     = reinterpret_cast<DrawSpriteFn>(Rva(0x03f80));
+    auto setBlend = reinterpret_cast<SetBlendFn>(Rva(0x0a490));
+    void* ctx = reinterpret_cast<void*>(kRenderCtx);
+
+    setBlend(ctx, kBlendSrcAlpha, kBlendInvSrcAlpha);
+    if (g_ovHaveBg)
+        draw(ctx, reinterpret_cast<uint32_t>(g_ovBgTex), FloatBits(0.0f), FloatBits(0.0f),
+             (float)kBgW, (float)kBgH, kBgArgb);
+    if (g_ovHaveIco)
+        draw(ctx, reinterpret_cast<uint32_t>(g_ovIcoTex),
+             FloatBits((float)(kBgW - kIcoDraw - kIcoPad)),
+             FloatBits((float)(kBgH - kIcoDraw - kIcoPad)),
+             (float)kIcoDraw, (float)kIcoDraw, kIcoArgb);
+    setBlend(ctx, kBlendOne, kBlendZero);   // back to the opaque pair the HUD expects
+}
+
+// The object died: the texture pool went with it.
+void CategoryOverlayReset() {
+    g_ovBgTex = g_ovBgSurf = g_ovIcoTex = g_ovIcoSurf = nullptr;
+    g_ovInitTried = false;
+    g_ovCategory.clear();
+    g_ovHaveBg = g_ovHaveIco = false;
+}
+
 // ---- song-select BGA preview -------------------------------------------------------------------
 //
 // The selected song's disc is a single texture slot on the object, obj+260, filled by
@@ -674,15 +888,10 @@ static bool EnsurePreviewSurface() {
     void* surface = createSurface(renderer, desc, kPreviewSize, kPreviewSize, 0);
     if (!surface) { LogLine("[preview] CreateSurface %dx%d failed", kPreviewSize, kPreviewSize); return false; }
 
-    void* old = *reinterpret_cast<void**>(texture);
-    if (old && old != surface) {
-        void** vt = *reinterpret_cast<void***>(old);
-        auto release = reinterpret_cast<DirectSurfaceRelease_t>(vt[2]);
-        *reinterpret_cast<void**>(texture) = surface;
-        release(old);
-    } else {
-        *reinterpret_cast<void**>(texture) = surface;
-    }
+    // Not released, for the same reason as the overlay: after a pool rebuild this pointer is
+    // recycled memory and its vtable is not one, which crashed at pc=00000000. We did not create
+    // that surface, so it is not ours to free.
+    *reinterpret_cast<void**>(texture) = surface;
     g_previewTexture = texture;
     g_previewSurface = surface;
     LogLine("[preview] surface ready %dx%d texture=%p", kPreviewSize, kPreviewSize, texture);
@@ -766,6 +975,7 @@ void BgaPreviewTick(uint32_t obj, const char* selectedId) {
         // survives that -- the texture pool is rebuilt with it, which is the same reset that used
         // to blank the version labels on a menu round-trip -- so drop everything and start clean.
         PreviewRestoreSlot(0);                 // 0: do not write to the object that just died
+        CategoryOverlayReset();                // the overlay surfaces came from the same pool
         g_previewTexture = nullptr;
         g_previewSurface = nullptr;
         g_previewInitTried = false;
@@ -1742,6 +1952,13 @@ static HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPS
         // The RANDOM row's songname. It is not a song, so it has no cache directory to redirect
         // to -- the tile is built in RAM on request, exactly like the category sprites below.
         // trace_hooks asks for this once and keeps the texture handle.
+        if (lower.find("bmsoverlaybg") != std::string::npos ||
+            lower.find("bmsoverlayico") != std::string::npos) {
+            HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0,
+                                         lower.find("bmsoverlaybg") != std::string::npos
+                                             ? kCatAbmOverlayBg : kCatAbmOverlayIco);
+            if (vh != INVALID_HANDLE_VALUE) return vh;
+        }
         if (lower.find("bmspreviewbase") != std::string::npos) {
             HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmPreviewBase);
             if (vh != INVALID_HANDLE_VALUE) return vh;

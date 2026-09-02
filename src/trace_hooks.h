@@ -13,3 +13,8 @@ unsigned int RequiredObjectBytes();
 // Song-select BGA preview, driven from the per-frame renderer hook. Defined in mod_main.
 void BgaPreviewTick(uint32_t obj, const char* selectedId);
 void BgaPreviewStop(uint32_t obj);
+
+// Per-category bg/ico overlays, drawn from the song-select frame hook. Defined in mod_main.
+void CategoryOverlaySetCategory(const char* name);
+void CategoryOverlayDraw();
+void CategoryOverlayReset();

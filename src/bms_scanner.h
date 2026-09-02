@@ -129,6 +129,11 @@ bool DecodeBgaPreview(const std::string& videoPath, int size, int fps, int secon
                       std::vector<unsigned char>& frames, uint32_t& frameCount);
 std::string BgaVideoPathForSong(const std::string& id);
 
+// Per-category overlays: BMSData\<mode>\<category>\bg.png and ico.png.
+bool RenderImageToBgr(const std::string& path, int w, int h, std::vector<unsigned char>& out);
+std::string CategoryOverlayPath(const std::string& mode, const std::string& category,
+                                const char* which);
+
 // Category sprites are produced in memory and handed to the game through the file hooks; nothing
 // is written to disk for them. kind selects which of the three the game asked for.
 enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3,
@@ -137,7 +142,9 @@ enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3,
        kCatAbmRandom = 4,
        // A blank 256x256 for the BGA preview to build its texture on. It exists so the preview
        // never has to borrow a texture the game also uses -- see EnsurePreviewSurface.
-       kCatAbmPreviewBase = 5 };
+       kCatAbmPreviewBase = 5,
+       // Blank grounds for the per-category overlays, at the two sizes they are drawn.
+       kCatAbmOverlayBg = 6, kCatAbmOverlayIco = 7 };
 bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int kind,
                               std::vector<unsigned char>& out);
 

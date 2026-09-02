@@ -17,6 +17,8 @@ struct ModConfig {
     // Loops a few seconds of a song's BGA video in the song-select disc while the cursor rests
     // on it. Costs one 256x256 surface and a ~12MB frame buffer, both reused for every song.
     bool bgaPreview = true;
+    // Per-category bg.png / ico.png drawn over the song-select background.
+    bool categoryOverlay = true;
     bool enableFunctionTrace = true;
     bool altEnter = true;
     bool borderlessOnly = true;

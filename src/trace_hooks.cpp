@@ -49,6 +49,7 @@ static TraceHook g_hooks[] = {
     {"FUN_004570A0 Ranking global top99",0x570A0,6, true},
     {"FUN_00457A90 Ranking UI",         0x57A90, 7, true},
     {"FUN_00433D50 SongSelect top5 draw",0x33D50,9, true},
+    {"SongSelect after-background",0x433B9,7, true},
     {"FUN_00435070 SongSelect list/filter",0x35070,5, true},
     // 0x35390 hook tried & REVERTED: at its ENTRY the master array isn't built yet
     // (435390 itself parses ALLSONG then preloads), so our inject bailed (master=0) and
@@ -1296,6 +1297,12 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
 
     // Custom songs have no native Top-5 record. Let the renderer draw the normal frame, but clear
     // its final `showRanking` argument before it interprets unrelated visible-entry bytes as glyphs.
+    // Top of the song-select frame: the category overlay goes down before the HUD does.
+    if (h->rva == 0x433B9) {
+        CategoryOverlayDraw();
+        return;                     // runs every frame; never trace-spam this renderer
+    }
+
     if (h->rva == 0x33D50 && regs) {
         // BuildStub does pushfd before pushad, so PUSHAD's saved ESP is function-entry ESP - 4.
         uint32_t functionEsp = regs->originalEsp + 4;
@@ -1590,6 +1597,27 @@ static bool InstallCustomCategoryPatches() {
     if (std::memcmp(Rva(0x33D50), top5Prologue, sizeof(top5Prologue)) != 0) {
         LogLine("[category] top5 guard signature mismatch — custom SongSelect disabled");
         return false;
+    }
+    // The frame-draw hook overwrites 7 bytes, so the same rule applies: if the prologue is not
+    // sub esp,8 / push ebx / push ebp / push esi / push edi, this is not the function we measured
+    // and the overlay stays off rather than cutting an instruction in half.
+    // Inside sub_443380 -- vtable[3] of the song-select class, its draw method -- at the
+    // instruction right after the animated background is painted:
+    //
+    //     +0x34  call sub_403940      ; this + 772240, and 772240/4 = 193060 = the bg sequence
+    //     +0x39  ...                  ; 0x433B9: everything from here on is the HUD
+    //
+    // Hooking the function's ENTRY put our overlay UNDERNEATH that background, which is why it
+    // loaded correctly and drew nothing visible. Here it lands over the background and under the
+    // HUD, which is what was asked for.
+    //
+    // The 7 bytes are  cmp dword ptr [0x1B2E89C], 0  -- one whole instruction, and the jz that
+    // follows reads its flags, which survive because the stub pushfd's before calling out.
+    static const unsigned char framePrologue[] = {0x83, 0x3D, 0x9C, 0xE8, 0xB2, 0x01, 0x00};
+    if (std::memcmp(Rva(0x433B9), framePrologue, sizeof(framePrologue)) != 0) {
+        LogLine("[overlay] frame-draw signature mismatch — category overlays disabled");
+        for (size_t i = 0; i < sizeof(g_hooks) / sizeof(g_hooks[0]); ++i)
+            if (g_hooks[i].rva == 0x433B9) g_hooks[i].enabled = false;
     }
 
     // Wheel-extend, FIXED (decomp fun_432200): the OLD code also redirected the texture
@@ -1896,7 +1924,10 @@ static void VerifyMasterAgainstIndex(uint32_t cat) {
 // tile reading "RANDOM" so the row does not simply look like a duplicate of whatever it rolled.
 // The small-disc slot is left at zero on purpose: it draws nothing, and the roll stays a surprise
 // until the song starts.
-static uint32_t g_randomTex = 0;       // the "RANDOM" songname texture, loaded once
+// The tile, and the object it was loaded for. Leaving song select destroys that object and the
+// texture pool goes with it -- the same reset that used to blank the version labels on a menu
+// round-trip. Cached without that check, the handle came back dangling and the row drew nothing.
+static uint32_t g_randomTex = 0;
 static uint32_t g_randomRolls = 0;
 
 // Copy one of the rows already written into visible[] over row 0, then mark it.
@@ -1911,7 +1942,12 @@ static void RollRandomRow(uint32_t obj, uint32_t count) {
 
     // Load the tile on first use: the texture pool is a bump allocator, so this must happen once
     // for the process, not once per category.
-    if (!g_randomTex) {
+    // Re-acquired every roll rather than cached for the session. Playing a song rebuilds the
+    // texture pool while REUSING the SongSelect object, so "has the object changed" -- the check
+    // this used to make -- never noticed, and the row came back blank after every game.
+    // loadTex on a filename the pool still holds is a lookup, so the common case costs nothing.
+    {
+        g_randomTex = 0;
         const uint32_t gfxCtx = SafeRead32(0x1b2f054);
         if (gfxCtx) {
             typedef int(__thiscall* LoadTexFn)(uint32_t, const char*, void*, const char*);
@@ -2046,6 +2082,22 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
     g_snObject = obj;
     g_snLastSelected = selected;
     LoadSongnameWindow(obj, selected, written, "category");
+
+    // Name the category for the overlay: it finds bg.png / ico.png by folder name.
+    {
+        static std::vector<std::string> s_cats;
+        static std::string s_catsMode;
+        const std::string mode = GetActiveMode();
+        if (s_catsMode != mode) { s_catsMode = mode; s_cats = CustomCategoriesForModeOrLargest(mode); }
+        const uint32_t ci = cat >= kCustomCatBase ? cat - kCustomCatBase : 0xFFFFFFFFu;
+        const char* nm = ci < s_cats.size() ? s_cats[ci].c_str() : "";
+        CategoryOverlaySetCategory(nm);
+        static unsigned s_diag = 0;
+        if (s_diag++ < 3)
+            LogLine("[overlay] filter cat=%lu base=%lu ci=%lu cats=%lu -> '%s'",
+                    (unsigned long)cat, (unsigned long)kCustomCatBase, (unsigned long)ci,
+                    (unsigned long)s_cats.size(), nm);
+    }
 
     const float scroll = (float)selected * 100.0f;
     const uint32_t retVal = SafeRead32(obj + kObjRetVal);
