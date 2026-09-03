@@ -462,6 +462,18 @@ static const uint32_t kEzTicksPerMeasure = 384;
 static const uint32_t kNativeTicksPerMeasure = 192;
 static const uint32_t kModelTickScale = kEzTicksPerMeasure / kNativeTicksPerMeasure;
 
+// Every shipped tap note carries a length, and it is never zero. Decrypting 5keymix1p-10anti-hd.ez
+// and counting: 1988 of its 2067 notes are type 1 with len=6, and the rest are long notes with
+// 36/48/72/96/120 -- so 6 is not a duration anyone authored, it is the floor the format uses for
+// an instantaneous note.
+//
+// Ours emitted 0, because len was only ever assigned when resolving a long note. A zero-length note
+// gives the engine a single instant to match an input against, which is exactly what "you have to
+// be extremely precise and sometimes it still does not register" looks like from the player's side.
+//
+// 6 of the native grid, which is 12 of ours.
+static const int kMinNoteLenTicks = 6 * (int)kModelTickScale;
+
 static uint32_t bmsTickToEzTick(const ParsedBmsForEz& bms, int measure, int index, int div) {
     double pos = 0.0;
     for (int m = 0; m < measure; ++m) {
@@ -2174,7 +2186,8 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
             } else {
                 uint32_t delta = events[i].tick > events[(size_t)open].tick ? events[i].tick - events[(size_t)open].tick : 7;
                 events[(size_t)open].len = (int)std::min<uint32_t>(delta, 0xffff);
-                if (events[(size_t)open].len < 7) events[(size_t)open].len = 7;
+                if (events[(size_t)open].len < kMinNoteLenTicks)
+                    events[(size_t)open].len = kMinNoteLenTicks;
                 events[i].type = -1;
                 open = -1;
                 ++longNotes;
@@ -2300,7 +2313,10 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
                 out[off + 7] = 0x7f;
                 out[off + 8] = 0x40;
                 out[off + 9] = 0x00;
-                putU16(out, off + 10, (uint16_t)ev.len);
+                // A tap never had its length set, so it arrived here as 0. Everything the game
+                // ships carries at least kMinNoteLenTicks, long or not.
+                putU16(out, off + 10,
+                       (uint16_t)(ev.len < kMinNoteLenTicks ? kMinNoteLenTicks : ev.len));
                 out[off + 12] = 0x00;
             }
         }
