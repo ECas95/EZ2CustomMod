@@ -76,7 +76,11 @@ static uint32_t g_customCategoryCount = 0;
 // Version-label array relocation (details at InstallVersionArrayRelocation below).
 static const uint32_t kVerArrayOrig  = 0xBFFC0;   // 196592 * 4
 static const uint32_t kVerArrayReloc = 0x111000;  // clear of 0x110000/0x110800 (508 bytes each)
-static const uint32_t kVerNativeCount = 19;
+// Version labels for the kept natives, compacted the same way: 16 of them at slots 0..15.
+// Custom labels still ask for Version_19.bmp upward -- the FILE numbering is untouched, so the
+// redirect in mod_main keeps its base and the native files 16..18 are not shadowed.
+static const uint32_t kVerNativeCount = 16;
+static const uint32_t kVerCustomFile  = 19;        // first custom Version_NN.bmp on disk
 // Array A -- system/SongSelect/Version/ -- is the one behind the label under the song title:
 //     3A104  mov eax,[esi+edx*4+0xBFF74]   ; A lookup
 //     3A10D  lea edi,[esi+0xBE8D8]         ; its animation object, slot 1
@@ -142,7 +146,17 @@ static const uint32_t kSortNativeHi   = 46;        // last native one
 //
 // SLOT is not FILENAME. Custom tiles keep their category_48+ / sortstyle_47+ names, because the
 // native files category_01..47 still exist on disk and renumbering would collide with them.
-static const uint32_t kCustomCatBase  = 19;        // first wheel slot we own (was 47)
+// HOT, NEW and ALL go too. They are views like the LV and alphabetical tabs were -- they hold no
+// songs of their own -- so the only native categories left are the 16 game versions, which used to
+// sit at rows 3..18 and are now COMPACTED down to 0..15.
+//
+// This is the part the earlier pass deliberately skipped: dropping the tail needed only a base
+// change, while dropping the head means moving data, and four parallel arrays have to move with it
+// (category counts, category id lists, version labels, wheel textures). The rule that keeps it
+// straight is the same one as before: a slot moves, a FILENAME does not. category_04.abm is still
+// category_04.abm on disk; it just lands in wheel slot 0 now.
+static const uint32_t kNativeSrcFirst = 3;         // source row of "1st"; its tile is category_04
+static const uint32_t kCustomCatBase  = 16;        // first wheel slot we own (47 -> 19 -> 16)
 static const uint32_t kWheelMax       = 127;       // signed imm8 ceiling in the gate instructions
 static CategoryMemoryEdit g_sortEdits[] = {
     {0x44820, kSortBiasedOrig, kSortReloc, 0, 4, false},
@@ -498,14 +512,15 @@ static void EnsureCategoryTablesRelocated() {
     void* ids = VirtualAlloc(nullptr, kCats * kCatNameStride * kCatNameSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!cnt || !ids) { LogLine("[category] reloc alloc FAILED"); return; }
     uint32_t shift = CatShift();
-    memcpy(cnt, reinterpret_cast<void*>(kCatCountTableBase + shift), kCustomCatBase * 4u);
+    memcpy(cnt, reinterpret_cast<void*>(kCatCountTableBase + shift + kNativeSrcFirst * 4),
+           kCustomCatBase * 4u);
     // Row by row: source rows are kNativeCatNameStride apart, ours are kCatNameStride apart.
-    // Only 0..kCustomCatBase-1: rows 19..46 are the dropped LV/alphabetical views and those slots
-    // now belong to custom categories.
+    // Source row nc + kNativeSrcFirst lands in our row nc: the three meta tabs at the head are
+    // dropped, and rows past the versions were already gone with the LV/alphabetical views.
     for (uint32_t nc = 0; nc < kCustomCatBase; ++nc)
         memcpy(reinterpret_cast<unsigned char*>(ids) + (size_t)nc * kCatNameStride * kCatNameSize,
                reinterpret_cast<unsigned char*>(kCatNameTableBase + shift)
-                   + (size_t)nc * kNativeCatNameStride * kCatNameSize,
+                   + (size_t)(nc + kNativeSrcFirst) * kNativeCatNameStride * kCatNameSize,
                kNativeCatNameStride * kCatNameSize);
     uint32_t c = reinterpret_cast<uint32_t>(cnt), i = reinterpret_cast<uint32_t>(ids);
     bool ok = WriteMemory(Rva(0x35093), &c, 4) && WriteMemory(Rva(0x35112), &i, 4);
@@ -522,11 +537,13 @@ static void RefreshRelocatedNativeCategoryTables() {
     // second SongSelect build (mode switch) wipes every custom category to count 0 → the game's filter
     // divides by that count on category change → STATUS_INTEGER_DIVIDE_BY_ZERO (0xc0000094).
     uint32_t shift = CatShift();
-    std::memcpy(reinterpret_cast<void*>(g_catCountBuf), reinterpret_cast<void*>(kCatCountTableBase + shift), kCustomCatBase * 4u);
+    std::memcpy(reinterpret_cast<void*>(g_catCountBuf),
+                reinterpret_cast<void*>(kCatCountTableBase + shift + kNativeSrcFirst * 4),
+                kCustomCatBase * 4u);
     for (uint32_t nc = 0; nc < kCustomCatBase; ++nc)
         memcpy(reinterpret_cast<unsigned char*>(g_catIdBuf) + (size_t)nc * kCatNameStride * kCatNameSize,
                reinterpret_cast<unsigned char*>(kCatNameTableBase + shift)
-                   + (size_t)nc * kNativeCatNameStride * kCatNameSize,
+                   + (size_t)(nc + kNativeSrcFirst) * kNativeCatNameStride * kCatNameSize,
                kNativeCatNameStride * kCatNameSize);
 }
 
@@ -1144,6 +1161,18 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
         LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
         uint32_t gfxCtx = SafeRead32(0x1b2f054);
         if (gfxCtx) {
+            // The game's own loader filled slots 0..46 from category_01..47, so after the
+            // compaction slot N holds the tile of a category that is no longer there. Re-point the
+            // kept natives at the files they actually belong to: slot N <- category_(N + 4).
+            for (uint32_t n = 0; n < kCustomCatBase; ++n) {
+                char nf[96];
+                snprintf(nf, sizeof(nf), "System\\SongSelect\\Sortimage\\category_%02lu.bmp",
+                         (unsigned long)(n + kNativeSrcFirst + 1));
+                loadTex(gfxCtx, nf, reinterpret_cast<void*>(obj + g_catTexSmallBase + n * 4), nullptr);
+                snprintf(nf, sizeof(nf), "System\\SongSelect\\Sortimage\\categorybig_%02lu.bmp",
+                         (unsigned long)(n + kNativeSrcFirst + 1));
+                loadTex(gfxCtx, nf, reinterpret_cast<void*>(obj + g_catTexBigBase + n * 4), nullptr);
+            }
             for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
                 int catNum = 48 + (int)c;             // FILENAME: native files are 01..47 on disk
                 char fn[80];
@@ -1169,7 +1198,8 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                 // custom slots, loaded here directly, looked fine. Re-copying is 76 bytes and
                 // self-heals as soon as the loader has run.
                 SafeWriteBytes(obj + kVerArrayReloc,
-                               reinterpret_cast<void*>(obj + kVerArrayOrig), kVerNativeCount * 4);
+                               reinterpret_cast<void*>(obj + kVerArrayOrig + kNativeSrcFirst * 4),
+                               kVerNativeCount * 4);
                 uint32_t nativeOk = 0;
                 for (uint32_t v = 0; v < kVerNativeCount; ++v)
                     if (SafeRead32(obj + kVerArrayReloc + v * 4)) ++nativeOk;
@@ -1177,7 +1207,8 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                 if (g_verARelocated &&
                     CanReadPtr(reinterpret_cast<void*>(obj + kVerAOrig), kVerNativeCount * 4))
                     SafeWriteBytes(obj + kVerAReloc,
-                                   reinterpret_cast<void*>(obj + kVerAOrig), kVerNativeCount * 4);
+                                   reinterpret_cast<void*>(obj + kVerAOrig + kNativeSrcFirst * 4),
+                                   kVerNativeCount * 4);
                 // The custom textures DO load once: the pool is a bump allocator that never
                 // frees, so reloading them per pass burned ~770KB each time.
                 if (s_verFilledFor == obj) {
@@ -1201,11 +1232,12 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                 s_verFilledFor = obj;
                 unsigned long ok = 0;
                 for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
-                    uint32_t slotIdx = kVerNativeCount + c;
+                    const uint32_t slotIdx = kVerNativeCount + c;   // where it goes
+                    const uint32_t fileIdx = kVerCustomFile  + c;   // what it is called on disk
                     char vf[112] = {};
                     snprintf(vf, sizeof(vf),
                              "System\\SongSelect\\V_View\\version\\Version_%02lu.bmp",
-                             (unsigned long)slotIdx);
+                             (unsigned long)fileIdx);
                     loadTex(gfxCtx, vf,
                             reinterpret_cast<void*>(obj + kVerArrayReloc + slotIdx * 4), nullptr);
                     // The visible label lives in array A, so load it there too.
@@ -1213,7 +1245,7 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                         char af[112] = {};
                         snprintf(af, sizeof(af),
                                  "System\\SongSelect\\Version\\Version_%02lu.bmp",
-                                 (unsigned long)slotIdx);
+                                 (unsigned long)fileIdx);
                         loadTex(gfxCtx, af,
                                 reinterpret_cast<void*>(obj + kVerAReloc + slotIdx * 4), nullptr);
                     }
