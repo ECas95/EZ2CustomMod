@@ -397,16 +397,23 @@ static bool LooksLikeExecutable(void* ptr) {
     return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
 }
 
+// The last range found readable. SafeRead32 is called tens of thousands of times in a row over
+// one array, and a VirtualQuery apiece is a syscall apiece; the object never changes protection
+// underneath those loops, so the query only has to happen when the address leaves the range.
+static uintptr_t g_readableBase = 0, g_readableEnd = 0;
+
 static bool CanReadPtr(const void* ptr, size_t bytes = 4) {
     if (!ptr) return false;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(ptr);
+    if (g_readableEnd && a >= g_readableBase && a + bytes <= g_readableEnd) return true;
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(ptr, &mbi, sizeof(mbi))) return false;
     if (mbi.State != MEM_COMMIT) return false;
     DWORD p = mbi.Protect & 0xff;
     if (p == PAGE_NOACCESS || p == PAGE_EXECUTE) return false;
-    uintptr_t a = reinterpret_cast<uintptr_t>(ptr);
-    uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-    return a + bytes <= base + mbi.RegionSize;
+    g_readableBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    g_readableEnd  = g_readableBase + mbi.RegionSize;
+    return a + bytes <= g_readableEnd;
 }
 
 static uint32_t SafeRead32(uint32_t addr, uint32_t def = 0) {
@@ -430,7 +437,47 @@ static std::string SafeReadAscii(uint32_t addr, size_t maxLen = 96) {
     return out;
 }
 
+// A range already known to be committed and writable, so the common case costs no syscall at all.
+// Invalidated whenever a write falls outside it, which re-queries and re-caches.
+static uint32_t g_writableBase = 0, g_writableEnd = 0;
+
+// Both caches are dropped at the start of every operation that touches the song object. They pay
+// for themselves inside one pass over the catalogue, and bounding them to a single call means a
+// cached range can never outlive the object it described -- which, for memory the game frees when
+// SongSelect goes away, is the difference between a fast write and a write into freed memory.
+static void DropRangeCaches() {
+    g_writableBase = g_writableEnd = 0;
+    g_readableBase = g_readableEnd = 0;
+}
+
+static bool RangeIsWritable(uint32_t addr, size_t bytes) {
+    if (g_writableEnd && addr >= g_writableBase && addr + bytes <= g_writableEnd) return true;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    const DWORD p = mbi.Protect & 0xff;
+    if (p != PAGE_READWRITE && p != PAGE_WRITECOPY &&
+        p != PAGE_EXECUTE_READWRITE && p != PAGE_EXECUTE_WRITECOPY) return false;
+    g_writableBase = reinterpret_cast<uint32_t>(mbi.BaseAddress);
+    g_writableEnd  = g_writableBase + static_cast<uint32_t>(mbi.RegionSize);
+    return addr + bytes <= g_writableEnd;
+}
+
+// Writing into the song object used to cost three syscalls a field: a VirtualQuery to validate,
+// then VirtualProtect to PAGE_READWRITE and back. writeEntry does seventeen of these per song and
+// runs for the whole catalogue, so a 20,366-song list meant roughly a million syscalls -- and worse
+// than their count, protecting and unprotecting 884-byte slices inside one 22 MB region splits the
+// process's VAD tree, so every call after them is slower than the last. Measured on the cabinet's
+// log that was 32 seconds of the two and a half minutes it took to open song select.
+//
+// None of it was needed: the object is a VirtualAlloc'd region we size ourselves and it is already
+// writable. So a writable target is now a plain memcpy behind one cached range check. The old path
+// stays for targets that really are read-only -- code patches -- which are rare and one-shot.
 static bool SafeWriteBytes(uint32_t addr, const void* src, size_t bytes) {
+    if (RangeIsWritable(addr, bytes)) {
+        std::memcpy(reinterpret_cast<void*>(addr), src, bytes);
+        return true;
+    }
     if (!CanReadPtr(reinterpret_cast<void*>(addr), bytes)) return false;
     DWORD oldProtect = 0;
     if (!VirtualProtect(reinterpret_cast<void*>(addr), bytes, PAGE_READWRITE, &oldProtect)) return false;
@@ -551,6 +598,7 @@ static void RefreshRelocatedNativeCategoryTables() {
 // tables so the game's own filter lists them under their custom category. After this the
 // mod never touches visible[] — the native filter rebuilds it correctly on every entry.
 static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uint32_t categoryParam) {
+    DropRangeCaches();
     (void)categoryParam;
     if (!Config().enableSongSelectInject || !Config().enableBmsData) return;
     if (GetActiveMode().empty()) return;
@@ -2027,6 +2075,7 @@ static void RollRandomRow(uint32_t obj, uint32_t count) {
 
 // ---- the filter itself ------------------------------------------------------------------------
 static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSelection) {
+    DropRangeCaches();
     BgaPreviewStop(obj);       // the list is about to be rebuilt under the preview
     SongSelectPreFilter(obj, cat);
     ProbeVacatedMaster(obj);
