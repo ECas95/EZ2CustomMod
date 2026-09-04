@@ -2042,14 +2042,575 @@ static std::vector<std::string> FindScrFrameRun(const std::string& dir) {
     return best;
 }
 
-// A song's .scr background, decoded into the same frame buffer the video preview uses.
-bool DecodeScrPreview(const std::string& songId, int size, int fps, int seconds,
-                      std::vector<unsigned char>& frames, uint32_t& frameCount) {
+// ---- .scr / .str scene compositing --------------------------------------------------------------
+//
+// A .scr is a timeline and a .str is a scene, and reversing both is what makes a real preview
+// possible. Neither is documented past its header -- freem's formats.md marks the .str layer and
+// keyframe structures "todo" and says outright that how a .scr times its .str playback is unknown --
+// so the layouts below were derived from the shipped files and checked against all of them.
+//
+//   .scr  "SCR0", then a table of 136-byte entries: start time in MILLISECONDS (u32), a plane
+//         index (u32), and a 128-byte .str filename. The table does not always start at the same
+//         offset (0x14, 0x1C and 0x24 all occur), so it is located by trying each and keeping the
+//         one whose names resolve to .str files that exist -- 297 of 305 files parse that way, and
+//         3611 of 3613 references resolve.
+//
+//         The plane is what makes this worth doing: entries on different planes play AT THE SAME
+//         TIME, each plane advancing through its own scenes. Sorting by time proves it -- 297 of
+//         297 files are ordered within every plane, against 152 ordered globally.
+//
+//   .str  "STRM", fps at 8, layer count at 0x10, 16 reserved bytes, then per layer: a texture count,
+//         that many 128-byte names, a keyframe count, and that many 124-byte keyframes. Walking it
+//         lands exactly on the last byte of 10469 of 10543 files, which is what says 124 is right.
+//
+//         A keyframe holds frame number, type, position, the four quad corners, an animation-frame
+//         index, an angle, RGBA and a source/destination blend pair. Type 0 keyframes are the real
+//         keys and are interpolated between; type 1 entries are all-zero placeholders (their count
+//         matches the all-zero blend pair exactly, across 231764 of them).
+//
+// Of 895214 keyframes, 98.2% have axis-aligned quads, so corner deformation is dropped and the quad
+// is taken as its bounding rectangle; rotation is kept because a quarter of the real keys use it.
+
+struct ScrEntry { uint32_t ms; uint32_t plane; std::string str; };
+
+struct StrKey {
+    int32_t frame;
+    float   x, y;                    // where the quad's centre sits, in the scene's 640x480 space
+    float   qx0, qx1, qy0, qy1;      // quad bounds relative to that centre
+    float   ani, angle;
+    float   col[4];                  // RGBA 0..255, alpha included
+    int32_t sa, da;                  // D3D7 blend factors
+};
+struct StrLayer { std::vector<std::string> tex; std::vector<StrKey> keys; };
+struct StrScene { int fps; std::vector<StrLayer> layers; };
+
+static const int kSceneW = 640, kSceneH = 480;   // the coordinate space keyframes are written in
+
+static bool ScrFileExists(const std::string& p) {
+    const DWORD a = GetFileAttributesA(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static size_t FieldLen(const char* p, size_t cap) {
+    size_t n = 0;
+    while (n < cap && p[n]) ++n;
+    return n;
+}
+
+static bool ReadWholeFile(const std::string& path, size_t minSize, size_t maxSize,
+                          std::vector<unsigned char>& out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    const long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    bool ok = false;
+    if (sz > (long)minSize && sz < (long)maxSize) {
+        out.resize((size_t)sz);
+        ok = fread(out.data(), 1, out.size(), f) == out.size();
+    }
+    fclose(f);
+    return ok;
+}
+
+static bool ParseStrScene(const std::string& path, StrScene& out) {
+    std::vector<unsigned char> d;
+    if (!ReadWholeFile(path, 0x24, 64u * 1024 * 1024, d)) return false;
+    if (memcmp(d.data(), "STRM", 4) != 0) return false;
+
+    uint32_t fps = 0, layers = 0;
+    memcpy(&fps, d.data() + 8, 4);
+    memcpy(&layers, d.data() + 0x10, 4);
+    if (layers > 256) return false;
+    out.fps = fps ? (int)fps : 60;
+    out.layers.clear();
+
+    size_t off = 0x24;
+    for (uint32_t L = 0; L < layers; ++L) {
+        if (off + 4 > d.size()) return false;
+        uint32_t tex = 0;
+        memcpy(&tex, d.data() + off, 4);
+        off += 4;
+        if (tex > 256 || off + (size_t)tex * 128 + 4 > d.size()) return false;
+        StrLayer layer;
+        for (uint32_t t = 0; t < tex; ++t) {
+            const char* p = (const char*)d.data() + off;
+            layer.tex.push_back(std::string(p, FieldLen(p, 128)));
+            off += 128;
+        }
+        uint32_t nk = 0;
+        memcpy(&nk, d.data() + off, 4);
+        off += 4;
+        if (nk > 100000 || off + (size_t)nk * 124 > d.size()) return false;
+        for (uint32_t k = 0; k < nk; ++k) {
+            const unsigned char* b = d.data() + off;
+            off += 124;
+            int32_t type = 0;
+            memcpy(&type, b + 4, 4);
+            if (type != 0) continue;                 // placeholder, carries nothing
+            StrKey key;
+            memcpy(&key.frame, b + 0, 4);
+            memcpy(&key.x, b + 8, 4);
+            memcpy(&key.y, b + 12, 4);
+            float xy[8];
+            memcpy(xy, b + 48, 32);
+            key.qx0 = key.qx1 = xy[0];
+            key.qy0 = key.qy1 = xy[4];
+            for (int i = 1; i < 4; ++i) {
+                if (xy[i] < key.qx0) key.qx0 = xy[i];
+                if (xy[i] > key.qx1) key.qx1 = xy[i];
+                if (xy[4 + i] < key.qy0) key.qy0 = xy[4 + i];
+                if (xy[4 + i] > key.qy1) key.qy1 = xy[4 + i];
+            }
+            memcpy(&key.ani, b + 80, 4);
+            memcpy(&key.angle, b + 92, 4);
+            memcpy(key.col, b + 96, 16);
+            memcpy(&key.sa, b + 112, 4);
+            memcpy(&key.da, b + 116, 4);
+            layer.keys.push_back(key);
+        }
+        out.layers.push_back(layer);
+    }
+    return !out.layers.empty();
+}
+
+// The entry table, found by trying each offset the shipped files use and keeping the one whose
+// names actually resolve. Guessing the header layout was not worth it: three variants exist, and
+// file existence is ground truth that settles all of them.
+static bool ParseScrTimeline(const std::string& path, const std::string& dir,
+                             std::vector<ScrEntry>& out) {
+    std::vector<unsigned char> d;
+    if (!ReadWholeFile(path, 0x14, 16u * 1024 * 1024, d)) return false;
+    if (memcmp(d.data(), "SCR0", 4) != 0) return false;
+
+    static const size_t kStarts[] = {0x14, 0x18, 0x1C, 0x20, 0x24};
+    int bestHits = -1;
+    for (int s = 0; s < 5; ++s) {
+        std::vector<ScrEntry> got;
+        int hits = 0;
+        for (size_t off = kStarts[s]; off + 8 <= d.size(); off += 136) {
+            ScrEntry e;
+            memcpy(&e.ms, d.data() + off, 4);
+            memcpy(&e.plane, d.data() + off + 4, 4);
+            const char* p = (const char*)d.data() + off + 8;
+            const size_t avail = d.size() - (off + 8) < 128 ? d.size() - (off + 8) : 128;
+            e.str.assign(p, FieldLen(p, avail));
+            bool clean = true;                       // the rest of the field must be padding
+            for (size_t i = e.str.size(); i < avail; ++i)
+                if (p[i]) { clean = false; break; }
+            if (!clean) break;
+            if (!e.str.empty()) {
+                std::string low = e.str;
+                std::transform(low.begin(), low.end(), low.begin(),
+                               [](unsigned char c) { return (char)tolower(c); });
+                if (low.size() < 5 || low.compare(low.size() - 4, 4, ".str") != 0) break;
+                if (ScrFileExists(JoinPath(dir, e.str))) ++hits;
+            }
+            got.push_back(e);
+        }
+        if (!got.empty() && hits > bestHits) { bestHits = hits; out.swap(got); }
+    }
+    return bestHits > 0;
+}
+
+// ---- rasterising one layer ----------------------------------------------------------------------
+
+struct ScrTex { int w, h; std::vector<unsigned char> bgra; };
+
+// Decoded textures, kept for one song's decode. A scene reuses the same art across every frame it
+// draws, so decoding once per name instead of once per frame is the difference between a preview
+// that appears and one that keeps the cabinet waiting.
+struct ScrTexCache {
+    std::map<std::string, ScrTex> map;
+    size_t bytes;
+    size_t cap;
+    ScrTexCache() : bytes(0), cap(24u * 1024 * 1024) {}
+};
+
+// Textures are stored no larger than the canvas they will be drawn into, and the cache as a whole
+// gets a budget. Neither is optional on a 32-bit cabinet: the art is authored for a 640x480 screen,
+// so bg\therhythm's scenes reach for 163 MB of it at full size, in a process that is already
+// holding the song object. Capped at preview size the same set is a fifteenth of that, and the
+// budget bounds the pathological case that is left.
+static const ScrTex* ScrLoadTex(ScrTexCache& cache, const std::string& dir, const std::string& name,
+                                int maxDim) {
+    std::string key = name;
+    std::transform(key.begin(), key.end(), key.begin(),
+                   [](unsigned char c) { return (char)tolower(c); });
+    std::map<std::string, ScrTex>::iterator it = cache.map.find(key);
+    if (it != cache.map.end()) return it->second.w ? &it->second : NULL;
+    if (cache.bytes >= cache.cap) return NULL;   // budget spent; the rest of this scene goes unpainted
+
+    ScrTex tex;
+    tex.w = tex.h = 0;
+    // The scenes name their art .bmp; on disk it is the .abm the game actually ships.
+    const size_t dot = name.find_last_of('.');
+    const std::string stem = dot == std::string::npos ? name : name.substr(0, dot);
+    std::vector<unsigned char> b;
+    int w = 0, h = 0, bpp = 0;
+    size_t dataOff = 0;
+    bool bottomUp = true;
+    if (ReadWholeFile(JoinPath(dir, stem + ".abm"), 54, 64u * 1024 * 1024, b) &&
+        AbmDecodeHeader(b, w, h, bpp, dataOff, bottomUp)) {
+        const int bytesPP = bpp / 8;
+        const size_t stride = (((size_t)w * bytesPP + 3) & ~(size_t)3);
+        if (dataOff + stride * (size_t)h <= b.size() && w > 0 && h > 0) {
+            // Shrunk on the way in, keeping the aspect, so nothing bigger than the canvas is kept.
+            int tw = w, th = h;
+            if (maxDim > 0 && (w > maxDim || h > maxDim)) {
+                if (w >= h) { tw = maxDim; th = (int)((int64_t)h * maxDim / w); }
+                else        { th = maxDim; tw = (int)((int64_t)w * maxDim / h); }
+                if (tw < 1) tw = 1;
+                if (th < 1) th = 1;
+            }
+            tex.w = tw;
+            tex.h = th;
+            tex.bgra.assign((size_t)tw * th * 4, 0);
+            for (int y = 0; y < th; ++y) {
+                const int sy = (int)((int64_t)y * h / th);
+                const unsigned char* row =
+                    b.data() + dataOff + (size_t)(bottomUp ? (h - 1 - sy) : sy) * stride;
+                unsigned char* dst = tex.bgra.data() + (size_t)y * tw * 4;
+                for (int x = 0; x < tw; ++x) {
+                    const unsigned char* p = row + (size_t)((int64_t)x * w / tw) * bytesPP;
+                    if (bpp == 16) {
+                        const uint16_t v = (uint16_t)(p[0] | (p[1] << 8));
+                        dst[x*4+0] = (unsigned char)(( v        & 0x1f) << 3);
+                        dst[x*4+1] = (unsigned char)(((v >> 5)  & 0x1f) << 3);
+                        dst[x*4+2] = (unsigned char)(((v >> 10) & 0x1f) << 3);
+                        dst[x*4+3] = 255;
+                    } else {
+                        dst[x*4+0] = p[0];
+                        dst[x*4+1] = p[1];
+                        dst[x*4+2] = p[2];
+                        dst[x*4+3] = bytesPP == 4 ? p[3] : 255;
+                    }
+                }
+            }
+        }
+    }
+    cache.bytes += tex.bgra.size();
+    std::map<std::string, ScrTex>::iterator ins =
+        cache.map.insert(std::make_pair(key, ScrTex())).first;
+    ins->second.w = tex.w;
+    ins->second.h = tex.h;
+    ins->second.bgra.swap(tex.bgra);
+    return ins->second.w ? &ins->second : NULL;
+}
+
+// D3D7 blend factor -> multiplier in 0..256 fixed point. src/dst are one channel, sa is source
+// alpha. The four that matter cover better than 96% of the keyframes: ONE/ZERO (opaque), ONE/ONE
+// (additive), SRCALPHA/INVSRCALPHA (the usual blend) and ZERO/SRCCOLOR (multiply).
+static inline int ScrBlendFactor(int code, int src, int sa, int dst) {
+    switch (code) {
+        case 1:  return 0;                    // ZERO
+        case 2:  return 256;                  // ONE
+        case 3:  return src + 1;              // SRCCOLOR
+        case 4:  return 256 - src;            // INVSRCCOLOR
+        case 5:  return sa + 1;               // SRCALPHA
+        case 6:  return 256 - sa;             // INVSRCALPHA
+        case 9:  return dst + 1;              // DESTCOLOR
+        case 10: return 256 - dst;            // INVDESTCOLOR
+        default: return sa + 1;               // DESTALPHA variants: no destination alpha is kept
+    }
+}
+
+// Interpolate a layer's state at `frame`, between the type-0 keys that bracket it.
+static bool ScrEvalLayer(const StrLayer& layer, float frame, StrKey& out) {
+    if (layer.keys.empty()) return false;
+    // A layer exists only between its first and last key. Holding the last key instead looks
+    // harmless and is not: bgRED spells one animation out as eight layers with consecutive
+    // three-frame windows, and holding them all left eight additive copies stacked on the disc,
+    // which saturates to a flat white circle. A lone key is a static layer and does persist.
+    if (layer.keys.size() > 1) {
+        if (frame < (float)layer.keys.front().frame - 0.5f) return false;
+        if (frame > (float)layer.keys.back().frame + 0.5f) return false;
+    }
+    size_t i = 0;
+    while (i + 1 < layer.keys.size() && (float)layer.keys[i + 1].frame <= frame) ++i;
+    const StrKey& a = layer.keys[i];
+    const StrKey& b = layer.keys[i + 1 < layer.keys.size() ? i + 1 : i];
+    const float span = (float)(b.frame - a.frame);
+    float t = 0.0f;
+    if (span > 0.0f && frame > (float)a.frame) {
+        t = (frame - (float)a.frame) / span;
+        if (t > 1.0f) t = 1.0f;
+    }
+    out = a;
+    out.x     += (b.x - a.x) * t;
+    out.y     += (b.y - a.y) * t;
+    out.qx0   += (b.qx0 - a.qx0) * t;
+    out.qx1   += (b.qx1 - a.qx1) * t;
+    out.qy0   += (b.qy0 - a.qy0) * t;
+    out.qy1   += (b.qy1 - a.qy1) * t;
+    out.ani   += (b.ani - a.ani) * t;
+    out.angle += (b.angle - a.angle) * t;
+    for (int c = 0; c < 4; ++c) out.col[c] += (b.col[c] - a.col[c]) * t;
+    return true;
+}
+
+// Draw one layer into the preview-sized BGR canvas. Scene coordinates are 640x480 and the canvas is
+// size*size, so everything is scaled on the way in -- rasterising at preview size rather than
+// compositing at 640x480 and shrinking is six times less work for the same result at 256px.
+static void ScrDrawLayer(unsigned char* canvas, int size, ScrTexCache& cache,
+                         const std::string& dir, const StrLayer& layer, const StrKey& st) {
+    if (layer.tex.empty() || st.col[3] < 0.5f) return;
+    int idx = 0;
+    if (layer.tex.size() > 1) {
+        idx = (int)(st.ani + 0.5f);
+        if (idx < 0) idx = 0;
+        if (idx >= (int)layer.tex.size()) idx = (int)layer.tex.size() - 1;
+    }
+    const ScrTex* tex = ScrLoadTex(cache, dir, layer.tex[idx], size);
+    if (!tex) return;
+
+    const float sx = (float)size / (float)kSceneW, sy = (float)size / (float)kSceneH;
+    const float w = (st.qx1 - st.qx0) * sx, h = (st.qy1 - st.qy0) * sy;
+    if (w < 0.5f || h < 0.5f) return;
+    const float cx = (st.x + (st.qx0 + st.qx1) * 0.5f) * sx;
+    const float cy = (st.y + (st.qy0 + st.qy1) * 0.5f) * sy;
+
+    const float ang = st.angle * 3.14159265f / 180.0f;
+    const float ca = cosf(ang), sa = sinf(ang);
+    const float rad = sqrtf(w * w + h * h) * 0.5f + 2.0f;
+    int px0 = (int)(cx - rad), px1 = (int)(cx + rad) + 1;
+    int py0 = (int)(cy - rad), py1 = (int)(cy + rad) + 1;
+    if (px0 < 0) px0 = 0;
+    if (py0 < 0) py0 = 0;
+    if (px1 > size) px1 = size;
+    if (py1 > size) py1 = size;
+    if (px0 >= px1 || py0 >= py1) return;
+
+    const int modB = (int)st.col[2], modG = (int)st.col[1], modR = (int)st.col[0];
+    const int alpha = (int)st.col[3];
+    const bool plain = modB >= 255 && modG >= 255 && modR >= 255 && alpha >= 255;
+    const bool opaque = st.sa == 2 && st.da == 1;        // ONE, ZERO: a straight copy
+    const float iw = 1.0f / w, ih = 1.0f / h;
+
+    // Three quarters of the real keyframes have no rotation, and a full-screen quad at 256px is
+    // 65k pixels a frame -- so the unrotated case gets its own path, with the horizontal texture
+    // lookup hoisted into a row of precomputed columns instead of two multiplies and a divide per
+    // pixel. Compositing a busy scene went from 2.2 s to well under a second on that alone.
+    std::vector<int> cols;
+    const bool axis = st.angle > -0.01f && st.angle < 0.01f;
+    if (axis) {
+        cols.resize((size_t)(px1 - px0), -1);
+        for (int x = px0; x < px1; ++x) {
+            const float u = ((float)x + 0.5f - cx) * iw + 0.5f;
+            if (u < 0.0f || u >= 1.0f) continue;
+            int tu = (int)(u * tex->w);
+            if (tu < 0) tu = 0;
+            if (tu >= tex->w) tu = tex->w - 1;
+            cols[(size_t)(x - px0)] = tu;
+        }
+    }
+
+    for (int y = py0; y < py1; ++y) {
+        const float dy = (float)y + 0.5f - cy;
+        unsigned char* drow = canvas + (size_t)y * size * 3;
+        int rowStart = -1;
+        if (axis) {
+            const float v = dy * ih + 0.5f;
+            if (v < 0.0f || v >= 1.0f) continue;
+            int tv = (int)(v * tex->h);
+            if (tv < 0) tv = 0;
+            if (tv >= tex->h) tv = tex->h - 1;
+            rowStart = tv * tex->w;
+        }
+        for (int x = px0; x < px1; ++x) {
+            int tu, tv;
+            const unsigned char* sp;
+            if (axis) {
+                tu = cols[(size_t)(x - px0)];
+                if (tu < 0) continue;
+                sp = tex->bgra.data() + ((size_t)rowStart + tu) * 4;
+            } else {
+                const float dx = (float)x + 0.5f - cx;
+                const float lx =  dx * ca + dy * sa;     // into the quad's own frame
+                const float ly = -dx * sa + dy * ca;
+                const float u = lx * iw + 0.5f, v = ly * ih + 0.5f;
+                if (u < 0.0f || u >= 1.0f || v < 0.0f || v >= 1.0f) continue;
+                tu = (int)(u * tex->w);
+                tv = (int)(v * tex->h);
+                if (tu < 0) tu = 0;
+                if (tv < 0) tv = 0;
+                if (tu >= tex->w) tu = tex->w - 1;
+                if (tv >= tex->h) tv = tex->h - 1;
+                sp = tex->bgra.data() + ((size_t)tv * tex->w + tu) * 4;
+            }
+
+            unsigned char* dp = drow + (size_t)x * 3;
+            if (opaque && plain) {                       // the commonest case, and the cheapest
+                dp[0] = sp[0];
+                dp[1] = sp[1];
+                dp[2] = sp[2];
+                continue;
+            }
+            const int sB = sp[0] * modB / 255, sG = sp[1] * modG / 255, sR = sp[2] * modR / 255;
+            const int sA = sp[3] * alpha / 255;
+            const int src[3] = {sB, sG, sR};
+            for (int c = 0; c < 3; ++c) {
+                const int d = dp[c];
+                const int o = (src[c] * ScrBlendFactor(st.sa, src[c], sA, d) +
+                               d      * ScrBlendFactor(st.da, src[c], sA, d)) >> 8;
+                dp[c] = (unsigned char)(o < 0 ? 0 : (o > 255 ? 255 : o));
+            }
+        }
+    }
+}
+
+// The composited .scr preview: every plane's active scene, layered, sampled in real time.
+//
+// Returns false when the song has no usable .scr, so the caller can fall back to reading a raw
+// frame run off disk -- which is still the right answer for scenes like bg\12Basic, whose whole
+// .scr is a scanline overlay and two letterbox bars over content that lives elsewhere.
+static bool DecodeScrComposited(const std::string& dir, const std::string& songId, int size,
+                                int fps, int seconds, std::vector<unsigned char>& frames,
+                                uint32_t& frameCount, double& coverage) {
+    coverage = 0.0;
+    std::string scrPath;
+    WIN32_FIND_DATAA fd;
+    memset(&fd, 0, sizeof(fd));
+    HANDLE h = FindFirstFileA(JoinPath(dir, "*.scr").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                scrPath = JoinPath(dir, fd.cFileName);
+                break;
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    if (scrPath.empty()) return false;
+
+    std::vector<ScrEntry> timeline;
+    if (!ParseScrTimeline(scrPath, dir, timeline) || timeline.empty()) return false;
+
+    // Scenes are parsed once and reused across every frame that references them, as are textures.
+    std::map<std::string, StrScene> scenes;
+    ScrTexCache texCache;
+
+    std::vector<uint32_t> planes;
+    uint32_t startMs = 0xFFFFFFFFu;
+    for (size_t i = 0; i < timeline.size(); ++i) {
+        if (std::find(planes.begin(), planes.end(), timeline[i].plane) == planes.end())
+            planes.push_back(timeline[i].plane);
+        if (!timeline[i].str.empty() && timeline[i].ms < startMs) startMs = timeline[i].ms;
+    }
+    if (startMs == 0xFFFFFFFFu) return false;
+    std::sort(planes.begin(), planes.end());
+
+    // Load every scene the timeline names, and with them the timeline's real length.
+    //
+    // That length is when the LAST scene on each plane finishes -- not the furthest any scene
+    // would have reached. Taking the maximum over all entries leaves a dead tail whenever the
+    // timeline ends on a short scene: bg\8Nihilism closes on a four-frame noise flash but also
+    // contains a four-second intro, and measuring to the intro's end left three silent seconds
+    // that the loop then dutifully replayed as nothing.
+    uint32_t endMs = startMs;
+    for (size_t p = 0; p < planes.size(); ++p) {
+        const ScrEntry* last = NULL;
+        for (size_t i = 0; i < timeline.size(); ++i) {
+            if (timeline[i].plane != planes[p]) continue;
+            if (!last || timeline[i].ms >= last->ms) last = &timeline[i];
+        }
+        if (!last) continue;
+        uint32_t done = last->ms;
+        if (!last->str.empty()) {
+            std::map<std::string, StrScene>::iterator it = scenes.find(last->str);
+            if (it == scenes.end()) {
+                StrScene sc;
+                sc.fps = 60;
+                ParseStrScene(JoinPath(dir, last->str), sc);
+                it = scenes.insert(std::make_pair(last->str, sc)).first;
+            }
+            int32_t tail = 0;
+            for (size_t L = 0; L < it->second.layers.size(); ++L) {
+                const StrLayer& layer = it->second.layers[L];
+                if (!layer.keys.empty() && layer.keys.back().frame > tail)
+                    tail = layer.keys.back().frame;
+            }
+            done += (uint32_t)((int64_t)tail * 1000 /
+                               (it->second.fps ? it->second.fps : 60));
+        }
+        if (done > endMs) endMs = done;
+    }
+
+    // Most .scr timelines run the length of the song, but plenty are far shorter than the preview --
+    // bg\5RED is 25 entries spanning 600 ms -- and those have to loop, or the preview freezes on
+    // the last scene a moment in and then empties as its layers pass their final keyframe.
+    uint32_t spanMs = endMs > startMs ? endMs - startMs : 0;
+    if (spanMs < 200) spanMs = 200;
+
+    const size_t frameBytes = (size_t)size * size * 3u;
+    const uint32_t want = (uint32_t)(fps * seconds);
+    frames.assign(frameBytes * want, 0);
+    frameCount = 0;
+
+    std::vector<double> cover;
+    cover.reserve(want);
+    for (uint32_t f = 0; f < want; ++f) {
+        const uint32_t ms = startMs + (f * 1000u / (uint32_t)fps) % spanMs;
+        unsigned char* canvas = frames.data() + (size_t)f * frameBytes;
+        for (size_t p = 0; p < planes.size(); ++p) {
+            // The scene a plane is showing at `ms` is the last one it was told to start.
+            const ScrEntry* active = NULL;
+            for (size_t i = 0; i < timeline.size(); ++i) {
+                if (timeline[i].plane != planes[p] || timeline[i].ms > ms) continue;
+                if (!active || timeline[i].ms >= active->ms) active = &timeline[i];
+            }
+            if (!active || active->str.empty()) continue;   // an empty name clears the plane
+
+            std::map<std::string, StrScene>::iterator it = scenes.find(active->str);
+            if (it == scenes.end()) {
+                StrScene sc;
+                sc.fps = 60;
+                ParseStrScene(JoinPath(dir, active->str), sc);
+                it = scenes.insert(std::make_pair(active->str, sc)).first;
+            }
+            const StrScene& scene = it->second;
+            if (scene.layers.empty()) continue;
+
+            const float local = (float)(ms - active->ms) * (float)scene.fps / 1000.0f;
+            for (size_t L = 0; L < scene.layers.size(); ++L) {
+                StrKey st;
+                if (ScrEvalLayer(scene.layers[L], local, st))
+                    ScrDrawLayer(canvas, size, texCache, dir, scene.layers[L], st);
+            }
+        }
+        size_t on = 0, seen = 0;
+        for (size_t i = 0; i < frameBytes; i += 33, ++seen) if (canvas[i] > 16) ++on;
+        cover.push_back(seen ? (double)on / (double)seen : 0.0);
+        ++frameCount;
+    }
+    if (frameCount < 2) { frames.clear(); frameCount = 0; return false; }
+
+    // How much of the disc this scene actually fills, typically. The median rather than the mean,
+    // because the case worth catching is a scene that is empty most of the time with a few bright
+    // frames in it -- bg\5blackbird's .scr is nothing but white_flash.str, an effects track whose
+    // photographs live in .str files it never sequences, and its mean brightness looks healthy on
+    // the strength of two flashes. The caller compares this against the raw frame run and keeps
+    // whichever actually shows something, which needs no threshold to be tuned per song.
+    std::sort(cover.begin(), cover.end());
+    coverage = cover[cover.size() / 2];
+
+    MaskPreviewFramesToCircle(frames, frameCount, size);
+    LogLine("[preview] scr '%s' composited %lu frames, %lu scenes on %lu plane(s), %lu textures,"
+            " coverage %.2f, %.1f MB of texture", songId.c_str(), (unsigned long)frameCount,
+            (unsigned long)scenes.size(), (unsigned long)planes.size(),
+            (unsigned long)texCache.map.size(), coverage, texCache.bytes / 1048576.0);
+    return true;
+}
+
+// The raw numbered frame run, read straight off disk. Older and blunter than compositing the
+// scene, and still the better answer where a .scr turns out to be an effects track rather than the
+// background itself.
+static bool DecodeScrFrameRun(const std::string& dir, const std::string& songId, int size, int fps,
+                              int seconds, std::vector<unsigned char>& frames, uint32_t& frameCount,
+                              double& coverage) {
     frames.clear();
     frameCount = 0;
-    if (songId.empty() || size <= 0 || fps <= 0 || seconds <= 0) return false;
-
-    const std::string dir = JoinPath(JoinPath(GetExeDirectory(), "bg"), songId);
+    coverage = 0.0;
     const std::vector<std::string> run = FindScrFrameRun(dir);
     if (run.size() < 2) return false;
 
@@ -2060,18 +2621,73 @@ bool DecodeScrPreview(const std::string& songId, int size, int fps, int seconds,
     const size_t step = run.size() > (size_t)want ? run.size() / want : 1;
 
     std::vector<unsigned char> one;
+    std::vector<double> cover;
     for (size_t i = 0; i < run.size() && frameCount < want; i += step) {
         if (!AbmFrameToBgr(run[i], size, one) || one.size() != frameBytes) continue;
         frames.insert(frames.end(), one.begin(), one.end());
+        size_t on = 0, seen = 0;
+        for (size_t p = 0; p < frameBytes; p += 33, ++seen) if (one[p] > 16) ++on;
+        cover.push_back(seen ? (double)on / (double)seen : 0.0);
         ++frameCount;
     }
     if (frameCount < 2) { frames.clear(); frameCount = 0; return false; }
 
+    // Measured before the mask, as the composited path's is, so the two are comparable.
+    std::sort(cover.begin(), cover.end());
+    coverage = cover[cover.size() / 2];
     MaskPreviewFramesToCircle(frames, frameCount, size);
-    LogLine("[preview] scr '%s' %lu frames of %lu on disk (%.1f MB)",
-            songId.c_str(), (unsigned long)frameCount, (unsigned long)run.size(),
-            frames.size() / 1048576.0);
+    LogLine("[preview] scr '%s' frame run %lu of %lu on disk, coverage %.2f",
+            songId.c_str(), (unsigned long)frameCount, (unsigned long)run.size(), coverage);
     return true;
+}
+
+// A song's .scr background, decoded into the same frame buffer the video preview uses.
+//
+// Both sources are tried and the one that fills more of the disc wins. Compositing the scene is
+// right nearly every time -- it is the actual animation, layered, in time -- but a handful of .scr
+// files sequence only an effects overlay, and for those the raw run holds the content. Comparing
+// what each produced settles it per song without a threshold to guess at, and the loser costs only
+// the decode.
+bool DecodeScrPreview(const std::string& songId, int size, int fps, int seconds,
+                      std::vector<unsigned char>& frames, uint32_t& frameCount) {
+    frames.clear();
+    frameCount = 0;
+    if (songId.empty() || size <= 0 || fps <= 0 || seconds <= 0) return false;
+
+    const std::string dir = JoinPath(JoinPath(GetExeDirectory(), "bg"), songId);
+    double sceneCover = 0.0;
+    uint32_t sceneCount = 0;
+    std::vector<unsigned char> scene;
+    const bool haveScene =
+        DecodeScrComposited(dir, songId, size, fps, seconds, scene, sceneCount, sceneCover);
+
+    // The composited scene wins whenever it has anything at all in it. Coverage is the test for
+    // "anything at all", not a contest -- a static full-screen frame from the run scores a perfect
+    // 1.00 and would otherwise beat bg\5shottime, whose real animated scene sits at 0.84.
+    if (haveScene && sceneCover >= 0.05) {
+        frames.swap(scene);
+        frameCount = sceneCount;
+        return true;
+    }
+
+    double runCover = 0.0;
+    uint32_t runCount = 0;
+    std::vector<unsigned char> run;
+    const bool haveRun = DecodeScrFrameRun(dir, songId, size, fps, seconds, run, runCount, runCover);
+
+    if (haveScene && (!haveRun || sceneCover >= runCover)) {
+        frames.swap(scene);
+        frameCount = sceneCount;
+        return true;
+    }
+    if (haveRun) {
+        LogLine("[preview] scr '%s' using frame run (%.2f) over composited scene (%.2f)",
+                songId.c_str(), runCover, haveScene ? sceneCover : 0.0);
+        frames.swap(run);
+        frameCount = runCount;
+        return true;
+    }
+    return false;
 }
 
 // The BGA video a song would play, or empty when it has none.
