@@ -913,6 +913,14 @@ static DWORD WINAPI PreviewDecodeThread(LPVOID) {
         if (!g_previewDecodePath.empty())
             DecodeBgaPreview(g_previewDecodePath, kPreviewSize, kPreviewFps, kPreviewSeconds,
                              frames, count);
+        // Native songs without a video animate their background with a .scr instead.
+        //
+        // There is deliberately no third source. Custom songs mostly have no preview material at
+        // all: of 20050, only 1839 ship a video, and the rest do NOT have an animated BGA to fall
+        // back on -- sampling 400 charts found 300 with a #STAGEFILE and 275 with a #BANNER, both
+        // single title images, and a median of one image file in the whole folder. The 73 with a
+        // #BMP table use it to declare the video. An image-sequence preview was built for those and
+        // measured at zero songs, so it was removed rather than left to cost a decode per song.
         if (!count)
             DecodeScrPreview(g_previewDecodeId, kPreviewSize, kPreviewFps, kPreviewSeconds,
                              frames, count);
@@ -956,6 +964,21 @@ static bool PreviewSurfaceUsable() {
     void** vt = *reinterpret_cast<void***>(g_previewSurface);
     if (!vt || IsBadReadPtr(vt, 27 * sizeof(void*))) return false;
     return vt[17] && vt[26];
+}
+
+// The surface check above is not enough on its own, and this is the same trap the category
+// overlay already fell into: playing a song, or loading new disc art on a difficulty change,
+// rebuilds the texture POOL without destroying the SongSelect object. Our surface is ours and
+// survives, so PreviewSurfaceUsable keeps saying yes and every blit keeps reporting success --
+// while the texture object the pool owned has been freed underneath us. Writing that dead pointer
+// into the disc slot draws nothing, which is exactly "the preview disappears when I change
+// difficulty and never comes back".
+//
+// The link is what proves it: we pointed the texture at our surface when we built it, so if that
+// pointer no longer reads back as our surface, the object is not ours any more.
+static bool PreviewTexUsable() {
+    if (!g_previewTexture || IsBadReadPtr(g_previewTexture, sizeof(void*))) return false;
+    return *reinterpret_cast<void**>(g_previewTexture) == g_previewSurface;
 }
 
 static void PreviewBlitFrame() {
@@ -1054,6 +1077,18 @@ void BgaPreviewTick(uint32_t obj, const char* selectedId) {
         static unsigned s_lost = 0;
         if (s_lost++ < 5) LogLine("[preview] surface lost; rebuilding");
         return;
+    }
+    if (!PreviewTexUsable()) {
+        // The pool took the texture back. The saved disc pointer came from that same pool and is
+        // just as dead, so it is NOT written back -- the game has already put a live disc in the
+        // slot, and restoring the old one over it is how a freed texture reaches the renderer.
+        g_previewSlotSwapped = false;
+        g_previewTexture = nullptr;
+        g_previewSurface = nullptr;
+        g_previewInitTried = false;
+        static unsigned s_pool = 0;
+        if (s_pool++ < 5) LogLine("[preview] texture reclaimed by the pool; rebuilding");
+        return;                                  // rebuilt next tick, and the preview resumes
     }
 
     // Hold the slot every tick rather than only on the swap: the game refills obj+260 whenever it

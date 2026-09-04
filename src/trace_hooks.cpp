@@ -2172,20 +2172,11 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
     SafeWriteBytes(obj + kObjScrollB,   &scroll, 4);
     SafeWriteBytes(obj + kObjRetCopy,   &retVal, 4);
 
-    // The footprint at scan time was a healthy 791MB; the 3,296MB that broke rendering appeared
-    // later, while browsing. Sampling every few category changes is what shows which of the two
-    // it is -- a steady climb per category, or one big step somewhere.
-    {
-        // Every change, not every fifth. The growth we are chasing appeared somewhere between two
-        // samples five apart, which is exactly the resolution that hid it; a full region walk costs
-        // a few milliseconds against a human pressing a button.
-        static uint32_t s_changes = 0;
-        ++s_changes;
-        char why[64];
-        snprintf(why, sizeof(why), "category change #%lu", (unsigned long)s_changes);
-        ReportProcessFootprint(why);
-        ReportAllocHistogram(why);
-    }
+    // A full footprint report used to run here on every category change, to chase the 3,296MB that
+    // once broke rendering. That was found and fixed, and the report is not free: it walks every
+    // memory region in the process -- two thousand of them -- and writes eight log lines, on a path
+    // the player hits constantly. Removed; ReportProcessFootprint is still there to call by hand if
+    // memory growth ever needs chasing again.
     g_gsLastCat = cat;            // so a /GS failure names the category that led to it
     g_gsLastCount = published;
     static uint32_t s_lastCat = 0xFFFFFFFFu;

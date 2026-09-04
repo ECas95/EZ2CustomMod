@@ -40,7 +40,12 @@ void LogV(const char* prefix, const char* fmt, va_list ap) {
     vsnprintf(msg, sizeof(msg) - 1, fmt ? fmt : "(null)", ap);
     std::lock_guard<std::mutex> lock(g_logMutex);
     if (g_log) {
-        fprintf(g_log, "%s%s\n", prefix ? prefix : "", msg);
+        // Milliseconds since the DLL loaded, on every line. Without it the log says what happened
+        // but never how long it took, so "startup is slow" cannot be answered from it -- which is
+        // exactly the question it kept being asked.
+        static const DWORD s_start = GetTickCount();
+        fprintf(g_log, "[%8lu] %s%s\n", (unsigned long)(GetTickCount() - s_start),
+                prefix ? prefix : "", msg);
         // Flushing every line costs a syscall per log line (~20k lines during a scan, plus every
         // traced file open in-game). Batch: flush at most every 250ms — EXCEPT crash/exit lines,
         // which must hit the disk before the process dies (they are the whole point of the log).
