@@ -19,6 +19,8 @@ struct ModConfig {
     bool bgaPreview = true;
     // Per-category bg.png / ico.png drawn over the song-select background.
     bool categoryOverlay = true;
+    // Reuse the previous run's BMS parse for folders that have not changed.
+    bool scanCache = true;
     bool enableFunctionTrace = true;
     bool altEnter = true;
     bool borderlessOnly = true;

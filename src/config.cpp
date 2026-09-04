@@ -47,6 +47,7 @@ ModConfig LoadConfig() {
     cfg.hangWatchdog = readBool("Debug", "HangWatchdog", false, ini);
     cfg.bgaPreview = readBool("Visuals", "BgaPreview", true, ini);
     cfg.categoryOverlay = readBool("Visuals", "CategoryOverlay", true, ini);
+    cfg.scanCache = readBool("BMSData", "ScanCache", true, ini);
     cfg.enableFunctionTrace = readBool("Debug", "EnableFunctionTrace", true, ini);
     cfg.altEnter = readBool("Video", "AltEnter", true, ini);
     cfg.borderlessOnly = readBool("Video", "BorderlessOnly", true, ini);

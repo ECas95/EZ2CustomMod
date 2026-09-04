@@ -1169,9 +1169,11 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                 snprintf(nf, sizeof(nf), "System\\SongSelect\\Sortimage\\category_%02lu.bmp",
                          (unsigned long)(n + kNativeSrcFirst + 1));
                 loadTex(gfxCtx, nf, reinterpret_cast<void*>(obj + g_catTexSmallBase + n * 4), nullptr);
-                snprintf(nf, sizeof(nf), "System\\SongSelect\\Sortimage\\categorybig_%02lu.bmp",
-                         (unsigned long)(n + kNativeSrcFirst + 1));
-                loadTex(gfxCtx, nf, reinterpret_cast<void*>(obj + g_catTexBigBase + n * 4), nullptr);
+                // No categorybig_ here. That name appears nowhere in the executable -- it is
+                // ours, invented for the custom categories and served from RAM at base 48.
+                // Asking for categorybig_04 found neither a file nor a redirect, so the loader
+                // fell back to drawing the filename itself: that is the "categorybig_04" tile
+                // that appeared in the wheel. The big slot keeps whatever the game put there.
             }
             for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
                 int catNum = 48 + (int)c;             // FILENAME: native files are 01..47 on disk
