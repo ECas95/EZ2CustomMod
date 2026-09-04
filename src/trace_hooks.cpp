@@ -572,8 +572,9 @@ static void EnsureCategoryTablesRelocated() {
     uint32_t c = reinterpret_cast<uint32_t>(cnt), i = reinterpret_cast<uint32_t>(ids);
     bool ok = WriteMemory(Rva(0x35093), &c, 4) && WriteMemory(Rva(0x35112), &i, 4);
     g_catCountBuf = c; g_catIdBuf = i;
-    LogLine("[category] tables relocated count=%08lx id=%08lx ok=%d (copied 47 native from shift=0x%lx)",
-            (unsigned long)c, (unsigned long)i, ok ? 1 : 0, (unsigned long)shift);
+    LogLine("[category] tables relocated count=%08lx id=%08lx ok=%d (copied %lu native from source %u, base 0x%lx)",
+            (unsigned long)c, (unsigned long)i, ok ? 1 : 0, (unsigned long)kCustomCatBase,
+            (unsigned)kNativeSrcFirst, (unsigned long)shift);
 }
 
 static void RefreshRelocatedNativeCategoryTables() {
@@ -1375,6 +1376,90 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
     }
 }
 
+// The native version labels are copied out of the game's own array rather than reloaded, and on
+// the first filter pass that array is still empty -- SongSelect's loader has not run yet, so what
+// gets copied is sixteen zeros. The copy is written to self-heal by repeating on the next pass, but
+// the next pass only comes when the player changes category. Until then song select sits there
+// showing the game's own wheel, HOT/NEW/ALL and all, in its original order.
+//
+// The log says it plainly: "0/16 native present" as song select opens, "16/16" eight seconds later
+// when the category changed. So the copy is retried every frame instead, and stops as soon as it
+// takes -- after that this costs one comparison.
+static const uint32_t kCatTexBigOrig = 0xc0084;   // the game's own 47-entry big-label array
+
+static void RefreshNativeVersionLabels(uint32_t obj) {
+    static uint32_t s_doneFor = 0;
+    if (s_doneFor == obj || !g_versionRelocated) return;
+    if (!CanReadPtr(reinterpret_cast<void*>(obj + kVerArrayOrig), kVerNativeCount * 4)) return;
+
+    // The big centre label of the kept natives, which was the other half of the wheel looking
+    // wrong. The small tab icons are re-pointed at category_(N+4) when the tables are built, but
+    // the big ones were left as the game set them -- and the game filled slot N from category N,
+    // so after dropping the three meta tabs at the head every centre label was three off, showing
+    // HOT/NEW/ALL where the first versions belong. There is no categorybig file on disk to load
+    // for a native (that name is ours, invented for the custom categories), so the pointer is
+    // copied across from the game's own array instead, exactly as the version labels are.
+    if (g_catTexBigBase && CanReadPtr(reinterpret_cast<void*>(obj + kCatTexBigOrig), 47 * 4)) {
+        for (uint32_t n = 0; n < kCustomCatBase; ++n) {
+            const uint32_t src = SafeRead32(obj + kCatTexBigOrig + (n + kNativeSrcFirst) * 4);
+            if (src) SafeWriteBytes(obj + g_catTexBigBase + n * 4, &src, 4);
+        }
+    }
+
+    SafeWriteBytes(obj + kVerArrayReloc,
+                   reinterpret_cast<void*>(obj + kVerArrayOrig + kNativeSrcFirst * 4),
+                   kVerNativeCount * 4);
+    if (g_verARelocated &&
+        CanReadPtr(reinterpret_cast<void*>(obj + kVerAOrig), kVerNativeCount * 4))
+        SafeWriteBytes(obj + kVerAReloc,
+                       reinterpret_cast<void*>(obj + kVerAOrig + kNativeSrcFirst * 4),
+                       kVerNativeCount * 4);
+
+    // Anything the copy could not supply is loaded straight off disk. The copy depends on the
+    // game's own loader having run, and at song select it has not: the labels stayed wrong for the
+    // three seconds it took, which is the window the screenshots caught. The files are right there
+    // -- version_00..18.abm, of which 03..18 are the sixteen kept eras, numbered exactly like the
+    // custom ones that follow at 19 -- so there is no reason to wait for anyone.
+    {
+        typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
+        LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
+        const uint32_t gfxCtx = SafeRead32(0x1b2f054);
+        if (gfxCtx) {
+            for (uint32_t v = 0; v < kVerNativeCount; ++v) {
+                const unsigned long file = (unsigned long)(v + kNativeSrcFirst);
+                if (!SafeRead32(obj + kVerArrayReloc + v * 4)) {
+                    char f[112] = {};
+                    snprintf(f, sizeof(f),
+                             "System\\SongSelect\\V_View\\version\\Version_%02lu.bmp", file);
+                    loadTex(gfxCtx, f, reinterpret_cast<void*>(obj + kVerArrayReloc + v * 4), nullptr);
+                }
+                if (g_verARelocated && !SafeRead32(obj + kVerAReloc + v * 4)) {
+                    char f[112] = {};
+                    snprintf(f, sizeof(f),
+                             "System\\SongSelect\\Version\\Version_%02lu.bmp", file);
+                    loadTex(gfxCtx, f, reinterpret_cast<void*>(obj + kVerAReloc + v * 4), nullptr);
+                }
+            }
+        }
+    }
+
+    // Completion is judged on array A, because array A is the one the renderer draws. Counting the
+    // other array instead stopped the refresh as soon as THAT one filled, while the tab strip was
+    // still showing the game's own unshifted labels -- HOT/NEW/ALL at the head, which is exactly
+    // what the screenshots showed. Both have to be full before this stops.
+    uint32_t ok = 0, okA = 0;
+    for (uint32_t v = 0; v < kVerNativeCount; ++v) {
+        if (SafeRead32(obj + kVerArrayReloc + v * 4)) ++ok;
+        if (!g_verARelocated || SafeRead32(obj + kVerAReloc + v * 4)) ++okA;
+    }
+    if (ok == kVerNativeCount && okA == kVerNativeCount) {
+        s_doneFor = obj;
+        LogLine("[version] native labels filled on frame %lu/%u (array A %lu/%u)",
+                (unsigned long)ok, (unsigned)kVerNativeCount,
+                (unsigned long)okA, (unsigned)kVerNativeCount);
+    }
+}
+
 extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, PushadRegs* regs) {
     if (!h) return;
     h->hitCount++;
@@ -1405,6 +1490,10 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
         // BGA preview: the disc slot follows whatever the cursor is resting on. Runs every
         // frame because it has to hold obj+260 against the game's own disc reloads, but it does
         // nothing at all until the cursor has been still for a moment.
+        // Cheap, and it has to be here: this is the only thing that runs every song-select
+        // frame with the object in hand, and the labels have to be right on the first one.
+        RefreshNativeVersionLabels(regs->ecx);
+
         if (selected < visible) {
             const char* selId = reinterpret_cast<const char*>(
                 regs->ecx + kVisibleBase + selected * kEntryBytes + kEntryIdOff);
@@ -1789,8 +1878,9 @@ static bool InstallCustomCategoryPatches() {
         }
         edit.installed = true;
     }
-    LogLine("[category] native wheel extended categories=%lu custom=%lu slots=47..%lu reloc=%d small=0x%lx big=0x%lx",
+    LogLine("[category] native wheel extended categories=%lu custom=%lu slots=%lu..%lu reloc=%d small=0x%lx big=0x%lx",
             static_cast<unsigned long>(categoryCount), static_cast<unsigned long>(g_customCategoryCount),
+            static_cast<unsigned long>(kCustomCatBase),
             static_cast<unsigned long>(lastCategory), (g_capacityPatched && g_catTexSmallBase) ? 1 : 0,
             (unsigned long)g_catTexSmallBase, (unsigned long)g_catTexBigBase);
     if (categories.size() > g_customCategoryCount) {
