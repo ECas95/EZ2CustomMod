@@ -2071,13 +2071,27 @@ static std::vector<std::string> FindScrFrameRun(const std::string& dir) {
 // Of 895214 keyframes, 98.2% have axis-aligned quads, so corner deformation is dropped and the quad
 // is taken as its bounding rectangle; rotation is kept because a quarter of the real keys use it.
 
-struct ScrEntry { uint32_t ms; uint32_t plane; std::string str; };
+// A .scr entry starts a scene on a plane. Its time field is in SCENE FRAMES at 60 Hz, the same
+// unit the .str keyframes use -- not milliseconds. Two things say so. A .str header carries both an
+// fps (always 60) and a maxkey, and bg\10prm's overlay declares fps 60 with maxkey 30 and keys at
+// 0 and 30: half a second for a cymbal flash, where milliseconds would make it 30ms and invisible.
+// And across 3251 consecutive entry pairs, the gap a .scr leaves for a scene divided by that
+// scene's own last keyframe has a median of exactly 1.00 -- each scene is scheduled for precisely
+// as long as it runs, which only holds if both fields share a unit.
+//
+// Reading the .scr as milliseconds while dividing keyframes by 60 was the original mistake, and it
+// advanced scene-local time 16.7x too slowly: every scene showed only its first six percent before
+// the timeline cut to the next, which is what made previews look like they were racing.
+static const int kSceneHz = 60;
+
+struct ScrEntry { uint32_t frame; uint32_t plane; std::string str; };
 
 struct StrKey {
-    int32_t frame;
+    int32_t frame;                   // when this key applies, in frames from the scene's start
     float   x, y;                    // where the quad's centre sits, in the scene's 640x480 space
     float   qx0, qx1, qy0, qy1;      // quad bounds relative to that centre
     float   ani, angle;
+    float   delay;                   // textures advanced per scene frame, when the layer has many
     float   col[4];                  // RGBA 0..255, alpha included
     int32_t sa, da;                  // D3D7 blend factors
 };
@@ -2122,7 +2136,7 @@ static bool ParseStrScene(const std::string& path, StrScene& out) {
     memcpy(&fps, d.data() + 8, 4);
     memcpy(&layers, d.data() + 0x10, 4);
     if (layers > 256) return false;
-    out.fps = fps ? (int)fps : 60;
+    out.fps = fps ? (int)fps : 60;      // authoring rate only -- keyframes are timed in ms
     out.layers.clear();
 
     size_t off = 0x24;
@@ -2163,6 +2177,7 @@ static bool ParseStrScene(const std::string& path, StrScene& out) {
                 if (xy[4 + i] > key.qy1) key.qy1 = xy[4 + i];
             }
             memcpy(&key.ani, b + 80, 4);
+            memcpy(&key.delay, b + 88, 4);
             memcpy(&key.angle, b + 92, 4);
             memcpy(key.col, b + 96, 16);
             memcpy(&key.sa, b + 112, 4);
@@ -2190,7 +2205,7 @@ static bool ParseScrTimeline(const std::string& path, const std::string& dir,
         int hits = 0;
         for (size_t off = kStarts[s]; off + 8 <= d.size(); off += 136) {
             ScrEntry e;
-            memcpy(&e.ms, d.data() + off, 4);
+            memcpy(&e.frame, d.data() + off, 4);
             memcpy(&e.plane, d.data() + off + 4, 4);
             const char* p = (const char*)d.data() + off + 8;
             const size_t avail = d.size() - (off + 8) < 128 ? d.size() - (off + 8) : 128;
@@ -2315,25 +2330,25 @@ static inline int ScrBlendFactor(int code, int src, int sa, int dst) {
     }
 }
 
-// Interpolate a layer's state at `frame`, between the type-0 keys that bracket it.
-static bool ScrEvalLayer(const StrLayer& layer, float frame, StrKey& out) {
+// Interpolate a layer's state at `at`, in frames since the scene started.
+static bool ScrEvalLayer(const StrLayer& layer, float at, StrKey& out) {
     if (layer.keys.empty()) return false;
     // A layer exists only between its first and last key. Holding the last key instead looks
     // harmless and is not: bgRED spells one animation out as eight layers with consecutive
     // three-frame windows, and holding them all left eight additive copies stacked on the disc,
     // which saturates to a flat white circle. A lone key is a static layer and does persist.
     if (layer.keys.size() > 1) {
-        if (frame < (float)layer.keys.front().frame - 0.5f) return false;
-        if (frame > (float)layer.keys.back().frame + 0.5f) return false;
+        if (at < (float)layer.keys.front().frame - 0.5f) return false;
+        if (at > (float)layer.keys.back().frame + 0.5f) return false;
     }
     size_t i = 0;
-    while (i + 1 < layer.keys.size() && (float)layer.keys[i + 1].frame <= frame) ++i;
+    while (i + 1 < layer.keys.size() && (float)layer.keys[i + 1].frame <= at) ++i;
     const StrKey& a = layer.keys[i];
     const StrKey& b = layer.keys[i + 1 < layer.keys.size() ? i + 1 : i];
     const float span = (float)(b.frame - a.frame);
     float t = 0.0f;
-    if (span > 0.0f && frame > (float)a.frame) {
-        t = (frame - (float)a.frame) / span;
+    if (span > 0.0f && at > (float)a.frame) {
+        t = (at - (float)a.frame) / span;
         if (t > 1.0f) t = 1.0f;
     }
     out = a;
@@ -2345,6 +2360,8 @@ static bool ScrEvalLayer(const StrLayer& layer, float frame, StrKey& out) {
     out.qy1   += (b.qy1 - a.qy1) * t;
     out.ani   += (b.ani - a.ani) * t;
     out.angle += (b.angle - a.angle) * t;
+    // How far into the layer we are, which is what drives its texture cycle.
+    out.frame  = (int32_t)at;
     for (int c = 0; c < 4; ++c) out.col[c] += (b.col[c] - a.col[c]) * t;
     return true;
 }
@@ -2355,11 +2372,33 @@ static bool ScrEvalLayer(const StrLayer& layer, float frame, StrKey& out) {
 static void ScrDrawLayer(unsigned char* canvas, int size, ScrTexCache& cache,
                          const std::string& dir, const StrLayer& layer, const StrKey& st) {
     if (layer.tex.empty() || st.col[3] < 0.5f) return;
+    // Which of the layer's textures to draw.
+    //
+    // Not from the keyframe's animation index, which is the obvious reading and is wrong: layers
+    // with fifty textures routinely hold that index at zero across every key. The cycle is driven
+    // by `delay` instead -- textures advanced per scene frame -- and the two agree exactly where it
+    // can be checked, bgloki carrying fifty textures at 0.5 over a hundred-frame layer. Reading
+    // only the index left those layers frozen on their first frame.
     int idx = 0;
     if (layer.tex.size() > 1) {
-        idx = (int)(st.ani + 0.5f);
-        if (idx < 0) idx = 0;
-        if (idx >= (int)layer.tex.size()) idx = (int)layer.tex.size() - 1;
+        float pos = st.ani;
+        if (st.delay > 0.0f && !layer.keys.empty())
+            pos += ((float)st.frame - (float)layer.keys.front().frame) * st.delay;
+        const int n = (int)layer.tex.size();
+        idx = (int)pos % n;                              // every anitype seen here cycles
+        if (idx < 0) idx += n;
+
+        // Only every few textures of a long cycle are ever decoded. A preview samples ten times a
+        // second while these cycles run at up to sixty textures a second, so most are skipped
+        // anyway -- but landing on a different one each time still meant decoding the whole set,
+        // and that pushed the slowest song from 0.8 s to 4.5 s. Snapping to a stride bounds the
+        // work at kCycleTexCap files per layer.
+        // ponytail: coarser animation on cycles longer than the cap; raise it if XP has the room.
+        const int kCycleTexCap = 24;
+        if (n > kCycleTexCap) {
+            const int stride = (n + kCycleTexCap - 1) / kCycleTexCap;
+            idx = (idx / stride) * stride;
+        }
     }
     const ScrTex* tex = ScrLoadTex(cache, dir, layer.tex[idx], size);
     if (!tex) return;
@@ -2386,6 +2425,25 @@ static void ScrDrawLayer(unsigned char* canvas, int size, ScrTexCache& cache,
     const bool plain = modB >= 255 && modG >= 255 && modR >= 255 && alpha >= 255;
     const bool opaque = st.sa == 2 && st.da == 1;        // ONE, ZERO: a straight copy
     const float iw = 1.0f / w, ih = 1.0f / h;
+
+    // Colour modulation and alpha through lookup tables rather than arithmetic.
+    //
+    // The obvious `sp[c] * mod / 255` is four integer divisions per pixel, and integer division is
+    // tens of cycles: profiling a heavy scene put the inner loop at 85 ns a pixel and bgparadise
+    // at 4.2 seconds for its 49 million, with texture loading only 32 ms of that. Tables make the
+    // whole thing a load.
+    unsigned char lutB[256], lutG[256], lutR[256], lutA[256];
+    for (int v = 0; v < 256; ++v) {
+        lutB[v] = (unsigned char)(v * modB / 255);
+        lutG[v] = (unsigned char)(v * modG / 255);
+        lutR[v] = (unsigned char)(v * modR / 255);
+        lutA[v] = (unsigned char)(v * alpha / 255);
+    }
+    // The two blends that dominate the shipped scenes get their own branch-free inner loops:
+    // ONE/ONE is additive and needs no factors at all, and SRCALPHA/INVSRCALPHA is the ordinary
+    // one. Together with ONE/ZERO they cover better than four keyframes in five.
+    const bool additive = st.sa == 2 && st.da == 2;
+    const bool srcAlpha = st.sa == 5 && st.da == 6;
 
     // Three quarters of the real keyframes have no rotation, and a full-screen quad at 256px is
     // 65k pixels a frame -- so the unrotated case gets its own path, with the horizontal texture
@@ -2446,8 +2504,28 @@ static void ScrDrawLayer(unsigned char* canvas, int size, ScrTexCache& cache,
                 dp[2] = sp[2];
                 continue;
             }
-            const int sB = sp[0] * modB / 255, sG = sp[1] * modG / 255, sR = sp[2] * modR / 255;
-            const int sA = sp[3] * alpha / 255;
+            const int sB = lutB[sp[0]], sG = lutG[sp[1]], sR = lutR[sp[2]];
+            if (opaque) {
+                dp[0] = (unsigned char)sB;
+                dp[1] = (unsigned char)sG;
+                dp[2] = (unsigned char)sR;
+                continue;
+            }
+            if (additive) {
+                const int b = dp[0] + sB, g = dp[1] + sG, r = dp[2] + sR;
+                dp[0] = (unsigned char)(b > 255 ? 255 : b);
+                dp[1] = (unsigned char)(g > 255 ? 255 : g);
+                dp[2] = (unsigned char)(r > 255 ? 255 : r);
+                continue;
+            }
+            const int sA = lutA[sp[3]];
+            if (srcAlpha) {
+                const int a1 = sA + 1, a0 = 256 - sA;
+                dp[0] = (unsigned char)((sB * a1 + dp[0] * a0) >> 8);
+                dp[1] = (unsigned char)((sG * a1 + dp[1] * a0) >> 8);
+                dp[2] = (unsigned char)((sR * a1 + dp[2] * a0) >> 8);
+                continue;
+            }
             const int src[3] = {sB, sG, sR};
             for (int c = 0; c < 3; ++c) {
                 const int d = dp[c];
@@ -2491,13 +2569,14 @@ static bool DecodeScrComposited(const std::string& dir, const std::string& songI
     ScrTexCache texCache;
 
     std::vector<uint32_t> planes;
-    uint32_t startMs = 0xFFFFFFFFu;
+    uint32_t startFrame = 0xFFFFFFFFu;
     for (size_t i = 0; i < timeline.size(); ++i) {
         if (std::find(planes.begin(), planes.end(), timeline[i].plane) == planes.end())
             planes.push_back(timeline[i].plane);
-        if (!timeline[i].str.empty() && timeline[i].ms < startMs) startMs = timeline[i].ms;
+        if (!timeline[i].str.empty() && timeline[i].frame < startFrame)
+            startFrame = timeline[i].frame;
     }
-    if (startMs == 0xFFFFFFFFu) return false;
+    if (startFrame == 0xFFFFFFFFu) return false;
     std::sort(planes.begin(), planes.end());
 
     // Load every scene the timeline names, and with them the timeline's real length.
@@ -2507,15 +2586,15 @@ static bool DecodeScrComposited(const std::string& dir, const std::string& songI
     // timeline ends on a short scene: bg\8Nihilism closes on a four-frame noise flash but also
     // contains a four-second intro, and measuring to the intro's end left three silent seconds
     // that the loop then dutifully replayed as nothing.
-    uint32_t endMs = startMs;
+    uint32_t endFrame = startFrame;
     for (size_t p = 0; p < planes.size(); ++p) {
         const ScrEntry* last = NULL;
         for (size_t i = 0; i < timeline.size(); ++i) {
             if (timeline[i].plane != planes[p]) continue;
-            if (!last || timeline[i].ms >= last->ms) last = &timeline[i];
+            if (!last || timeline[i].frame >= last->frame) last = &timeline[i];
         }
         if (!last) continue;
-        uint32_t done = last->ms;
+        uint32_t done = last->frame;
         if (!last->str.empty()) {
             std::map<std::string, StrScene>::iterator it = scenes.find(last->str);
             if (it == scenes.end()) {
@@ -2530,17 +2609,16 @@ static bool DecodeScrComposited(const std::string& dir, const std::string& songI
                 if (!layer.keys.empty() && layer.keys.back().frame > tail)
                     tail = layer.keys.back().frame;
             }
-            done += (uint32_t)((int64_t)tail * 1000 /
-                               (it->second.fps ? it->second.fps : 60));
+            done += (uint32_t)tail;
         }
-        if (done > endMs) endMs = done;
+        if (done > endFrame) endFrame = done;
     }
 
-    // Most .scr timelines run the length of the song, but plenty are far shorter than the preview --
-    // bg\5RED is 25 entries spanning 600 ms -- and those have to loop, or the preview freezes on
-    // the last scene a moment in and then empties as its layers pass their final keyframe.
-    uint32_t spanMs = endMs > startMs ? endMs - startMs : 0;
-    if (spanMs < 200) spanMs = 200;
+    // Most .scr timelines run the length of the song, but plenty are far shorter than the preview,
+    // and those have to loop or the preview freezes on the last scene and then empties as its
+    // layers pass their final keyframe.
+    uint32_t spanFrames = endFrame > startFrame ? endFrame - startFrame : 0;
+    if (spanFrames < kSceneHz / 4) spanFrames = kSceneHz / 4;
 
     const size_t frameBytes = (size_t)size * size * 3u;
     const uint32_t want = (uint32_t)(fps * seconds);
@@ -2550,14 +2628,16 @@ static bool DecodeScrComposited(const std::string& dir, const std::string& songI
     std::vector<double> cover;
     cover.reserve(want);
     for (uint32_t f = 0; f < want; ++f) {
-        const uint32_t ms = startMs + (f * 1000u / (uint32_t)fps) % spanMs;
+        // Preview frames are wall-clock; the timeline is scene frames at 60 Hz.
+        const uint32_t at =
+            startFrame + ((f * (uint32_t)kSceneHz / (uint32_t)fps) % spanFrames);
         unsigned char* canvas = frames.data() + (size_t)f * frameBytes;
         for (size_t p = 0; p < planes.size(); ++p) {
             // The scene a plane is showing at `ms` is the last one it was told to start.
             const ScrEntry* active = NULL;
             for (size_t i = 0; i < timeline.size(); ++i) {
-                if (timeline[i].plane != planes[p] || timeline[i].ms > ms) continue;
-                if (!active || timeline[i].ms >= active->ms) active = &timeline[i];
+                if (timeline[i].plane != planes[p] || timeline[i].frame > at) continue;
+                if (!active || timeline[i].frame >= active->frame) active = &timeline[i];
             }
             if (!active || active->str.empty()) continue;   // an empty name clears the plane
 
@@ -2571,7 +2651,17 @@ static bool DecodeScrComposited(const std::string& dir, const std::string& songI
             const StrScene& scene = it->second;
             if (scene.layers.empty()) continue;
 
-            const float local = (float)(ms - active->ms) * (float)scene.fps / 1000.0f;
+            // A scene repeats inside the slot the timeline gives it. Most slots are exactly one
+            // playthrough -- that median ratio of 1.00 again -- but a fair number are far longer
+            // than the scene: bg\7loki hands a 99-frame loop a 1200-frame slot, and holding its
+            // final keyframe for the other 92% left the disc empty most of the time.
+            int32_t tail = 0;
+            for (size_t L = 0; L < scene.layers.size(); ++L)
+                if (!scene.layers[L].keys.empty() && scene.layers[L].keys.back().frame > tail)
+                    tail = scene.layers[L].keys.back().frame;
+            float local = (float)(at - active->frame);
+            if (tail > 0 && local > (float)tail) local = fmodf(local, (float)(tail + 1));
+
             for (size_t L = 0; L < scene.layers.size(); ++L) {
                 StrKey st;
                 if (ScrEvalLayer(scene.layers[L], local, st))
