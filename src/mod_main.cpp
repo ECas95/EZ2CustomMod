@@ -12,6 +12,7 @@
 #include "trace_hooks.h"
 #include "progress_popup.h"
 #include <string>
+#include <unordered_map>
 #include <cctype>
 #include <algorithm>
 
@@ -402,13 +403,67 @@ static std::string VisualCacheRedirectForPath(const CustomBmsSong& s, const std:
 
 
 
+
+// ---- finding which custom song a path belongs to -------------------------------------------------
+//
+// Every CreateFileA the game makes passes through MaybeRedirectCustomPath, and that used to ask,
+// for each of the catalogue's songs, whether its id appeared anywhere in the path. With the
+// auto-generated modes expanded the catalogue is 179,424 entries, so one file open cost 179,424
+// substring searches -- and song select opens hundreds of files as it comes up. That is where the
+// startup minutes went, and why it got worse as the library grew and slower again on the way out
+// of a song.
+//
+// Custom ids are written by exactly one format, "bms%06lu", so the path can be asked which ids it
+// contains instead: scan it once for "bms" followed by six digits, and look those up. One pass over
+// an eighty-character path plus a hash lookup, in place of a scan of the whole catalogue.
+static std::unordered_map<std::string, size_t> g_songByIdIndex;
+static size_t g_songByIdStamp = (size_t)-1;
+
+static void EnsureSongIdIndex(const std::vector<CustomBmsSong>& songs) {
+    if (g_songByIdStamp == songs.size()) return;
+    g_songByIdIndex.clear();
+    g_songByIdIndex.reserve(songs.size() * 2);
+    for (size_t i = 0; i < songs.size(); ++i) {
+        std::string k = songs[i].id;
+        std::transform(k.begin(), k.end(), k.begin(),
+                       [](unsigned char c) { return (char)tolower(c); });
+        g_songByIdIndex.emplace(k, i);          // first wins, matching the old scan order
+    }
+    g_songByIdStamp = songs.size();
+}
+
+// Catalogue indices for every custom id the path mentions, in catalogue order -- the order the old
+// loop visited them in, so the first match is still the same song.
+static std::vector<size_t> CustomSongsMentionedIn(const std::string& path,
+                                                  const std::vector<CustomBmsSong>& songs) {
+    std::vector<size_t> out;
+    EnsureSongIdIndex(songs);
+    std::string lower = LowerAscii(path);
+    for (size_t i = 0; i + 9 <= lower.size(); ++i) {
+        if (lower.compare(i, 3, "bms") != 0) continue;
+        bool digits = true;
+        for (size_t d = 3; d < 9; ++d)
+            if (!isdigit((unsigned char)lower[i + d])) { digits = false; break; }
+        if (!digits) continue;
+        std::unordered_map<std::string, size_t>::const_iterator it =
+            g_songByIdIndex.find(lower.substr(i, 9));
+        if (it != g_songByIdIndex.end()) out.push_back(it->second);
+        i += 8;                                  // ids cannot overlap
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 static std::string MaybeRedirectCustomDirectory(LPCSTR name) {
     if (!name) return std::string();
     std::string p = name;
     const auto& songs = GetCustomBmsSongs();
-    for (const auto& s : songs) {
+    const std::vector<size_t> mentioned = CustomSongsMentionedIn(p, songs);
+    for (size_t mi = 0; mi < mentioned.size(); ++mi) {
+        const auto& s = songs[mentioned[mi]];
         size_t pos = p.find(s.id);
-        if (pos == std::string::npos) continue;
+        if (pos == std::string::npos) continue;  // matched case-folded; this exact path did not
 
         if (Config().redirectCustomToNative && !Config().bridgeMode) {
             std::string out = p;
@@ -455,19 +510,21 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
         size_t idStart = vp + 7, slash = lpv.find('\\', idStart);
         if (slash != std::string::npos) {
             std::string id = p.substr(idStart, slash - idStart);
-            for (const auto& s : songs) {
-                if (_stricmp(s.id.c_str(), id.c_str()) != 0) continue;
-                if (!s.videoFiles.empty()) break; // legacy own BGA has a real INI
+            std::string idl = LowerAscii(id);
+            EnsureSongIdIndex(songs);
+            std::unordered_map<std::string, size_t>::const_iterator hit = g_songByIdIndex.find(idl);
+            if (hit != g_songByIdIndex.end() && songs[hit->second].videoFiles.empty()) {
                 std::string def = JoinPath(JoinPath(JoinPath(GetExeDirectory(), "Video"), "_spv"), "default.ini");
                 if (LocalFileExists(def)) return def;
-                break;
             }
         }
     }
 
-    for (const auto& s : songs) {
+    const std::vector<size_t> mentioned = CustomSongsMentionedIn(p, songs);
+    for (size_t mi = 0; mi < mentioned.size(); ++mi) {
+        const auto& s = songs[mentioned[mi]];
         size_t pos = p.find(s.id);
-        if (pos == std::string::npos) continue;
+        if (pos == std::string::npos) continue;  // matched case-folded; this exact path did not
 
         if (Config().redirectCustomToNative && !Config().bridgeMode) {
             std::string out = p;
@@ -1837,8 +1894,12 @@ static const std::wstring* MaybeRedirectSpvW(LPCWSTR wpath) {
     std::wstring wid = lw.substr(idStart, slash - idStart);
     // narrow the id to match against song ids (ascii bmsNNNNNN)
     char id[64] = {}; WideCharToMultiByte(CP_ACP, 0, wid.c_str(), -1, id, sizeof(id) - 1, nullptr, nullptr);
+    const std::vector<CustomBmsSong>& all = GetCustomBmsSongs();
+    EnsureSongIdIndex(all);
     const CustomBmsSong* song = nullptr;
-    for (const auto& s : GetCustomBmsSongs()) if (_stricmp(s.id.c_str(), id) == 0) { song = &s; break; }
+    std::unordered_map<std::string, size_t>::const_iterator hit =
+        g_songByIdIndex.find(LowerAscii(id));
+    if (hit != g_songByIdIndex.end()) song = &all[hit->second];
     if (!song || !song->videoFiles.empty()) return nullptr;
     if (GetFileAttributesW(wpath) != INVALID_FILE_ATTRIBUTES) return nullptr; // a real .spv exists → use it
     auto& pool = BgPoolW();

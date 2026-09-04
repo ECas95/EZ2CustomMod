@@ -6085,7 +6085,13 @@ static void LogCatalogOrderCheck() {
             alpha == 0 && difficulty == 0 && range == 0 ? 1 : 0);
 }
 
+static void DropCatalogueCaches();
+
 void ScanBMSData() {
+    // Anything memoised from the catalogue dies with it. The per-mode category lists are keyed on
+    // the catalogue's size, and a rescan that happened to land on the same count would otherwise
+    // keep serving the old answer -- unlikely, but not something to leave to chance.
+    DropCatalogueCaches();
     g_songs.clear();
     if (!Config().enableBmsData) return;
     DWORD scanStart = GetTickCount();
@@ -6177,16 +6183,47 @@ std::vector<CustomBmsSong> GetCustomBmsSongsForActiveMode() {
     return GetCustomBmsSongsForMode(g_activeMode);
 }
 
+// The categories a mode has songs in, memoised per mode.
+//
+// This is called from the CreateFileA hook -- every path containing "songselect" asks for it, and
+// the game opens hundreds of those while song select comes up -- and it used to walk the whole
+// catalogue every time. That catalogue is 179,424 entries after the auto-generated modes are
+// expanded, not the 19,936 songs on disk, and the inner duplicate check compares each match against
+// up to 84 category names, so one call was roughly 1.7 million case-insensitive compares. Another
+// caller loops it over candidate modes, paying that several times over.
+//
+// The catalogue is fixed once scanning finishes, so the answer is computed once per mode and kept.
+// It is keyed on the catalogue's size as well, so a rescan cannot serve a stale list.
+static std::map<std::string, std::vector<std::string> > g_catsByMode;
+static size_t g_catsByModeStamp = (size_t)-1;
+
+static void DropCatalogueCaches() {
+    g_catsByMode.clear();
+    g_catsByModeStamp = (size_t)-1;
+}
+
 std::vector<std::string> GetCustomBmsCategoriesForMode(const std::string& mode) {
-    std::vector<std::string> out;
     std::string n = NormalizeModeName(mode);
     if (n.empty()) n = mode;
+
+    if (g_catsByModeStamp != g_songs.size()) {
+        g_catsByMode.clear();
+        g_catsByModeStamp = g_songs.size();
+    }
+    std::map<std::string, std::vector<std::string> >::iterator it = g_catsByMode.find(n);
+    if (it != g_catsByMode.end()) return it->second;
+
+    // Built with a set rather than a linear duplicate check, so filling it is one pass.
+    std::vector<std::string> out;
+    std::set<std::string> seen;
     for (const auto& s : g_songs) {
         if (_stricmp(s.mode.c_str(), n.c_str()) != 0) continue;
-        bool seen = false;
-        for (const auto& c : out) if (_stricmp(c.c_str(), s.category.c_str()) == 0) { seen = true; break; }
-        if (!seen) out.push_back(s.category);
+        std::string key = s.category;
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return (char)tolower(c); });
+        if (seen.insert(key).second) out.push_back(s.category);
     }
+    g_catsByMode[n] = out;
     return out;
 }
 
