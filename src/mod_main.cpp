@@ -856,6 +856,7 @@ static HANDLE   g_previewThread = nullptr;
 static volatile LONG g_previewDecoding = 0;
 static std::string g_previewDecodePath;
 static std::string g_previewDecodeId;
+static DWORD g_previewDecodeStartMs = 0;
 
 static const uint32_t kObjDiscSlot = 260;         // "HotSpotDisc"
 
@@ -898,20 +899,35 @@ static bool EnsurePreviewSurface() {
     return true;
 }
 
+// g_previewDecoding is the gate that stops two decodes running at once, and it is cleared here.
+// If this thread ever left without clearing it -- an exception out of a large allocation is the way
+// that happens, and the .scr path reserves tens of megabytes -- the gate stayed shut for the rest of
+// the session and no preview ever appeared again, whatever song was selected. That is the "changed
+// difficulty and it never came back" report. So the clear is unconditional now.
 static DWORD WINAPI PreviewDecodeThread(LPVOID) {
     std::vector<unsigned char> frames;
     uint32_t count = 0;
-    // A video if the song has one; otherwise its .scr background, whose frames are already images.
-    if (!g_previewDecodePath.empty())
-        DecodeBgaPreview(g_previewDecodePath, kPreviewSize, kPreviewFps, kPreviewSeconds,
-                         frames, count);
-    if (!count)
-        DecodeScrPreview(g_previewDecodeId, kPreviewSize, kPreviewFps, kPreviewSeconds,
-                         frames, count);
+    try {
+        // A video if the song has one; otherwise its .scr background, whose frames are already
+        // images on disk.
+        if (!g_previewDecodePath.empty())
+            DecodeBgaPreview(g_previewDecodePath, kPreviewSize, kPreviewFps, kPreviewSeconds,
+                             frames, count);
+        if (!count)
+            DecodeScrPreview(g_previewDecodeId, kPreviewSize, kPreviewFps, kPreviewSeconds,
+                             frames, count);
+    } catch (...) {
+        frames.clear();
+        count = 0;
+        LogLine("[preview] decode threw for id='%s'; no preview for it", g_previewDecodeId.c_str());
+    }
     g_previewFrames.swap(frames);
     g_previewFrameCount = count;
     g_previewIndex = 0;
-    g_previewHaveId = count ? g_previewDecodeId : std::string();
+    // The id is recorded even when nothing decoded. Leaving it empty meant "not decoded yet", so a
+    // song with neither a video nor a .scr was re-attempted on every single frame -- a thread per
+    // tick, forever. Recording it says "tried, there is nothing", and the retry stops.
+    g_previewHaveId = g_previewDecodeId;
     InterlockedExchange(&g_previewDecoding, 0);
     return 0;
 }
@@ -1007,7 +1023,17 @@ void BgaPreviewTick(uint32_t obj, const char* selectedId) {
     // Decode once per song, off the game's thread: ffmpeg takes hundreds of milliseconds and the
     // wheel must keep animating through it.
     if (g_previewHaveId != id) {
-        if (InterlockedCompareExchange(&g_previewDecoding, 1, 0) != 0) return;  // already running
+        if (InterlockedCompareExchange(&g_previewDecoding, 1, 0) != 0) {
+            // Belt and braces for the gate above: if a decode has somehow been in flight for far
+            // longer than one can take, assume its thread is gone and reopen it. Costs one wasted
+            // decode in the worst case; the alternative is a preview that never returns.
+            if (GetTickCount() - g_previewDecodeStartMs > 30000) {
+                InterlockedExchange(&g_previewDecoding, 0);
+                LogLine("[preview] decode gate was stuck; reopened");
+            }
+            return;
+        }
+        g_previewDecodeStartMs = GetTickCount();
         // An empty path is no longer a dead end: the song may still have a .scr background, and
         // the decode thread falls through to that. Only a song with neither ends up with no frames.
         g_previewDecodePath = BgaVideoPathForSong(id);

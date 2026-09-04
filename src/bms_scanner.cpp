@@ -1963,13 +1963,44 @@ static bool AbmFrameToBgr(const std::string& path, int size, std::vector<unsigne
     return true;
 }
 
-// The longest numbered run of frames in bg\<id>\, masks excluded.
+// The best numbered run of frames in bg\<id>\, masks excluded.
 //
-// A folder mixes several sequences -- a title animation, an overlay, the background itself -- plus
-// one-off images. The longest run is the one that actually animates, and the strays lose by
-// construction because a name with no trailing number is not a run at all.
+// A real .scr composites several layers, each placed and scaled by keyframes -- and those transforms
+// live in the .scr and .str, which nobody has documented past their headers (freem's formats.md
+// marks the layer and keyframe structures "todo", and says outright that how a .scr times its .str
+// playback is unknown). Stacking the runs without them would produce a collage, not the animation:
+// a 128x128 sprite meant to sit in one corner would be blown up over the whole disc.
+//
+// So one run is chosen, and the choice is by FRAME AREA rather than by length. Picking the longest
+// run looked reasonable and was wrong in the case that matters: bg\5shottime's longest is
+// 7th_title_move at 100 frames of 160x120 -- a title card -- while its actual scene is ryu_an at
+// 256x256. Area picks the layer that fills the frame, which is the one worth previewing.
+//
+// Area alone overshoots, though: bg\5shottime has a 512x256 run of ten frames, which wins on size
+// and barely animates. So the rule is area among the runs that are long enough to be an animation
+// -- a quarter of the longest run in the folder -- which lands on ryu_an there, 41 frames at
+// 256x256, the actual scene.
+//
+// Ties go to the longer run, which settles folders like bg\Commonbg9 where the groups (3s_v1_,
+// 3s_v2_, 3s_v3_, 3s_v4_) are four VARIANTS of one background at identical size, not layers.
+// Width*height of an .abm without decoding its pixels.
+static uint64_t AbmFrameArea(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    std::vector<unsigned char> head(64, 0);
+    const size_t got = fread(head.data(), 1, head.size(), f);
+    fclose(f);
+    if (got < 32) return 0;
+    int w = 0, h = 0, bpp = 0;
+    size_t off = 0;
+    bool bottomUp = true;
+    if (!AbmDecodeHeader(head, w, h, bpp, off, bottomUp)) return 0;
+    return (uint64_t)w * (uint64_t)h;
+}
+
 static std::vector<std::string> FindScrFrameRun(const std::string& dir) {
     std::vector<std::string> best;
+    uint64_t bestArea = 0;
     WIN32_FIND_DATAA fd{};
     HANDLE h = FindFirstFileA(JoinPath(dir, "*.abm").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return best;
@@ -1990,9 +2021,22 @@ static std::vector<std::string> FindScrFrameRun(const std::string& dir) {
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 
+    size_t longest = 0;
     for (std::map<std::string, std::vector<std::string> >::iterator it = runs.begin();
          it != runs.end(); ++it)
-        if (it->second.size() > best.size()) best.swap(it->second);
+        if (it->second.size() > longest) longest = it->second.size();
+    const size_t minRun = longest / 4 < 2 ? 2 : longest / 4;
+
+    for (std::map<std::string, std::vector<std::string> >::iterator it = runs.begin();
+         it != runs.end(); ++it) {
+        if (it->second.size() < minRun) continue;            // too short to read as an animation
+        std::sort(it->second.begin(), it->second.end());
+        const uint64_t area = AbmFrameArea(JoinPath(dir, it->second.front()));
+        if (area > bestArea || (area == bestArea && it->second.size() > best.size())) {
+            bestArea = area;
+            best = it->second;
+        }
+    }
     std::sort(best.begin(), best.end());
     for (size_t i = 0; i < best.size(); ++i) best[i] = JoinPath(dir, best[i]);
     return best;
