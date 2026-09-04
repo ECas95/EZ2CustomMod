@@ -1778,6 +1778,31 @@ static bool ffmpegDecodePcmLocal(const std::string& src, uint32_t maxSeconds,
 }
 
 
+
+// The disc is a circle and a frame is a square, so the corners have to go. Native disc art is a
+// circle of radius 125 on a 256x256 canvas with everything outside it black -- measured, and
+// identical across every shipped disc.
+//
+// Applied once per decode rather than per blit: once a song instead of ten times a second.
+static void MaskPreviewFramesToCircle(std::vector<unsigned char>& frames, uint32_t frameCount,
+                                      int size) {
+    if (!frameCount || size <= 0) return;
+    const size_t frameBytes = (size_t)size * size * 3u;
+    const int r = (size * 125) / 256;
+    const int cx = size / 2, cy = size / 2, r2 = r * r;
+    for (uint32_t f = 0; f < frameCount; ++f) {
+        unsigned char* px = frames.data() + (size_t)f * frameBytes;
+        for (int y = 0; y < size; ++y) {
+            const int dy = y - cy, dy2 = dy * dy;
+            unsigned char* row = px + (size_t)y * size * 3;
+            for (int x = 0; x < size; ++x) {
+                const int dx = x - cx;
+                if (dx * dx + dy2 > r2) { row[x*3] = row[x*3+1] = row[x*3+2] = 0; }
+            }
+        }
+    }
+}
+
 // Decode a short chunk of a BGA video into raw BGR24 frames, all of them, into one buffer.
 //
 // The song-select preview loops six seconds of video inside a 256x256 disc. Decoding that once into
@@ -1825,28 +1850,7 @@ bool DecodeBgaPreview(const std::string& videoPath, int size, int fps, int secon
         frames.resize((frames.size() / frameBytes) * frameBytes);   // drop a torn tail
         frameCount = (uint32_t)(frames.size() / frameBytes);
 
-        // The disc is a circle, the video is a square, and the corners were showing as a hard
-        // rectangle around it. Native disc art is a circle of radius 125 centred on a 256x256
-        // canvas with everything outside it black -- measured, and identical across every shipped
-        // disc -- so match that exactly.
-        //
-        // Done here rather than per blit: once per song instead of ten times a second, forever.
-        if (frameCount) {
-            const int r = (size * 125) / 256;             // the shipped discs' radius, scaled
-            const int cx = size / 2, cy = size / 2;
-            const int r2 = r * r;
-            for (uint32_t f = 0; f < frameCount; ++f) {
-                unsigned char* px = frames.data() + (size_t)f * frameBytes;
-                for (int y = 0; y < size; ++y) {
-                    const int dy = y - cy, dy2 = dy * dy;
-                    unsigned char* row = px + (size_t)y * size * 3;
-                    for (int x = 0; x < size; ++x) {
-                        const int dx = x - cx;
-                        if (dx * dx + dy2 > r2) { row[x*3] = row[x*3+1] = row[x*3+2] = 0; }
-                    }
-                }
-            }
-        }
+        MaskPreviewFramesToCircle(frames, frameCount, size);
         if (frameCount >= 2) {
             LogLine("[preview] decoded '%s' %ux%d frames=%lu (%.1f MB)%s",
                     videoPath.c_str(), (unsigned)size, size,
@@ -1861,6 +1865,170 @@ bool DecodeBgaPreview(const std::string& videoPath, int size, int fps, int secon
     return false;
 }
 
+
+// ---- .scr background previews -------------------------------------------------------------------
+//
+// 319 native songs animate their background with .scr instead of a video, and .scr is not a video
+// format at all: the Ez2Visual reference guide describes a keyframed layered scene with path
+// interpolation, deformation and per-layer blend functions (R:G:B-A:SrcAlphaFunc:DestAlphaFunc).
+// Reproducing that means reimplementing an animation runtime.
+//
+// None of which is needed, because the frames it composes are already individual images on disk:
+// bg\<id>\ holds them as .abm, and 179 of the 281 folders that have any name them as a numbered
+// run (name0001.abm, name0002.abm, ...). Reading a run off disk gives a real animated preview and
+// skips the .scr and .str formats entirely.
+//
+// The frames go into the same buffer the video path fills, so the surface, the circular mask, the
+// loop and the frame clock are all shared: this adds a source, not a second player.
+
+// Undo the .abm transform in place. Forward (AbmFromBmpBytes) swaps the magic BM -> AW, restates
+// bpp/width/height at 2/6/8 and XORs four header dwords; the XOR is its own inverse, and the
+// restated fields are ignored because the real ones come back with it.
+static bool AbmDecodeHeader(std::vector<unsigned char>& b, int& w, int& h, int& bpp,
+                            size_t& dataOff, bool& bottomUp) {
+    if (b.size() < 54 || b[0] != 'A' || b[1] != 'W') return false;
+    static const uint32_t xors[] = {0x109a, 0xcfa1, 0x51ae, 0xb18f};
+    static const size_t offsets[] = {10, 18, 22, 28};
+    for (int i = 0; i < 4; ++i) {
+        uint32_t v = 0;
+        memcpy(&v, b.data() + offsets[i], 4);
+        v ^= xors[i];
+        memcpy(b.data() + offsets[i], &v, 4);
+    }
+    uint32_t off = 0; int32_t bw = 0, bh = 0; uint16_t bb = 0;
+    memcpy(&off, b.data() + 10, 4);
+    memcpy(&bw,  b.data() + 18, 4);
+    memcpy(&bh,  b.data() + 22, 4);
+    memcpy(&bb,  b.data() + 28, 2);
+    if (bw <= 0 || bh == 0 || (bb != 16 && bb != 24 && bb != 32)) return false;
+    if (off >= b.size()) return false;
+    w = bw;
+    h = bh < 0 ? -bh : bh;
+    bpp = bb;
+    dataOff = off;
+    bottomUp = bh > 0;                       // the usual BMP orientation
+    return true;
+}
+
+// One .abm scaled into size*size BGR24, nearest neighbour -- bilinear costs more than it buys at
+// this size, on art that is already being reduced far past the point where it shows.
+static bool AbmFrameToBgr(const std::string& path, int size, std::vector<unsigned char>& out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<unsigned char> b;
+    bool read = false;
+    if (sz > 54) {
+        b.resize((size_t)sz);
+        read = fread(b.data(), 1, b.size(), f) == b.size();
+    }
+    fclose(f);
+    if (!read) return false;
+
+    int w = 0, h = 0, bpp = 0;
+    size_t dataOff = 0;
+    bool bottomUp = true;
+    if (!AbmDecodeHeader(b, w, h, bpp, dataOff, bottomUp)) return false;
+
+    const int bytesPP = bpp / 8;
+    const size_t stride = (((size_t)w * bytesPP + 3) & ~(size_t)3);
+    if (dataOff + stride * (size_t)h > b.size()) return false;
+
+    out.assign((size_t)size * size * 3, 0);
+    for (int y = 0; y < size; ++y) {
+        const int sy = (int)((int64_t)y * h / size);
+        const unsigned char* row =
+            b.data() + dataOff + (size_t)(bottomUp ? (h - 1 - sy) : sy) * stride;
+        unsigned char* dst = out.data() + (size_t)y * size * 3;
+        for (int x = 0; x < size; ++x) {
+            const int sx = (int)((int64_t)x * w / size);
+            const unsigned char* p = row + (size_t)sx * bytesPP;
+            if (bpp == 16) {
+                // 1:5:5:5, not 5:6:5. Read as 5:6:5 the green channel steals a bit from red and
+                // everything shifts: the frames came out as green noise. Verified by rendering the
+                // same frame both ways -- 1555 gives a coherent image, 565 gives static.
+                const uint16_t v = (uint16_t)(p[0] | (p[1] << 8));
+                dst[x*3+0] = (unsigned char)(( v        & 0x1f) << 3);
+                dst[x*3+1] = (unsigned char)(((v >> 5)  & 0x1f) << 3);
+                dst[x*3+2] = (unsigned char)(((v >> 10) & 0x1f) << 3);
+            } else {
+                dst[x*3+0] = p[0];
+                dst[x*3+1] = p[1];
+                dst[x*3+2] = p[2];
+            }
+        }
+    }
+    return true;
+}
+
+// The longest numbered run of frames in bg\<id>\, masks excluded.
+//
+// A folder mixes several sequences -- a title animation, an overlay, the background itself -- plus
+// one-off images. The longest run is the one that actually animates, and the strays lose by
+// construction because a name with no trailing number is not a run at all.
+static std::vector<std::string> FindScrFrameRun(const std::string& dir) {
+    std::vector<std::string> best;
+    WIN32_FIND_DATAA fd{};
+    HANDLE h = FindFirstFileA(JoinPath(dir, "*.abm").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return best;
+    std::map<std::string, std::vector<std::string> > runs;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::string name = fd.cFileName;
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return (char)tolower(c); });
+        if (lower.find("mask") != std::string::npos) continue;   // alpha companion, not a frame
+        size_t dot = name.find_last_of('.');
+        std::string stem = dot == std::string::npos ? name : name.substr(0, dot);
+        size_t end = stem.size();
+        while (end > 0 && isdigit((unsigned char)stem[end - 1])) --end;
+        if (end == stem.size()) continue;                        // unnumbered: a one-off
+        runs[stem.substr(0, end)].push_back(name);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+
+    for (std::map<std::string, std::vector<std::string> >::iterator it = runs.begin();
+         it != runs.end(); ++it)
+        if (it->second.size() > best.size()) best.swap(it->second);
+    std::sort(best.begin(), best.end());
+    for (size_t i = 0; i < best.size(); ++i) best[i] = JoinPath(dir, best[i]);
+    return best;
+}
+
+// A song's .scr background, decoded into the same frame buffer the video preview uses.
+bool DecodeScrPreview(const std::string& songId, int size, int fps, int seconds,
+                      std::vector<unsigned char>& frames, uint32_t& frameCount) {
+    frames.clear();
+    frameCount = 0;
+    if (songId.empty() || size <= 0 || fps <= 0 || seconds <= 0) return false;
+
+    const std::string dir = JoinPath(JoinPath(GetExeDirectory(), "bg"), songId);
+    const std::vector<std::string> run = FindScrFrameRun(dir);
+    if (run.size() < 2) return false;
+
+    const size_t frameBytes = (size_t)size * size * 3u;
+    const uint32_t want = (uint32_t)(fps * seconds);
+    // A run longer than the preview is sampled evenly rather than truncated, so a 400-frame
+    // animation previews as the whole thing sped up instead of only its opening seconds.
+    const size_t step = run.size() > (size_t)want ? run.size() / want : 1;
+
+    std::vector<unsigned char> one;
+    for (size_t i = 0; i < run.size() && frameCount < want; i += step) {
+        if (!AbmFrameToBgr(run[i], size, one) || one.size() != frameBytes) continue;
+        frames.insert(frames.end(), one.begin(), one.end());
+        ++frameCount;
+    }
+    if (frameCount < 2) { frames.clear(); frameCount = 0; return false; }
+
+    MaskPreviewFramesToCircle(frames, frameCount, size);
+    LogLine("[preview] scr '%s' %lu frames of %lu on disk (%.1f MB)",
+            songId.c_str(), (unsigned long)frameCount, (unsigned long)run.size(),
+            frames.size() / 1048576.0);
+    return true;
+}
 
 // The BGA video a song would play, or empty when it has none.
 //

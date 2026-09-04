@@ -901,7 +901,13 @@ static bool EnsurePreviewSurface() {
 static DWORD WINAPI PreviewDecodeThread(LPVOID) {
     std::vector<unsigned char> frames;
     uint32_t count = 0;
-    DecodeBgaPreview(g_previewDecodePath, kPreviewSize, kPreviewFps, kPreviewSeconds, frames, count);
+    // A video if the song has one; otherwise its .scr background, whose frames are already images.
+    if (!g_previewDecodePath.empty())
+        DecodeBgaPreview(g_previewDecodePath, kPreviewSize, kPreviewFps, kPreviewSeconds,
+                         frames, count);
+    if (!count)
+        DecodeScrPreview(g_previewDecodeId, kPreviewSize, kPreviewFps, kPreviewSeconds,
+                         frames, count);
     g_previewFrames.swap(frames);
     g_previewFrameCount = count;
     g_previewIndex = 0;
@@ -1002,14 +1008,9 @@ void BgaPreviewTick(uint32_t obj, const char* selectedId) {
     // wheel must keep animating through it.
     if (g_previewHaveId != id) {
         if (InterlockedCompareExchange(&g_previewDecoding, 1, 0) != 0) return;  // already running
-        std::string path = BgaVideoPathForSong(id);
-        if (path.empty()) {                       // no BGA: nothing to preview, and that is fine
-            g_previewHaveId = id;
-            g_previewFrameCount = 0;
-            InterlockedExchange(&g_previewDecoding, 0);
-            return;
-        }
-        g_previewDecodePath = path;
+        // An empty path is no longer a dead end: the song may still have a .scr background, and
+        // the decode thread falls through to that. Only a song with neither ends up with no frames.
+        g_previewDecodePath = BgaVideoPathForSong(id);
         g_previewDecodeId = id;
         if (g_previewThread) { CloseHandle(g_previewThread); g_previewThread = nullptr; }
         g_previewThread = CreateThread(nullptr, 0, PreviewDecodeThread, nullptr, 0, nullptr);

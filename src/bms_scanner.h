@@ -127,6 +127,10 @@ std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& 
 // Song-select BGA preview: decode a few seconds of a song's video into raw BGR24 frames.
 bool DecodeBgaPreview(const std::string& videoPath, int size, int fps, int seconds,
                       std::vector<unsigned char>& frames, uint32_t& frameCount);
+// Songs whose background is a .scr animation have no video to decode; their frames are already
+// individual .abm images in bg\<id>\, so the run is read straight off disk instead.
+bool DecodeScrPreview(const std::string& songId, int size, int fps, int seconds,
+                      std::vector<unsigned char>& frames, uint32_t& frameCount);
 std::string BgaVideoPathForSong(const std::string& id);
 
 // Per-category overlays: BMSData\<mode>\<category>\bg.png and ico.png.
