@@ -352,7 +352,8 @@ unsigned int RequiredObjectBytes() {
 // is live render state. To add custom slots we move BOTH arrays into the object's free tail,
 // placed in the 0x20000 headroom the capacity patch reserves AFTER the relocated master[]
 // (page-aligned). Set by InstallSongCapacityPatches (needs newCap); 0 = not relocated.
-static void SnapshotCategoryTabs(uint32_t obj);   // defined with HoldCategoryTabs, below
+static void SnapshotCategoryTabs(uint32_t obj);   // both defined with HoldCategoryTabs, below
+static void SnapshotSortStyles(uint32_t obj);
 
 static uint32_t g_catTexSmallBase = 0;
 static uint32_t g_catTexBigBase   = 0;
@@ -1342,6 +1343,7 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                 }
             }
             SnapshotCategoryTabs(obj);
+            SnapshotSortStyles(obj);
             LogLine("[category] loaded %lu wheel icons into relocated slots %lu.. small=%08lx big=%08lx",
                     (unsigned long)g_customCategoryCount, (unsigned long)kCustomCatBase,
                     (unsigned long)SafeRead32(obj + g_catTexSmallBase + kCustomCatBase * 4),
@@ -1403,6 +1405,15 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
 static std::vector<uint32_t> g_tabSnapshot;
 static uint32_t g_tabSnapFor = 0;
 
+// The same treatment for the sortstyle array -- the two-line sprite the category-change animation
+// shows. The game bulk-loads sortstyle 00..29 at init, which lands on our custom slots 16..29, and
+// the "did we lose it" check only ever looked at slot 16 -- a slot the game refills with its own
+// art, so the check saw something there and never reloaded. That is why ANX (slot 16) showed a
+// stretched title with no subtext while VOEZ (slot 99, far past anything the game touches) was
+// perfect.
+static std::vector<uint32_t> g_sortSnapshot;
+static uint32_t g_sortSnapFor = 0;
+
 // Called at the end of the pre-filter, with the array in the state we just built.
 static void SnapshotCategoryTabs(uint32_t obj) {
     if (!g_catTexSmallBase) return;
@@ -1418,7 +1429,72 @@ static void SnapshotCategoryTabs(uint32_t obj) {
             (unsigned long)count);
 }
 
+static void SnapshotSortStyles(uint32_t obj) {
+    if (!g_sortRelocated) return;
+    const uint32_t count = kCustomCatBase + g_customCategoryCount;
+    g_sortSnapshot.assign(count, 0);
+    uint32_t live = 0;
+    for (uint32_t n = 0; n < count; ++n) {
+        g_sortSnapshot[n] = SafeRead32(obj + kSortReloc + n * 4);
+        if (g_sortSnapshot[n]) ++live;
+    }
+    g_sortSnapFor = obj;
+    LogLine("[sortstyle] snapshotted: %lu/%lu slots have a texture (natives 0..%lu are the game's)",
+            (unsigned long)live, (unsigned long)count, (unsigned long)(kCustomCatBase - 1));
+
+    // What the sixteen kept eras currently draw, against what the game's own biased array holds.
+    // The animation shows the wrong overlay for them -- category "1st" plays "HOT" -- and the shift
+    // that fixes it cannot be read off the code: kSortBiasedOrig is indexed [base + cat*4] for
+    // cat 19..46 only, so the eras at categories 3..18 have no obvious entry. Printing both sides
+    // lets the mapping be matched by pointer instead of guessed at, which is how the last two
+    // attempts at an array I had not identified went wrong.
+}
+
+// Dumped from the per-frame path, and only once the version array has actually been filled.
+//
+// The first attempt at this ran inside the pre-filter and printed four arrays of zeros, because the
+// game's own loader had not run yet -- the log shows "0/16 native present" there and "16/16"
+// eighteen seconds later. A measurement taken before the thing being measured exists says nothing,
+// which cost a run to learn.
+static void DumpCategoryArrayDiag(uint32_t obj) {
+    static bool s_done = false;
+    if (s_done || !g_versionRelocated) return;
+    if (!SafeRead32(obj + kVerArrayReloc + (kVerNativeCount - 1) * 4)) return;   // not filled yet
+    s_done = true;
+
+    char v[500] = {}; int vt = snprintf(v, sizeof(v), "[verdiag] B.reloc[0..9]=");
+    for (uint32_t n = 0; n < 10; ++n)
+        vt += snprintf(v + vt, sizeof(v) - vt, "%08lx ",
+                       (unsigned long)SafeRead32(obj + kVerArrayReloc + n * 4));
+    vt += snprintf(v + vt, sizeof(v) - vt, "| B.orig[0..9]=");
+    for (uint32_t n = 0; n < 10; ++n)
+        vt += snprintf(v + vt, sizeof(v) - vt, "%08lx ",
+                       (unsigned long)SafeRead32(obj + kVerArrayOrig + n * 4));
+    LogLine("%s", v);
+
+    char w[500] = {}; int wt = snprintf(w, sizeof(w), "[verdiag] A.reloc[0..9]=");
+    for (uint32_t n = 0; n < 10; ++n)
+        wt += snprintf(w + wt, sizeof(w) - wt, "%08lx ",
+                       (unsigned long)SafeRead32(obj + kVerAReloc + n * 4));
+    wt += snprintf(w + wt, sizeof(w) - wt, "| A.orig[0..9]=");
+    for (uint32_t n = 0; n < 10; ++n)
+        wt += snprintf(w + wt, sizeof(w) - wt, "%08lx ",
+                       (unsigned long)SafeRead32(obj + kVerAOrig + n * 4));
+    LogLine("%s", w);
+
+    char x[500] = {}; int xt = snprintf(x, sizeof(x), "[sortdiag] reloc[0..9]=");
+    for (uint32_t n = 0; n < 10; ++n)
+        xt += snprintf(x + xt, sizeof(x) - xt, "%08lx ",
+                       (unsigned long)SafeRead32(obj + kSortReloc + n * 4));
+    xt += snprintf(x + xt, sizeof(x) - xt, "| orig[cat 17..26]=");
+    for (uint32_t c = 17; c < 27; ++c)
+        xt += snprintf(x + xt, sizeof(x) - xt, "%08lx ",
+                       (unsigned long)SafeRead32(obj + kSortBiasedOrig + c * 4));
+    LogLine("%s", x);
+}
+
 static void HoldCategoryTabs(uint32_t obj) {
+    DumpCategoryArrayDiag(obj);
     if (g_tabSnapFor != obj || g_tabSnapshot.empty()) return;
     uint32_t fixed = 0;
     for (size_t n = 0; n < g_tabSnapshot.size(); ++n) {
@@ -1430,6 +1506,23 @@ static void HoldCategoryTabs(uint32_t obj) {
     if (fixed && s_reported < 3) {
         ++s_reported;
         LogLine("[category] tab strip: %lu slot(s) were overwritten and put back", (unsigned long)fixed);
+    }
+
+    // Only the custom half is held. The natives are left exactly as the game has them, because what
+    // their slots should contain is not established -- the original array is BIASED (only ever
+    // indexed by category 19 and up), so the sixteen kept eras have no obvious source in it, and
+    // guessing at an array's meaning is what broke the song title and the label under it.
+    if (g_sortSnapFor != obj || g_sortSnapshot.empty()) return;
+    uint32_t sfixed = 0;
+    for (size_t n = kCustomCatBase; n < g_sortSnapshot.size(); ++n) {
+        const uint32_t want = g_sortSnapshot[n];
+        if (want && SafeRead32(obj + kSortReloc + (uint32_t)n * 4) != want)
+            { SafeWriteBytes(obj + kSortReloc + (uint32_t)n * 4, &want, 4); ++sfixed; }
+    }
+    static uint32_t s_sreported = 0;
+    if (sfixed && s_sreported < 3) {
+        ++s_sreported;
+        LogLine("[sortstyle] %lu custom slot(s) were overwritten and put back", (unsigned long)sfixed);
     }
 }
 
