@@ -1416,9 +1416,42 @@ static void HoldNativeCategoryTabs(uint32_t obj) {
             s_tab[n] = slot;
         }
     }
+    uint32_t reasserted = 0;
     for (uint32_t n = 0; n < kVerNativeCount; ++n)
-        if (s_tab[n] && SafeRead32(obj + g_catTexSmallBase + n * 4) != s_tab[n])
+        if (s_tab[n] && SafeRead32(obj + g_catTexSmallBase + n * 4) != s_tab[n]) {
             SafeWriteBytes(obj + g_catTexSmallBase + n * 4, &s_tab[n], 4);
+            ++reasserted;
+        }
+
+    // One-shot picture of the tab array, to answer a question the screenshots could not: the strip
+    // shows MUSE.3 where VOEZ (the last custom, slot 99) belongs. Either the array is right and the
+    // game is reading a different slot for that position, or the array itself is wrong -- and the
+    // pointers say which. Logged once, after the first pass that had to reassert nothing.
+    static bool s_dumped = false;
+    if (!s_dumped && !reasserted) {
+        s_dumped = true;
+        char line[512] = {};
+        int at = snprintf(line, sizeof(line), "[tabdiag] small[0..3]=");
+        for (uint32_t n = 0; n < 4; ++n)
+            at += snprintf(line + at, sizeof(line) - at, "%08lx ",
+                           (unsigned long)SafeRead32(obj + g_catTexSmallBase + n * 4));
+        at += snprintf(line + at, sizeof(line) - at, "| [14..17]=");
+        for (uint32_t n = 14; n < 18; ++n)
+            at += snprintf(line + at, sizeof(line) - at, "%08lx ",
+                           (unsigned long)SafeRead32(obj + g_catTexSmallBase + n * 4));
+        at += snprintf(line + at, sizeof(line) - at, "| [66..69]=");
+        for (uint32_t n = 66; n < 70; ++n)
+            at += snprintf(line + at, sizeof(line) - at, "%08lx ",
+                           (unsigned long)SafeRead32(obj + g_catTexSmallBase + n * 4));
+        at += snprintf(line + at, sizeof(line) - at, "| [96..99]=");
+        for (uint32_t n = 96; n < 100; ++n)
+            at += snprintf(line + at, sizeof(line) - at, "%08lx ",
+                           (unsigned long)SafeRead32(obj + g_catTexSmallBase + n * 4));
+        LogLine("%s", line);
+        LogLine("[tabdiag] selected=%lu visibleCats=%lu customBase=%lu customCount=%lu",
+                (unsigned long)SafeRead32(obj + 0x80), (unsigned long)SafeRead32(obj + 0x7C),
+                (unsigned long)kCustomCatBase, (unsigned long)g_customCategoryCount);
+    }
 }
 
 static const uint32_t kCatTexBigOrig = 0xc0084;   // the game's own 47-entry big-label array
@@ -1428,29 +1461,11 @@ static void RefreshNativeVersionLabels(uint32_t obj) {
     if (s_doneFor == obj || !g_versionRelocated) return;
     if (!CanReadPtr(reinterpret_cast<void*>(obj + kVerArrayOrig), kVerNativeCount * 4)) return;
 
-    // The big centre label of the kept natives, which was the other half of the wheel looking
-    // wrong. The small tab icons are re-pointed at category_(N+4) when the tables are built, but
-    // the big ones were left as the game set them -- and the game filled slot N from category N,
-    // so after dropping the three meta tabs at the head every centre label was three off, showing
-    // HOT/NEW/ALL where the first versions belong. There is no categorybig file on disk to load
-    // for a native (that name is ours, invented for the custom categories), so the pointer is
-    // copied across from the game's own array instead, exactly as the version labels are.
-    if (g_catTexBigBase && CanReadPtr(reinterpret_cast<void*>(obj + kCatTexBigOrig), 47 * 4)) {
-        for (uint32_t n = 0; n < kCustomCatBase; ++n) {
-            const uint32_t src = SafeRead32(obj + kCatTexBigOrig + (n + kNativeSrcFirst) * 4);
-            if (src) SafeWriteBytes(obj + g_catTexBigBase + n * 4, &src, 4);
-        }
-    }
-
-    SafeWriteBytes(obj + kVerArrayReloc,
-                   reinterpret_cast<void*>(obj + kVerArrayOrig + kNativeSrcFirst * 4),
-                   kVerNativeCount * 4);
-    if (g_verARelocated &&
-        CanReadPtr(reinterpret_cast<void*>(obj + kVerAOrig), kVerNativeCount * 4))
-        SafeWriteBytes(obj + kVerAReloc,
-                       reinterpret_cast<void*>(obj + kVerAOrig + kNativeSrcFirst * 4),
-                       kVerNativeCount * 4);
-
+    // A copy of the game's big centre-label pointers used to run here, on the theory that the
+    // kept natives needed re-pointing past the three dropped meta tabs. It was inferred from a
+    // comment, never verified, and it broke the song-title text: something in that array is not
+    // what the comment says, and writing to it put a songname texture where the big label goes.
+    // Removed. If the centre label really is three off, it needs the array identified first.
     // Anything the copy could not supply is loaded straight off disk. The copy depends on the
     // game's own loader having run, and at song select it has not: the labels stayed wrong for the
     // three seconds it took, which is the window the screenshots caught. The files are right there

@@ -2445,6 +2445,20 @@ static void ScrDrawLayer(unsigned char* canvas, int size, ScrTexCache& cache,
     const bool additive = st.sa == 2 && st.da == 2;
     const bool srcAlpha = st.sa == 5 && st.da == 6;
 
+    // Black is the transparent colour on an opaque sprite.
+    //
+    // 11,626 of the 28,288 sprite-sized layers draw with ONE/ZERO, a straight copy -- and copying
+    // is what put a black rectangle around every one of them, which is what the fish in that
+    // preview looked like. The art has no alpha to lean on (16bpp 1:5:5:5 with the one bit unset,
+    // 24bpp with none at all), so the era's usual trick is the only thing left: the key colour is
+    // black, and the hardware simply did not write those pixels.
+    //
+    // Only for sprites. A full-screen opaque layer is allowed its black, because some of them
+    // exist to black something out -- the letterbox bars in 12Basic are exactly that.
+    // ponytail: exact black only; a sprite matted on near-black keeps a faint edge.
+    const bool keyBlack = opaque && (st.qx1 - st.qx0) < (float)kSceneW * 0.9f
+                                 && (st.qy1 - st.qy0) < (float)kSceneH * 0.9f;
+
     // Three quarters of the real keyframes have no rotation, and a full-screen quad at 256px is
     // 65k pixels a frame -- so the unrotated case gets its own path, with the horizontal texture
     // lookup hoisted into a row of precomputed columns instead of two multiplies and a divide per
@@ -2497,6 +2511,7 @@ static void ScrDrawLayer(unsigned char* canvas, int size, ScrTexCache& cache,
                 sp = tex->bgra.data() + ((size_t)tv * tex->w + tu) * 4;
             }
 
+            if (keyBlack && !sp[0] && !sp[1] && !sp[2]) continue;   // the key colour
             unsigned char* dp = drow + (size_t)x * 3;
             if (opaque && plain) {                       // the commonest case, and the cheapest
                 dp[0] = sp[0];
