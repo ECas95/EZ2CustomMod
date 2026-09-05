@@ -4682,9 +4682,15 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
         draw(Utf8ToWide(category), RECT{pad, 0, w - pad, h}, 13, RGB(235,235,235), true);
     } else {
         // Category sprite: BOTH lines live in this one texture, exactly like the native art --
-        // the name in white over a smaller subtitle in orange. It is only 16px tall because every
-        // Sortimage asset is 128x16 and the game scales it up for the overlay; giving it a bigger
-        // canvas (256x64) changed the 8:1 aspect and came out stretched across the mask.
+        // the name in white over a smaller subtitle in orange. The canvas was 128x16, to match every
+        // other Sortimage asset, and at that size the two lines landed on top of each other: the
+        // white name and the orange caption overlapped into an illegible smear, which the game then
+        // scaled up. That is the "stretched, pixelated, no subtext" overlay -- the subtext was
+        // always there, printed through the title.
+        //
+        // 256x64 was tried once and rejected for good reason: it changes the aspect from 8:1 to
+        // 4:1 and the overlay came out stretched across the mask. 256x32 keeps the 8:1 exactly and
+        // only doubles the resolution, which is about 1:1 with the size the game draws it at.
         // Geometry lifted off the shipped sortstyle_NN.bmp (256x64 24bpp), all 30 of which place
         // their ink identically: the white category name occupies y 18..31 (14px caps) centred on
         // x=128, and the orange caption y 43..50 (8px caps). Arial Bold reaches those cap heights
@@ -4784,8 +4790,20 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
         case kCatAbmTab:      // wheel tab: SHORT folder name, one centred line filling the canvas
             ok = RenderSplashBytes(out, cats[categoryIndex], std::string(), 128, 16, false, false);
             break;
-        case kCatAbmOverlay:  // wheel-side category sprite, 128x16 like every Sortimage asset
-            ok = RenderSplashBytes(out, cat, sub, 128, 16, false, true);
+        case kCatAbmOverlay:
+            // The big centre label, and it was being drawn at twice the size it was made.
+            //
+            // 128x16 was chosen to match the shipped Sortimage assets, but this one is not a wheel
+            // sprite: the game draws it around 250x30, so a 128-wide source was upscaled two to one
+            // and came out stretched and pixelated -- and sixteen pixels of height has no room for
+            // a second line, which is why the subtext never appeared. The giveaway was the aspect
+            // ratio: the text on screen is about 8:1, which is 128x16's ratio and not the 4:1 of
+            // the 256x64 sortstyle sprite, so it could only be this asset.
+            //
+            // Same 8:1, twice the resolution: roughly 1:1 with how it is actually drawn.
+            // ponytail: assumes the draw rect is fixed rather than taken from the texture. If the
+            // label suddenly draws twice as large, that assumption was wrong -- put 128x16 back.
+            ok = RenderSplashBytes(out, cat, sub, 256, 32, false, true);
             break;
         case kCatAbmSort:     // big overlay: 256x64 24bpp, matching the native sortstyle art
             ok = RenderSplashBytes(out, cat, sub, 256, 64, false, true);
