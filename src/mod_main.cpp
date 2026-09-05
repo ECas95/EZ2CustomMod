@@ -1959,6 +1959,7 @@ static int VirtualAssetKind(const std::string& lowerPath, size_t catCount, int& 
         // The game never asks for these by name -- it bulk-loads 00..29 at init and then only
         // indexes the array -- so the request comes from our own loadTex call, which numbers the
         // file after the category (47+) to keep the array index and the asset name the same thing.
+        { "natsort_",     kCatAbmSortNative, 0 },   // must precede sortstyle_: different range
         { "sortstyle_",   kCatAbmSort,    47 },
     };
     for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); ++i) {
@@ -1966,7 +1967,9 @@ static int VirtualAssetKind(const std::string& lowerPath, size_t catCount, int& 
         if (at == std::string::npos) continue;
         int nn = atoi(lowerPath.c_str() + at + strlen(kinds[i].prefix));
         int idx = nn - kinds[i].base;
-        if (idx < 0 || (size_t)idx >= catCount) return -1;
+        // The era sprites are bounded by their own count, not by how many custom categories exist.
+        const size_t cap = kinds[i].kind == kCatAbmSortNative ? 16u : catCount;
+        if (idx < 0 || (size_t)idx >= cap) return -1;
         kindOut = kinds[i].kind;
         return idx;
     }

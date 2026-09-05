@@ -1326,6 +1326,25 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                 if (s_sortFilledFor != obj || sortLost) {
                     s_sortFilledFor = obj;
                     unsigned long sok = 0;
+
+                    // The sixteen kept eras first. Their slots were being left empty, and an empty
+                    // slot does not mean "draw nothing" -- the animation object simply keeps the
+                    // texture it was last handed, so every one of them replayed whatever had been
+                    // shown before. At boot that is sortstyle_00, which is why "1st" animated
+                    // "HOT". These are generated from the era names, like the custom ones.
+                    unsigned long nok = 0;
+                    for (uint32_t n = 0; n < kCustomCatBase && n < 16; ++n) {
+                        char nf[128] = {};
+                        snprintf(nf, sizeof(nf),
+                                 "System\\SongSelect\\V_View\\sortstyle\\natsort_%02lu.bmp",
+                                 (unsigned long)n);
+                        loadTex(gfxCtx, nf,
+                                reinterpret_cast<void*>(obj + kSortReloc + n * 4), nullptr);
+                        if (SafeRead32(obj + kSortReloc + n * 4)) ++nok;
+                    }
+                    LogLine("[sortstyle] %lu/%lu era overlays loaded into slots 0..%lu",
+                            nok, (unsigned long)kCustomCatBase, (unsigned long)(kCustomCatBase - 1));
+
                     for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
                         const uint32_t slot = kCustomCatBase + c;   // where it goes
                         const uint32_t file = 47 + c;               // what it is called on disk

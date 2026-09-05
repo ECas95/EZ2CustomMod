@@ -4752,6 +4752,17 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
                                  RGB(255, 174, 0)) &&
                AbmFromBmpBytes(out);
 
+    // The kept eras, in wheel order. Their names exist only as pixels inside the game's own tab
+    // art -- there is no string anywhere to read them from -- so they are written out here. Sixteen
+    // short labels, and they are visible on screen at all times, so a wrong one would be obvious.
+    if (kind == kCatAbmSortNative) {
+        static const char* kEras[] = {"1st", "S/E", "2nd", "3rd", "4th", "PLT", "6th", "7th",
+                                      "1.5-2.0", "CV", "3s-BE", "AEIC", "EC", "EV", "NT", "TT"};
+        if (categoryIndex >= sizeof(kEras) / sizeof(kEras[0])) return false;
+        return RenderSplashBytes(out, kEras[categoryIndex], std::string(), 256, 64, false, true) &&
+               AbmFromBmpBytes(out);
+    }
+
     // Empty text on the standard black ground: a plain 256x256 tile, the disc's own geometry.
     if (kind == kCatAbmPreviewBase)
         return RenderSplashBytes(out, std::string(), std::string(), 256, 256, true, false) &&

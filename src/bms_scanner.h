@@ -140,10 +140,14 @@ std::string CategoryOverlayPath(const std::string& mode, const std::string& cate
 
 // Category sprites are produced in memory and handed to the game through the file hooks; nothing
 // is written to disk for them. kind selects which of the three the game asked for.
+// kCatAbmSortNative is the category-change overlay for the sixteen kept game eras. They have no
+// sprite of their own: the game's array only ever held one for categories 19 and up (the LV and
+// alphabetical views, which are gone), so those slots stay empty and the animation object keeps
+// whatever texture it was last given -- which is why "1st" animated "HOT".
 enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3,
        // The songname tile for the RANDOM row the filter puts at the top of every category.
        // Category-independent: it says the same thing everywhere, so it ignores the index.
-       kCatAbmRandom = 4,
+       kCatAbmRandom = 4, kCatAbmSortNative = 7,
        // A blank 256x256 for the BGA preview to build its texture on. It exists so the preview
        // never has to borrow a texture the game also uses -- see EnsurePreviewSurface.
        kCatAbmPreviewBase = 5,
