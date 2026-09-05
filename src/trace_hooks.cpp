@@ -1379,15 +1379,13 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
     }
 }
 
-// The native version labels are copied out of the game's own array rather than reloaded, and on
-// the first filter pass that array is still empty -- SongSelect's loader has not run yet, so what
-// gets copied is sixteen zeros. The copy is written to self-heal by repeating on the next pass, but
-// the next pass only comes when the player changes category. Until then song select sits there
-// showing the game's own wheel, HOT/NEW/ALL and all, in its original order.
-//
-// The log says it plainly: "0/16 native present" as song select opens, "16/16" eight seconds later
-// when the category changed. So the copy is retried every frame instead, and stops as soon as it
-// takes -- after that this costs one comparison.
+// A per-frame refresher for the version labels used to live here. It was added to stop song
+// select opening with the game's own category wheel, and it did the opposite of help: array A
+// is the label UNDER THE SONG TITLE, indexed by the song's version rather than by category, and
+// writing to it put a songname texture where "3RD TRAX" belongs. The categories are fixed by
+// holding the tab strip below instead -- that is the array that actually draws them. Reverted
+// to the original copy-on-filter behaviour, which worked.
+
 // Holding the category tab strip against the game's own loader.
 //
 // The tabs live in the small array at g_catTexSmallBase. The pre-filter fills it correctly -- the
@@ -1435,62 +1433,6 @@ static void HoldCategoryTabs(uint32_t obj) {
     }
 }
 
-static const uint32_t kCatTexBigOrig = 0xc0084;   // the game's own 47-entry big-label array
-
-static void RefreshNativeVersionLabels(uint32_t obj) {
-    static uint32_t s_doneFor = 0;
-    if (s_doneFor == obj || !g_versionRelocated) return;
-    if (!CanReadPtr(reinterpret_cast<void*>(obj + kVerArrayOrig), kVerNativeCount * 4)) return;
-
-    // A copy of the game's big centre-label pointers used to run here, on the theory that the
-    // kept natives needed re-pointing past the three dropped meta tabs. It was inferred from a
-    // comment, never verified, and it broke the song-title text: something in that array is not
-    // what the comment says, and writing to it put a songname texture where the big label goes.
-    // Removed. If the centre label really is three off, it needs the array identified first.
-    // Anything the copy could not supply is loaded straight off disk. The copy depends on the
-    // game's own loader having run, and at song select it has not: the labels stayed wrong for the
-    // three seconds it took, which is the window the screenshots caught. The files are right there
-    // -- version_00..18.abm, of which 03..18 are the sixteen kept eras, numbered exactly like the
-    // custom ones that follow at 19 -- so there is no reason to wait for anyone.
-    {
-        typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
-        LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
-        const uint32_t gfxCtx = SafeRead32(0x1b2f054);
-        if (gfxCtx) {
-            for (uint32_t v = 0; v < kVerNativeCount; ++v) {
-                const unsigned long file = (unsigned long)(v + kNativeSrcFirst);
-                if (!SafeRead32(obj + kVerArrayReloc + v * 4)) {
-                    char f[112] = {};
-                    snprintf(f, sizeof(f),
-                             "System\\SongSelect\\V_View\\version\\Version_%02lu.bmp", file);
-                    loadTex(gfxCtx, f, reinterpret_cast<void*>(obj + kVerArrayReloc + v * 4), nullptr);
-                }
-                if (g_verARelocated && !SafeRead32(obj + kVerAReloc + v * 4)) {
-                    char f[112] = {};
-                    snprintf(f, sizeof(f),
-                             "System\\SongSelect\\Version\\Version_%02lu.bmp", file);
-                    loadTex(gfxCtx, f, reinterpret_cast<void*>(obj + kVerAReloc + v * 4), nullptr);
-                }
-            }
-        }
-    }
-
-    // Completion is judged on array A, because array A is the one the renderer draws. Counting the
-    // other array instead stopped the refresh as soon as THAT one filled, while the tab strip was
-    // still showing the game's own unshifted labels -- HOT/NEW/ALL at the head, which is exactly
-    // what the screenshots showed. Both have to be full before this stops.
-    uint32_t ok = 0, okA = 0;
-    for (uint32_t v = 0; v < kVerNativeCount; ++v) {
-        if (SafeRead32(obj + kVerArrayReloc + v * 4)) ++ok;
-        if (!g_verARelocated || SafeRead32(obj + kVerAReloc + v * 4)) ++okA;
-    }
-    if (ok == kVerNativeCount && okA == kVerNativeCount) {
-        s_doneFor = obj;
-        LogLine("[version] native labels filled on frame %lu/%u (array A %lu/%u)",
-                (unsigned long)ok, (unsigned)kVerNativeCount,
-                (unsigned long)okA, (unsigned)kVerNativeCount);
-    }
-}
 
 extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, PushadRegs* regs) {
     if (!h) return;
@@ -1524,7 +1466,6 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
         // nothing at all until the cursor has been still for a moment.
         // Cheap, and it has to be here: this is the only thing that runs every song-select
         // frame with the object in hand, and the labels have to be right on the first one.
-        RefreshNativeVersionLabels(regs->ecx);
         HoldCategoryTabs(regs->ecx);
 
         if (selected < visible) {
