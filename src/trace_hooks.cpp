@@ -1385,6 +1385,42 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
 // The log says it plainly: "0/16 native present" as song select opens, "16/16" eight seconds later
 // when the category changed. So the copy is retried every frame instead, and stops as soon as it
 // takes -- after that this costs one comparison.
+// The tab strip along the top is a DIFFERENT array again -- not A (the label under the song
+// title) nor B, but the small category tabs at g_catTexSmallBase. Those are re-pointed past the
+// three dropped meta tabs when the tables are built, once, and the game's own loader fills the
+// very same slots 0..46 from category_01..47. When it runs after us it puts HOT/NEW/ALL back at
+// the head, which is what the screenshots showed, and the next category change re-points them
+// again -- which is why it looked like it fixed itself as soon as you moved.
+//
+// So the pointers are HELD rather than set once: loaded a single time into s_tab (the texture
+// pool never frees, so reloading per frame would grow it without bound) and re-asserted whenever
+// something overwrites a slot. Sixteen comparisons a frame, and it cannot be folded into the
+// label refresh above -- that one stops when the labels are done, and this must not stop.
+static void HoldNativeCategoryTabs(uint32_t obj) {
+    if (!g_catTexSmallBase || !g_customCategoryCount) return;
+    static uint32_t s_tab[kVerNativeCount] = {};
+    static uint32_t s_tabFor = 0;
+    typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
+    LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
+    const uint32_t gfxCtx = SafeRead32(0x1b2f054);
+    if (!gfxCtx) return;
+
+    if (s_tabFor != obj) {
+        s_tabFor = obj;
+        for (uint32_t n = 0; n < kVerNativeCount; ++n) {
+            char nf[96] = {};
+            snprintf(nf, sizeof(nf), "System\\SongSelect\\Sortimage\\category_%02lu.bmp",
+                     (unsigned long)(n + kNativeSrcFirst + 1));
+            uint32_t slot = 0;
+            loadTex(gfxCtx, nf, &slot, nullptr);
+            s_tab[n] = slot;
+        }
+    }
+    for (uint32_t n = 0; n < kVerNativeCount; ++n)
+        if (s_tab[n] && SafeRead32(obj + g_catTexSmallBase + n * 4) != s_tab[n])
+            SafeWriteBytes(obj + g_catTexSmallBase + n * 4, &s_tab[n], 4);
+}
+
 static const uint32_t kCatTexBigOrig = 0xc0084;   // the game's own 47-entry big-label array
 
 static void RefreshNativeVersionLabels(uint32_t obj) {
@@ -1493,6 +1529,7 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
         // Cheap, and it has to be here: this is the only thing that runs every song-select
         // frame with the object in hand, and the labels have to be right on the first one.
         RefreshNativeVersionLabels(regs->ecx);
+        HoldNativeCategoryTabs(regs->ecx);
 
         if (selected < visible) {
             const char* selId = reinterpret_cast<const char*>(
