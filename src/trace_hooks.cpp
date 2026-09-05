@@ -352,6 +352,8 @@ unsigned int RequiredObjectBytes() {
 // is live render state. To add custom slots we move BOTH arrays into the object's free tail,
 // placed in the 0x20000 headroom the capacity patch reserves AFTER the relocated master[]
 // (page-aligned). Set by InstallSongCapacityPatches (needs newCap); 0 = not relocated.
+static void SnapshotCategoryTabs(uint32_t obj);   // defined with HoldCategoryTabs, below
+
 static uint32_t g_catTexSmallBase = 0;
 static uint32_t g_catTexBigBase   = 0;
 
@@ -1339,6 +1341,7 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                             (unsigned long)kCustomCatBase);
                 }
             }
+            SnapshotCategoryTabs(obj);
             LogLine("[category] loaded %lu wheel icons into relocated slots %lu.. small=%08lx big=%08lx",
                     (unsigned long)g_customCategoryCount, (unsigned long)kCustomCatBase,
                     (unsigned long)SafeRead32(obj + g_catTexSmallBase + kCustomCatBase * 4),
@@ -1385,72 +1388,50 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
 // The log says it plainly: "0/16 native present" as song select opens, "16/16" eight seconds later
 // when the category changed. So the copy is retried every frame instead, and stops as soon as it
 // takes -- after that this costs one comparison.
-// The tab strip along the top is a DIFFERENT array again -- not A (the label under the song
-// title) nor B, but the small category tabs at g_catTexSmallBase. Those are re-pointed past the
-// three dropped meta tabs when the tables are built, once, and the game's own loader fills the
-// very same slots 0..46 from category_01..47. When it runs after us it puts HOT/NEW/ALL back at
-// the head, which is what the screenshots showed, and the next category change re-points them
-// again -- which is why it looked like it fixed itself as soon as you moved.
+// Holding the category tab strip against the game's own loader.
 //
-// So the pointers are HELD rather than set once: loaded a single time into s_tab (the texture
-// pool never frees, so reloading per frame would grow it without bound) and re-asserted whenever
-// something overwrites a slot. Sixteen comparisons a frame, and it cannot be folded into the
-// label refresh above -- that one stops when the labels are done, and this must not stop.
-static void HoldNativeCategoryTabs(uint32_t obj) {
-    if (!g_catTexSmallBase || !g_customCategoryCount) return;
-    static uint32_t s_tab[kVerNativeCount] = {};
-    static uint32_t s_tabFor = 0;
-    typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
-    LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
-    const uint32_t gfxCtx = SafeRead32(0x1b2f054);
-    if (!gfxCtx) return;
+// The tabs live in the small array at g_catTexSmallBase. The pre-filter fills it correctly -- the
+// kept natives re-pointed past the three dropped meta tabs, then our 84 customs from slot 16 up --
+// and then the game's own loader fills slots 0..46 from category_01..47 and undoes the lot.
+//
+// The tab diagnostic caught it exactly: slot 16, the first custom, held the same texture pointer as
+// our native slot 13, because both had asked for category_17.bmp and the pool is keyed by filename.
+// The game overwrites slots 16 through 46 -- thirty-one of them, which is precisely the offset the
+// screenshot showed between where a category sat and where it belonged.
+//
+// So the whole array is snapshotted once it is known good and re-asserted every frame. Snapshotting
+// beats reloading: the pool never frees, so loading the tabs again each frame would grow it without
+// bound, and the pointers are all that need restoring.
+static std::vector<uint32_t> g_tabSnapshot;
+static uint32_t g_tabSnapFor = 0;
 
-    if (s_tabFor != obj) {
-        s_tabFor = obj;
-        for (uint32_t n = 0; n < kVerNativeCount; ++n) {
-            char nf[96] = {};
-            snprintf(nf, sizeof(nf), "System\\SongSelect\\Sortimage\\category_%02lu.bmp",
-                     (unsigned long)(n + kNativeSrcFirst + 1));
-            uint32_t slot = 0;
-            loadTex(gfxCtx, nf, &slot, nullptr);
-            s_tab[n] = slot;
-        }
+// Called at the end of the pre-filter, with the array in the state we just built.
+static void SnapshotCategoryTabs(uint32_t obj) {
+    if (!g_catTexSmallBase) return;
+    const uint32_t count = kCustomCatBase + g_customCategoryCount;
+    g_tabSnapshot.assign(count, 0);
+    uint32_t live = 0;
+    for (uint32_t n = 0; n < count; ++n) {
+        g_tabSnapshot[n] = SafeRead32(obj + g_catTexSmallBase + n * 4);
+        if (g_tabSnapshot[n]) ++live;
     }
-    uint32_t reasserted = 0;
-    for (uint32_t n = 0; n < kVerNativeCount; ++n)
-        if (s_tab[n] && SafeRead32(obj + g_catTexSmallBase + n * 4) != s_tab[n]) {
-            SafeWriteBytes(obj + g_catTexSmallBase + n * 4, &s_tab[n], 4);
-            ++reasserted;
-        }
+    g_tabSnapFor = obj;
+    LogLine("[category] tab strip snapshotted: %lu/%lu slots have a texture", (unsigned long)live,
+            (unsigned long)count);
+}
 
-    // One-shot picture of the tab array, to answer a question the screenshots could not: the strip
-    // shows MUSE.3 where VOEZ (the last custom, slot 99) belongs. Either the array is right and the
-    // game is reading a different slot for that position, or the array itself is wrong -- and the
-    // pointers say which. Logged once, after the first pass that had to reassert nothing.
-    static bool s_dumped = false;
-    if (!s_dumped && !reasserted) {
-        s_dumped = true;
-        char line[512] = {};
-        int at = snprintf(line, sizeof(line), "[tabdiag] small[0..3]=");
-        for (uint32_t n = 0; n < 4; ++n)
-            at += snprintf(line + at, sizeof(line) - at, "%08lx ",
-                           (unsigned long)SafeRead32(obj + g_catTexSmallBase + n * 4));
-        at += snprintf(line + at, sizeof(line) - at, "| [14..17]=");
-        for (uint32_t n = 14; n < 18; ++n)
-            at += snprintf(line + at, sizeof(line) - at, "%08lx ",
-                           (unsigned long)SafeRead32(obj + g_catTexSmallBase + n * 4));
-        at += snprintf(line + at, sizeof(line) - at, "| [66..69]=");
-        for (uint32_t n = 66; n < 70; ++n)
-            at += snprintf(line + at, sizeof(line) - at, "%08lx ",
-                           (unsigned long)SafeRead32(obj + g_catTexSmallBase + n * 4));
-        at += snprintf(line + at, sizeof(line) - at, "| [96..99]=");
-        for (uint32_t n = 96; n < 100; ++n)
-            at += snprintf(line + at, sizeof(line) - at, "%08lx ",
-                           (unsigned long)SafeRead32(obj + g_catTexSmallBase + n * 4));
-        LogLine("%s", line);
-        LogLine("[tabdiag] selected=%lu visibleCats=%lu customBase=%lu customCount=%lu",
-                (unsigned long)SafeRead32(obj + 0x80), (unsigned long)SafeRead32(obj + 0x7C),
-                (unsigned long)kCustomCatBase, (unsigned long)g_customCategoryCount);
+static void HoldCategoryTabs(uint32_t obj) {
+    if (g_tabSnapFor != obj || g_tabSnapshot.empty()) return;
+    uint32_t fixed = 0;
+    for (size_t n = 0; n < g_tabSnapshot.size(); ++n) {
+        const uint32_t want = g_tabSnapshot[n];
+        if (want && SafeRead32(obj + g_catTexSmallBase + (uint32_t)n * 4) != want)
+            { SafeWriteBytes(obj + g_catTexSmallBase + (uint32_t)n * 4, &want, 4); ++fixed; }
+    }
+    static uint32_t s_reported = 0;
+    if (fixed && s_reported < 3) {
+        ++s_reported;
+        LogLine("[category] tab strip: %lu slot(s) were overwritten and put back", (unsigned long)fixed);
     }
 }
 
@@ -1544,7 +1525,7 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
         // Cheap, and it has to be here: this is the only thing that runs every song-select
         // frame with the object in hand, and the labels have to be right on the first one.
         RefreshNativeVersionLabels(regs->ecx);
-        HoldNativeCategoryTabs(regs->ecx);
+        HoldCategoryTabs(regs->ecx);
 
         if (selected < visible) {
             const char* selId = reinterpret_cast<const char*>(
