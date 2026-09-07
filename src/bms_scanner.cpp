@@ -4788,7 +4788,7 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
     bool ok = false;
     switch (kind) {
         case kCatAbmTab:      // wheel tab: SHORT folder name, one centred line filling the canvas
-            ok = RenderSplashBytes(out, cats[categoryIndex], std::string(), 128, 16, false, false);
+            ok = RenderSplashBytes(out, cat, std::string(), 128, 16, false, false);
             break;
         case kCatAbmOverlay:
             // The big centre label, and it was being drawn at twice the size it was made.
@@ -4808,8 +4808,20 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
         case kCatAbmSort:     // big overlay: 256x64 24bpp, matching the native sortstyle art
             ok = RenderSplashBytes(out, cat, sub, 256, 64, false, true);
             break;
-        default:              // kCatAbmLabel: the right-aligned line under the song title
-            ok = RenderSplashBytes(out, cat, std::string(), 128, 16, true, false);
+        default:
+            // kCatAbmLabel -- and this one is drawn TWICE: small, under the song title, and blown
+            // up across the disc by the category-change animation. The marker build settled it;
+            // three earlier attempts had gone to the wrong asset because they were reasoned about
+            // rather than looked at.
+            //
+            // Two things were wrong. It passed no subtitle at all, which is the missing amber line
+            // -- it was never drawn, not lost. And 128x16 matches the shipped version_NN.abm, but
+            // the game upscales it about two to one for the animation, and a long custom category
+            // name blurs where a short era name like "3RD TRAX" does not.
+            //
+            // 256x32 keeps the 8:1 aspect exactly and only doubles the resolution: crisp where it
+            // is drawn large, unchanged where it is drawn small.
+            ok = RenderSplashBytes(out, cat, sub, 256, 32, true, true);
             break;
     }
     return ok && AbmFromBmpBytes(out);
