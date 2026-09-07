@@ -4758,17 +4758,6 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
                                  RGB(255, 174, 0)) &&
                AbmFromBmpBytes(out);
 
-    // The kept eras, in wheel order. Their names exist only as pixels inside the game's own tab
-    // art -- there is no string anywhere to read them from -- so they are written out here. Sixteen
-    // short labels, and they are visible on screen at all times, so a wrong one would be obvious.
-    if (kind == kCatAbmSortNative) {
-        static const char* kEras[] = {"1st", "S/E", "2nd", "3rd", "4th", "PLT", "6th", "7th",
-                                      "1.5-2.0", "CV", "3s-BE", "AEIC", "EC", "EV", "NT", "TT"};
-        if (categoryIndex >= sizeof(kEras) / sizeof(kEras[0])) return false;
-        return RenderSplashBytes(out, kEras[categoryIndex], std::string(), 256, 64, false, true) &&
-               AbmFromBmpBytes(out);
-    }
-
     // Empty text on the standard black ground: a plain 256x256 tile, the disc's own geometry.
     if (kind == kCatAbmPreviewBase)
         return RenderSplashBytes(out, std::string(), std::string(), 256, 256, true, false) &&
@@ -4787,41 +4776,22 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
     if (!haveDetails) cat = cats[categoryIndex];
     bool ok = false;
     switch (kind) {
-        case kCatAbmTab:      // wheel tab: SHORT folder name, one centred line filling the canvas
-            ok = RenderSplashBytes(out, cat, std::string(), 128, 16, false, false);
+        case kCatAbmTab:
+            // The wheel tab shows the FOLDER name -- ANX, ARC.1, BD.2 -- not the pretty name from
+            // details.txt. Only the folder name is short enough for a tab, and it is what the strip
+            // has always shown. A marker build swapped this to `cat` so the probe letter would be
+            // visible, and putting the marker back left the swap behind: the strip filled up with
+            // "Arcaea (...", "BanG Dr..." truncated mid-word. `cats[categoryIndex]` is the folder.
+            ok = RenderSplashBytes(out, cats[categoryIndex], std::string(), 128, 16, false, false);
             break;
-        case kCatAbmOverlay:
-            // The big centre label, and it was being drawn at twice the size it was made.
-            //
-            // 128x16 was chosen to match the shipped Sortimage assets, but this one is not a wheel
-            // sprite: the game draws it around 250x30, so a 128-wide source was upscaled two to one
-            // and came out stretched and pixelated -- and sixteen pixels of height has no room for
-            // a second line, which is why the subtext never appeared. The giveaway was the aspect
-            // ratio: the text on screen is about 8:1, which is 128x16's ratio and not the 4:1 of
-            // the 256x64 sortstyle sprite, so it could only be this asset.
-            //
-            // Same 8:1, twice the resolution: roughly 1:1 with how it is actually drawn.
-            // ponytail: assumes the draw rect is fixed rather than taken from the texture. If the
-            // label suddenly draws twice as large, that assumption was wrong -- put 128x16 back.
-            ok = RenderSplashBytes(out, cat, sub, 256, 32, false, true);
+        case kCatAbmOverlay:  // wheel-side category sprite, 128x16 like every Sortimage asset
+            ok = RenderSplashBytes(out, cat, sub, 128, 16, false, true);
             break;
         case kCatAbmSort:     // big overlay: 256x64 24bpp, matching the native sortstyle art
             ok = RenderSplashBytes(out, cat, sub, 256, 64, false, true);
             break;
-        default:
-            // kCatAbmLabel -- and this one is drawn TWICE: small, under the song title, and blown
-            // up across the disc by the category-change animation. The marker build settled it;
-            // three earlier attempts had gone to the wrong asset because they were reasoned about
-            // rather than looked at.
-            //
-            // Two things were wrong. It passed no subtitle at all, which is the missing amber line
-            // -- it was never drawn, not lost. And 128x16 matches the shipped version_NN.abm, but
-            // the game upscales it about two to one for the animation, and a long custom category
-            // name blurs where a short era name like "3RD TRAX" does not.
-            //
-            // 256x32 keeps the 8:1 aspect exactly and only doubles the resolution: crisp where it
-            // is drawn large, unchanged where it is drawn small.
-            ok = RenderSplashBytes(out, cat, sub, 256, 32, true, true);
+        default:              // kCatAbmLabel: the right-aligned line under the song title
+            ok = RenderSplashBytes(out, cat, std::string(), 128, 16, true, false);
             break;
     }
     return ok && AbmFromBmpBytes(out);

@@ -58,7 +58,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (pct > 100) pct = 100;
                 SendMessageA(g_bar, PBM_SETPOS, pct, 0);
                 char title[160];
-                wsprintfA(title, "EZ2CustomMod - %d%%  (%d/%d canciones)", pct, done, total);
+                wsprintfA(title, "EZ2CustomMod - %d%%  (%d/%d songs)", pct, done, total);
                 SetWindowTextA(h, title);
             }
             return 0;
@@ -95,7 +95,7 @@ static DWORD WINAPI PopupThread(LPVOID) {
     const int W = 560, H = 380;
     int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
     g_wnd = CreateWindowExA(WS_EX_TOPMOST, "EZ2CustomModPopup",
-        "EZ2CustomMod - Preparando canciones custom...",
+        "EZ2CustomMod - Preparing custom songs...",
         WS_POPUP | WS_CAPTION | WS_VISIBLE,
         (sx - W) / 2, (sy - H) / 2, W, H,
         nullptr, nullptr, wc.hInstance, nullptr);

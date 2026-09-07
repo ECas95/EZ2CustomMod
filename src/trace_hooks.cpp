@@ -79,7 +79,7 @@ static const uint32_t kVerArrayReloc = 0x111000;  // clear of 0x110000/0x110800 
 // Version labels for the kept natives, compacted the same way: 16 of them at slots 0..15.
 // Custom labels still ask for Version_19.bmp upward -- the FILE numbering is untouched, so the
 // redirect in mod_main keeps its base and the native files 16..18 are not shadowed.
-static const uint32_t kVerNativeCount = 16;
+static const uint32_t kVerNativeCount = 19;   // HOT/NEW/ALL plus the sixteen eras
 static const uint32_t kVerCustomFile  = 19;        // first custom Version_NN.bmp on disk
 // Array A -- system/SongSelect/Version/ -- is the one behind the label under the song title:
 //     3A104  mov eax,[esi+edx*4+0xBFF74]   ; A lookup
@@ -155,8 +155,11 @@ static const uint32_t kSortNativeHi   = 46;        // last native one
 // (category counts, category id lists, version labels, wheel textures). The rule that keeps it
 // straight is the same one as before: a slot moves, a FILENAME does not. category_04.abm is still
 // category_04.abm on disk; it just lands in wheel slot 0 now.
-static const uint32_t kNativeSrcFirst = 3;         // source row of "1st"; its tile is category_04
-static const uint32_t kCustomCatBase  = 16;        // first wheel slot we own (47 -> 19 -> 16)
+// 0 = keep the wheel's first rows. They were dropped to reclaim three slots, and that turned
+// out to break more than it bought: HOT/NEW/ALL are restored, so nothing is skipped and the
+// natives are slots 0..18 -- the three of them plus the sixteen game eras.
+static const uint32_t kNativeSrcFirst = 0;
+static const uint32_t kCustomCatBase  = 19;        // first wheel slot we own (47 -> 19 -> 16 -> 19)
 static const uint32_t kWheelMax       = 127;       // signed imm8 ceiling in the gate instructions
 static CategoryMemoryEdit g_sortEdits[] = {
     {0x44820, kSortBiasedOrig, kSortReloc, 0, 4, false},
@@ -352,8 +355,6 @@ unsigned int RequiredObjectBytes() {
 // is live render state. To add custom slots we move BOTH arrays into the object's free tail,
 // placed in the 0x20000 headroom the capacity patch reserves AFTER the relocated master[]
 // (page-aligned). Set by InstallSongCapacityPatches (needs newCap); 0 = not relocated.
-static void SnapshotCategoryTabs(uint32_t obj);   // both defined with HoldCategoryTabs, below
-static void SnapshotSortStyles(uint32_t obj);
 
 static uint32_t g_catTexSmallBase = 0;
 static uint32_t g_catTexBigBase   = 0;
@@ -1327,24 +1328,6 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                     s_sortFilledFor = obj;
                     unsigned long sok = 0;
 
-                    // The sixteen kept eras first. Their slots were being left empty, and an empty
-                    // slot does not mean "draw nothing" -- the animation object simply keeps the
-                    // texture it was last handed, so every one of them replayed whatever had been
-                    // shown before. At boot that is sortstyle_00, which is why "1st" animated
-                    // "HOT". These are generated from the era names, like the custom ones.
-                    unsigned long nok = 0;
-                    for (uint32_t n = 0; n < kCustomCatBase && n < 16; ++n) {
-                        char nf[128] = {};
-                        snprintf(nf, sizeof(nf),
-                                 "System\\SongSelect\\V_View\\sortstyle\\natsort_%02lu.bmp",
-                                 (unsigned long)n);
-                        loadTex(gfxCtx, nf,
-                                reinterpret_cast<void*>(obj + kSortReloc + n * 4), nullptr);
-                        if (SafeRead32(obj + kSortReloc + n * 4)) ++nok;
-                    }
-                    LogLine("[sortstyle] %lu/%lu era overlays loaded into slots 0..%lu",
-                            nok, (unsigned long)kCustomCatBase, (unsigned long)(kCustomCatBase - 1));
-
                     for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
                         const uint32_t slot = kCustomCatBase + c;   // where it goes
                         const uint32_t file = 47 + c;               // what it is called on disk
@@ -1361,8 +1344,6 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                             (unsigned long)kCustomCatBase);
                 }
             }
-            SnapshotCategoryTabs(obj);
-            SnapshotSortStyles(obj);
             LogLine("[category] loaded %lu wheel icons into relocated slots %lu.. small=%08lx big=%08lx",
                     (unsigned long)g_customCategoryCount, (unsigned long)kCustomCatBase,
                     (unsigned long)SafeRead32(obj + g_catTexSmallBase + kCustomCatBase * 4),
@@ -1407,143 +1388,6 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
 // holding the tab strip below instead -- that is the array that actually draws them. Reverted
 // to the original copy-on-filter behaviour, which worked.
 
-// Holding the category tab strip against the game's own loader.
-//
-// The tabs live in the small array at g_catTexSmallBase. The pre-filter fills it correctly -- the
-// kept natives re-pointed past the three dropped meta tabs, then our 84 customs from slot 16 up --
-// and then the game's own loader fills slots 0..46 from category_01..47 and undoes the lot.
-//
-// The tab diagnostic caught it exactly: slot 16, the first custom, held the same texture pointer as
-// our native slot 13, because both had asked for category_17.bmp and the pool is keyed by filename.
-// The game overwrites slots 16 through 46 -- thirty-one of them, which is precisely the offset the
-// screenshot showed between where a category sat and where it belonged.
-//
-// So the whole array is snapshotted once it is known good and re-asserted every frame. Snapshotting
-// beats reloading: the pool never frees, so loading the tabs again each frame would grow it without
-// bound, and the pointers are all that need restoring.
-static std::vector<uint32_t> g_tabSnapshot;
-static uint32_t g_tabSnapFor = 0;
-
-// The same treatment for the sortstyle array -- the two-line sprite the category-change animation
-// shows. The game bulk-loads sortstyle 00..29 at init, which lands on our custom slots 16..29, and
-// the "did we lose it" check only ever looked at slot 16 -- a slot the game refills with its own
-// art, so the check saw something there and never reloaded. That is why ANX (slot 16) showed a
-// stretched title with no subtext while VOEZ (slot 99, far past anything the game touches) was
-// perfect.
-static std::vector<uint32_t> g_sortSnapshot;
-static uint32_t g_sortSnapFor = 0;
-
-// Called at the end of the pre-filter, with the array in the state we just built.
-static void SnapshotCategoryTabs(uint32_t obj) {
-    if (!g_catTexSmallBase) return;
-    const uint32_t count = kCustomCatBase + g_customCategoryCount;
-    g_tabSnapshot.assign(count, 0);
-    uint32_t live = 0;
-    for (uint32_t n = 0; n < count; ++n) {
-        g_tabSnapshot[n] = SafeRead32(obj + g_catTexSmallBase + n * 4);
-        if (g_tabSnapshot[n]) ++live;
-    }
-    g_tabSnapFor = obj;
-    LogLine("[category] tab strip snapshotted: %lu/%lu slots have a texture", (unsigned long)live,
-            (unsigned long)count);
-}
-
-static void SnapshotSortStyles(uint32_t obj) {
-    if (!g_sortRelocated) return;
-    const uint32_t count = kCustomCatBase + g_customCategoryCount;
-    g_sortSnapshot.assign(count, 0);
-    uint32_t live = 0;
-    for (uint32_t n = 0; n < count; ++n) {
-        g_sortSnapshot[n] = SafeRead32(obj + kSortReloc + n * 4);
-        if (g_sortSnapshot[n]) ++live;
-    }
-    g_sortSnapFor = obj;
-    LogLine("[sortstyle] snapshotted: %lu/%lu slots have a texture (natives 0..%lu are the game's)",
-            (unsigned long)live, (unsigned long)count, (unsigned long)(kCustomCatBase - 1));
-
-    // What the sixteen kept eras currently draw, against what the game's own biased array holds.
-    // The animation shows the wrong overlay for them -- category "1st" plays "HOT" -- and the shift
-    // that fixes it cannot be read off the code: kSortBiasedOrig is indexed [base + cat*4] for
-    // cat 19..46 only, so the eras at categories 3..18 have no obvious entry. Printing both sides
-    // lets the mapping be matched by pointer instead of guessed at, which is how the last two
-    // attempts at an array I had not identified went wrong.
-}
-
-// Dumped from the per-frame path, and only once the version array has actually been filled.
-//
-// The first attempt at this ran inside the pre-filter and printed four arrays of zeros, because the
-// game's own loader had not run yet -- the log shows "0/16 native present" there and "16/16"
-// eighteen seconds later. A measurement taken before the thing being measured exists says nothing,
-// which cost a run to learn.
-static void DumpCategoryArrayDiag(uint32_t obj) {
-    static bool s_done = false;
-    if (s_done || !g_versionRelocated) return;
-    if (!SafeRead32(obj + kVerArrayReloc + (kVerNativeCount - 1) * 4)) return;   // not filled yet
-    s_done = true;
-
-    char v[500] = {}; int vt = snprintf(v, sizeof(v), "[verdiag] B.reloc[0..9]=");
-    for (uint32_t n = 0; n < 10; ++n)
-        vt += snprintf(v + vt, sizeof(v) - vt, "%08lx ",
-                       (unsigned long)SafeRead32(obj + kVerArrayReloc + n * 4));
-    vt += snprintf(v + vt, sizeof(v) - vt, "| B.orig[0..9]=");
-    for (uint32_t n = 0; n < 10; ++n)
-        vt += snprintf(v + vt, sizeof(v) - vt, "%08lx ",
-                       (unsigned long)SafeRead32(obj + kVerArrayOrig + n * 4));
-    LogLine("%s", v);
-
-    char w[500] = {}; int wt = snprintf(w, sizeof(w), "[verdiag] A.reloc[0..9]=");
-    for (uint32_t n = 0; n < 10; ++n)
-        wt += snprintf(w + wt, sizeof(w) - wt, "%08lx ",
-                       (unsigned long)SafeRead32(obj + kVerAReloc + n * 4));
-    wt += snprintf(w + wt, sizeof(w) - wt, "| A.orig[0..9]=");
-    for (uint32_t n = 0; n < 10; ++n)
-        wt += snprintf(w + wt, sizeof(w) - wt, "%08lx ",
-                       (unsigned long)SafeRead32(obj + kVerAOrig + n * 4));
-    LogLine("%s", w);
-
-    char x[500] = {}; int xt = snprintf(x, sizeof(x), "[sortdiag] reloc[0..9]=");
-    for (uint32_t n = 0; n < 10; ++n)
-        xt += snprintf(x + xt, sizeof(x) - xt, "%08lx ",
-                       (unsigned long)SafeRead32(obj + kSortReloc + n * 4));
-    xt += snprintf(x + xt, sizeof(x) - xt, "| orig[cat 17..26]=");
-    for (uint32_t c = 17; c < 27; ++c)
-        xt += snprintf(x + xt, sizeof(x) - xt, "%08lx ",
-                       (unsigned long)SafeRead32(obj + kSortBiasedOrig + c * 4));
-    LogLine("%s", x);
-}
-
-static void HoldCategoryTabs(uint32_t obj) {
-    DumpCategoryArrayDiag(obj);
-    if (g_tabSnapFor != obj || g_tabSnapshot.empty()) return;
-    uint32_t fixed = 0;
-    for (size_t n = 0; n < g_tabSnapshot.size(); ++n) {
-        const uint32_t want = g_tabSnapshot[n];
-        if (want && SafeRead32(obj + g_catTexSmallBase + (uint32_t)n * 4) != want)
-            { SafeWriteBytes(obj + g_catTexSmallBase + (uint32_t)n * 4, &want, 4); ++fixed; }
-    }
-    static uint32_t s_reported = 0;
-    if (fixed && s_reported < 3) {
-        ++s_reported;
-        LogLine("[category] tab strip: %lu slot(s) were overwritten and put back", (unsigned long)fixed);
-    }
-
-    // Only the custom half is held. The natives are left exactly as the game has them, because what
-    // their slots should contain is not established -- the original array is BIASED (only ever
-    // indexed by category 19 and up), so the sixteen kept eras have no obvious source in it, and
-    // guessing at an array's meaning is what broke the song title and the label under it.
-    if (g_sortSnapFor != obj || g_sortSnapshot.empty()) return;
-    uint32_t sfixed = 0;
-    for (size_t n = kCustomCatBase; n < g_sortSnapshot.size(); ++n) {
-        const uint32_t want = g_sortSnapshot[n];
-        if (want && SafeRead32(obj + kSortReloc + (uint32_t)n * 4) != want)
-            { SafeWriteBytes(obj + kSortReloc + (uint32_t)n * 4, &want, 4); ++sfixed; }
-    }
-    static uint32_t s_sreported = 0;
-    if (sfixed && s_sreported < 3) {
-        ++s_sreported;
-        LogLine("[sortstyle] %lu custom slot(s) were overwritten and put back", (unsigned long)sfixed);
-    }
-}
 
 
 extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, PushadRegs* regs) {
@@ -1578,7 +1422,6 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
         // nothing at all until the cursor has been still for a moment.
         // Cheap, and it has to be here: this is the only thing that runs every song-select
         // frame with the object in hand, and the labels have to be right on the first one.
-        HoldCategoryTabs(regs->ecx);
 
         if (selected < visible) {
             const char* selId = reinterpret_cast<const char*>(
