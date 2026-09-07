@@ -1154,8 +1154,26 @@ void BgaPreviewTick(uint32_t obj, const char* selectedId) {
         g_previewSavedSlot = *reinterpret_cast<uint32_t*>(obj + kObjDiscSlot);
         g_previewSlotSwapped = true;
         g_previewNextFrameMs = 0;
-        static bool logged = false;
-        if (!logged) { logged = true; LogLine("[preview] first preview running id='%s'", id.c_str()); }
+        LogLine("[preview] running id='%s'", id.c_str());   // once per song, not once per session
+    }
+    // Did anyone overwrite the slot since the last frame?
+    //
+    // The decodes keep succeeding and none of the guards fire, yet the preview is only ever seen
+    // once -- so the frames exist and something is undoing the swap rather than breaking it. This
+    // says whether that is the game reloading the disc, and how often, instead of leaving it to be
+    // guessed at. Logged a few times, then counted silently.
+    {
+        const uint32_t live = *reinterpret_cast<uint32_t*>(obj + kObjDiscSlot);
+        const uint32_t ours = reinterpret_cast<uint32_t>(g_previewTexture);
+        static uint32_t s_stolen = 0, s_logged = 0;
+        if (live != ours) {
+            ++s_stolen;
+            if (s_logged < 6) {
+                ++s_logged;
+                LogLine("[preview] disc slot was %08lx, not ours (%08lx) -- steal #%lu",
+                        (unsigned long)live, (unsigned long)ours, (unsigned long)s_stolen);
+            }
+        }
     }
     *reinterpret_cast<uint32_t*>(obj + kObjDiscSlot) = reinterpret_cast<uint32_t>(g_previewTexture);
 
