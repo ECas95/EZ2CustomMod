@@ -98,6 +98,8 @@ std::string GetCustomSongBackingId(const char* id);
 // On-demand cache: scan writes only metadata; these decode the heavy audio at play/hover.
 void EnsureSongKeysounds(const CustomBmsSong& song); // first sample miss = song is played
 void EnsureSongPreview(const CustomBmsSong& song);   // SongSelect hover preview
+// Direct mode: the per-chart judgement/level .ini the game loads with the chart, by requested name.
+std::string EnsureSongIni(const CustomBmsSong& song, const std::string& requestedName);
 
 // Direct bridge: build the selected BMS chart in memory and feed its PCM WAVs to
 // the game's native chart/audio objects. The selected BGA video remains the

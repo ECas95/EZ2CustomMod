@@ -556,6 +556,16 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
                 if (LocalFileExists(preview)) return preview;
                 return std::string();
             }
+            // Chart-load .gds: "<mode>1p-<id>[-hd].ini" -- judgement windows, gauge rates, level.
+            // KParser::readFile decrypts it to a sibling ".int" and reads that, so both go to cache.
+            if (!s.cacheDir.empty() && !HasSlashOrDrive(p)) {
+                if (EndsWithCaseInsensitive(fn, ".ini")) {
+                    std::string ini = EnsureSongIni(s, fn);
+                    if (!ini.empty()) return ini;
+                } else if (EndsWithCaseInsensitive(fn, ".int")) {
+                    return JoinPath(s.cacheDir, fn);
+                }
+            }
         }
 
         // v19: context-aware visual cache. system\disc and system\eyecatch can request the
@@ -907,7 +917,7 @@ static DWORD    g_previewDwellSince = 0;
 static std::string g_previewWantId;               // what the cursor is resting on
 static std::string g_previewHaveId;               // what the frame buffer holds
 static uint32_t g_previewObj = 0;
-static uint32_t g_previewSavedSlot = 0;           // the disc pointer we displaced
+static uint32_t g_previewSavedSlot[5] = {};       // the disc pointers we displaced, per difficulty
 static bool     g_previewSlotSwapped = false;
 static HANDLE   g_previewThread = nullptr;
 static volatile LONG g_previewDecoding = 0;
@@ -915,7 +925,11 @@ static std::string g_previewDecodePath;
 static std::string g_previewDecodeId;
 static DWORD g_previewDecodeStartMs = 0;
 
-static const uint32_t kObjDiscSlot = 260;         // "HotSpotDisc"
+// The disc sprites f_104[5] (decomp songselectpage.cpp m431ae0): 0 NM "HotSpotDisc", 1 HD, 3 SHD,
+// 4 EX (2 unused). The renderer draws f_104[f_f4] once the swing passes 180, so every difficulty
+// slot has to carry the preview or a difficulty change brings the game's own disc back.
+static const uint32_t kObjDiscSlot = 260;         // f_104[0]
+static const int kPreviewSlots[4] = {0, 1, 3, 4};
 
 // Build the surface once. The texture object is created from initdisc.abm purely to get a real
 // 256x256 24bpp texture of the right shape; its surface is then replaced by ours, which is the
@@ -1007,9 +1021,10 @@ static DWORD WINAPI PreviewDecodeThread(LPVOID) {
 // Pass 0 for "no object in hand", which drops the bookkeeping without writing anything.
 static void PreviewRestoreSlot(uint32_t onObj) {
     if (g_previewSlotSwapped && g_previewObj && onObj == g_previewObj)
-        *reinterpret_cast<uint32_t*>(g_previewObj + kObjDiscSlot) = g_previewSavedSlot;
+        for (int k : kPreviewSlots)
+            *reinterpret_cast<uint32_t*>(g_previewObj + kObjDiscSlot + 4 * k) = g_previewSavedSlot[k];
     g_previewSlotSwapped = false;
-    g_previewSavedSlot = 0;
+    for (int k : kPreviewSlots) g_previewSavedSlot[k] = 0;
 }
 
 // True when the surface still looks like a live COM object. DirectDraw surfaces can be lost --
@@ -1151,7 +1166,8 @@ void BgaPreviewTick(uint32_t obj, const char* selectedId) {
     // Hold the slot every tick rather than only on the swap: the game refills obj+260 whenever it
     // reloads the disc, and that would otherwise silently end the preview mid-loop.
     if (!g_previewSlotSwapped) {
-        g_previewSavedSlot = *reinterpret_cast<uint32_t*>(obj + kObjDiscSlot);
+        for (int k : kPreviewSlots)
+            g_previewSavedSlot[k] = *reinterpret_cast<uint32_t*>(obj + kObjDiscSlot + 4 * k);
         g_previewSlotSwapped = true;
         g_previewNextFrameMs = 0;
         LogLine("[preview] running id='%s'", id.c_str());   // once per song, not once per session
@@ -1175,7 +1191,8 @@ void BgaPreviewTick(uint32_t obj, const char* selectedId) {
             }
         }
     }
-    *reinterpret_cast<uint32_t*>(obj + kObjDiscSlot) = reinterpret_cast<uint32_t>(g_previewTexture);
+    for (int k : kPreviewSlots)
+        *reinterpret_cast<uint32_t*>(obj + kObjDiscSlot + 4 * k) = reinterpret_cast<uint32_t>(g_previewTexture);
 
     const DWORD now = GetTickCount();
     if (now >= g_previewNextFrameMs) {

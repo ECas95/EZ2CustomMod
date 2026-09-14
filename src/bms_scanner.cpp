@@ -3630,6 +3630,57 @@ static bool modeIsSevenKey(const std::string& mode) {
     return m == "7keyMix" || m == "spaceMix";
 }
 
+// The per-chart .gds the game reads through loadGds (decomp maingame.cpp @0x423790). Without it
+// the game falls back to Kool 6/Cool 24/Good 36/Miss 72 and Level 99; natives ship Good 50/Miss 70.
+// Format and values are those of the shipped natives (decrypted Sound\10Anti\*.ini); the per-mode
+// judgement/gauge sets are the ones every native carries for that mode. No [SongOriginalName]:
+// a title with '[' in it would read as a section header and skip the sections after it.
+static std::string BuildSongIni(const CustomBmsSong& song, const CustomBmsChart& chart) {
+    const std::string m = NormalizeModeName(song.mode);
+    const char* judge = m == "ez2Catch"  ? "Kool = 5\r\nCool = 18\r\nGood = 40\r\nMiss = 56\r\n"
+                      : m == "turnTable" ? "Kool = 10\r\nCool = 21\r\nGood = 45\r\nMiss = 60\r\n"
+                      :                    "Kool = 6\r\nCool = 24\r\nGood = 50\r\nMiss = 70\r\n";
+    const char* gauge = m == "ez2Catch"  ? "Cool = 0.2\r\nGood = 0.0\r\nMiss = 0.0\r\nFail = -4.0\r\n"
+                      : m == "turnTable" ? "Cool = 0.2\r\nGood = 0.1\r\nMiss = -1.5\r\nFail = -4.0\r\n"
+                      : m == "clubMix"   ? "Cool = 0.4\r\nGood = 0.3\r\nMiss = -1.5\r\nFail = -4.0\r\n"
+                      :                    "Cool = 0.2\r\nGood = 0.1\r\nMiss = -1.8\r\nFail = -4.8\r\n";
+    std::string ini;
+    ini += "[General]\r\n";
+    ini += "Level = " + (chart.playLevel.empty() ? std::string("1") : chart.playLevel) + "\r\n";
+    ini += "MeasureScale = 1.6\r\n\r\n";
+    ini += std::string("[JudgmentDelta]\r\n") + judge + "\r\n";
+    ini += std::string("[GaugeUpDownRate]\r\n") + gauge;
+    return ini;
+}
+
+// Direct mode writes no playable cache, so the .ini the game asks for at chart load
+// ("<mode>1p-<id>[-hd|-shd|-ex].ini", bare name after pushDirectory) is produced on demand,
+// keyed by the difficulty suffix so Level matches the chart. Returns the path to serve, or "".
+std::string EnsureSongIni(const CustomBmsSong& song, const std::string& requestedName) {
+    if (song.cacheDir.empty()) return std::string();
+    std::string lower = lowerCopy(requestedName);
+    size_t idPos = lower.find(lowerCopy(song.id));
+    if (idPos == std::string::npos || lower.size() < 4 ||
+        lower.compare(lower.size() - 4, 4, ".ini") != 0) return std::string();
+    std::string suffix = lower.substr(idPos + song.id.size(), lower.size() - 4 - idPos - song.id.size());
+    int slot = 0;
+    for (int s = 1; s < 4; ++s) if (suffix == suffixForSlot(s)) slot = s;
+    const CustomBmsChart* chart = nullptr;
+    for (size_t i = 0; i < song.chartMeta.size(); ++i)
+        if (song.chartMeta[i].slot == slot && (!chart || song.chartMeta[i].file < chart->file)) chart = &song.chartMeta[i];
+    if (!chart) for (size_t i = 0; i < song.chartMeta.size() && !chart; ++i) if (song.chartMeta[i].slot == 0) chart = &song.chartMeta[i];
+    if (!chart) return std::string();
+    std::string dst = JoinPath(song.cacheDir, requestedName);
+    if (cacheIsFresh(dst, JoinPath(song.songDir, chart->file))) return dst;
+    ensureDir(JoinPath(GetExeDirectory(), Config().cacheRoot));
+    ensureDir(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), song.mode));
+    ensureDir(song.cacheDir);
+    bool ok = writeEncryptedTextFileRuntime(dst, BuildSongIni(song, *chart), 0x0a8568);
+    LogLine("[direct] ini id='%s' slot=%d level=%s file='%s' ok=%d", song.id.c_str(), slot,
+            chart->playLevel.c_str(), requestedName.c_str(), ok ? 1 : 0);
+    return ok ? dst : std::string();
+}
+
 static void GeneratePlayableCacheV10(const CustomBmsSong& song, bool materializeAudio) {
     // All EZ2 modes share the same .ez/.ezi format and channel→track mapping (see
     // bmsChannelToEzTrackMode); the mode only sets the cache prefix and the 7-key flag. Catch is
@@ -3682,15 +3733,7 @@ static void GeneratePlayableCacheV10(const CustomBmsSong& song, bool materialize
             LogLine("[cache] playable cache cached id='%s' files=%d", song.id.c_str(), emitted);
             return; // warm boot: encrypted inis already written and still fresh
         }
-        std::string ini;
-        ini += "[General]\r\n";
-        ini += "Level = " + (charts.empty() ? std::string("1") : charts[0].playLevel.empty() ? std::string("1") : charts[0].playLevel) + "\r\n";
-        ini += "MeasureScale = 1.6\r\n\r\n";
-        ini += "[SongOriginalName]\r\n";
-        ini += "Name = " + song.title + "\r\n";
-        ini += "Artist = " + song.artist + "\r\n\r\n";
-        ini += "[JudgmentDelta]\r\nKool = 6\r\nCool = 24\r\nGood = 50\r\nMiss = 70\r\n\r\n";
-        ini += "[GaugeUpDownRate]\r\nCool = 0.2\r\nGood = 0.1\r\nMiss = -1.8\r\nFail = -4.8\r\n";
+        std::string ini = BuildSongIni(song, charts[0]);
         std::string iniA = JoinPath(song.cacheDir, prefix + song.id + ".ini");
         std::string iniB = JoinPath(song.cacheDir, song.id + ".ini");
         // Use runtime key (reads actual game binary at 0x0a8568) instead of hardcoded table.
