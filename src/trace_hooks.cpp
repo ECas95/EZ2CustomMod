@@ -2245,6 +2245,21 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
     // memory region in the process -- two thousand of them -- and writes eight log lines, on a path
     // the player hits constantly. Removed; ReportProcessFootprint is still there to call by hand if
     // memory growth ever needs chasing again.
+    // How full the texture pool gets. It is a bump allocator that never frees, patched in the EXE
+    // from 32MB to 512MB, and it is 71% of the process footprint -- so the question for doubling the
+    // library is not whether the catalogue fits (it does, at 154MB) but whether twice the generated
+    // art still fits in here. Reported only when it climbs, so a quiet session says nothing.
+    {
+        const uint32_t base = SafeRead32(0x530c2c + 0xc), bump = SafeRead32(0x530c2c + 0x10);
+        const uint32_t usedMb = (base && bump >= base) ? ((bump - base) >> 20) : 0;
+        static uint32_t s_peak = 0;
+        if (usedMb > s_peak) {
+            s_peak = usedMb;
+            LogLine("[texpool] high-water %luMB of %luMB after %lu category change(s)",
+                    (unsigned long)usedMb, (unsigned long)(SafeRead32(0x530c2c + 8) >> 20),
+                    (unsigned long)g_gsLastCount);
+        }
+    }
     g_gsLastCat = cat;            // so a /GS failure names the category that led to it
     g_gsLastCount = published;
     static uint32_t s_lastCat = 0xFFFFFFFFu;

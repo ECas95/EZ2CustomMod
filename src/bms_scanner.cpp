@@ -6112,6 +6112,52 @@ static void LogCatalogOrderCheck() {
 }
 
 static void DropCatalogueCaches();
+// ---- where the memory actually goes --------------------------------------------------------------
+//
+// Estimating this from outside kept missing by a factor of seven: the catalogue's own records add up
+// to about 100 MB and the per-song file lists to eight more, while the process reports 723 MB
+// private. So the structures are walked and weighed rather than reasoned about.
+//
+// Strings are counted by capacity() and only once they have escaped the small-string buffer -- below
+// sixteen characters a std::string carries its text inside itself and costs no heap at all, which is
+// most ids, modes and titles here. Allocator overhead is taken as eight bytes a block.
+static size_t StrHeap(const std::string& v) {
+    return v.capacity() >= 16 ? v.capacity() + 1 + 8 : 0;
+}
+
+static void LogCatalogMemory(const char* why) {
+    const double mb = 1048576.0;
+    size_t recs = g_songs.size() * sizeof(CustomBmsSong);
+    size_t strs = 0, shared = 0;
+    std::set<const void*> seenVec;               // a SharedVec payload is counted once per group
+    for (const auto& s : g_songs) {
+        strs += StrHeap(s.id) + StrHeap(s.mode) + StrHeap(s.modeFolder) + StrHeap(s.category)
+              + StrHeap(s.songDir) + StrHeap(s.cacheDir) + StrHeap(s.title) + StrHeap(s.artist)
+              + StrHeap(s.sourceMode);
+        auto weigh = [&](const auto& sv) {
+            if (sv.empty()) return;
+            if (!seenVec.insert((const void*)&sv[0]).second) return;
+            for (size_t i = 0; i < sv.size(); ++i) shared += sizeof(sv[i]) + 24;
+        };
+        weigh(s.charts); weigh(s.audioFiles); weigh(s.imageFiles); weigh(s.videoFiles);
+    }
+    size_t keys = 0;
+    for (const auto& k : g_catalogKeys) keys += 2 * sizeof(void*) + k.size() + StrHeap(k);
+    size_t idmap = 0;
+    for (const auto& kv : g_idMap) idmap += 40 + kv.first.size() + StrHeap(kv.first);
+    size_t cache = 0;
+    for (const auto& kv : g_scanCache) cache += 40 + StrHeap(kv.first) + sizeof(kv.second);
+
+    const size_t named = recs + strs + shared + keys + idmap + cache;
+    LogLine("[memacct] %s: songs=%lu  records=%.0fMB strings=%.0fMB sharedVecs=%.0fMB",
+            why, (unsigned long)g_songs.size(), recs / mb, strs / mb, shared / mb);
+    LogLine("[memacct]   catalogKeys=%.0fMB(%lu)  idMap=%.0fMB(%lu)  scanCache=%.0fMB(%lu)",
+            keys / mb, (unsigned long)g_catalogKeys.size(), idmap / mb,
+            (unsigned long)g_idMap.size(), cache / mb, (unsigned long)g_scanCache.size());
+    LogLine("[memacct]   accounted=%.0fMB -- the [mem] line above has the process total",
+            named / mb);
+}
+
 
 void ScanBMSData() {
     // Anything memoised from the catalogue dies with it. The per-mode category lists are keyed on
@@ -6174,6 +6220,7 @@ void ScanBMSData() {
         PrepareBgaPool();
     }
     LogProcessFootprint("scan complete");
+    LogCatalogMemory("scan complete");
     LogLine("[bms] indexed custom songs=%lu activeMode='%s' idmap=%lu entries scanMs=%lu",
             static_cast<unsigned long>(g_songs.size()), g_activeMode.c_str(), (unsigned long)g_idMap.size(),
             static_cast<unsigned long>(GetTickCount() - scanStart));
