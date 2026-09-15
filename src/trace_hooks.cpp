@@ -70,7 +70,55 @@ struct CategoryMemoryEdit {
     bool installed;
 };
 
-// ponytail: x86 uses signed imm8 loop bounds, so 127 total categories is the native ceiling.
+// Every ceiling on the category index is a `cmp r32,imm8` (83 /7 ib) followed by a jcc, and an
+// imm8 is signed, so rewriting the byte stopped at 127. Each site is detoured instead: the 5 (or
+// 9, near jcc) bytes of cmp+jcc become a jmp to a stub holding the same compare with an imm32,
+// the same jcc as a near jump, and a jmp back to the instruction after the pair. The flags the
+// fall-through path sees are the compare's, as before; nothing else about the site changes.
+struct GateDetour {
+    uintptr_t rva;                 // of the cmp
+    unsigned char expected;        // the native imm8
+    int32_t  bound;                // the imm32 to compare against, set before install
+    unsigned char original[9];
+    size_t   length;               // 5 or 9, from the site
+    void*    stub;
+};
+
+static void* AllocExec(size_t size);
+static void EmitU8(unsigned char*& p, unsigned char v);
+static void EmitU32(unsigned char*& p, uint32_t v);
+static void EmitRel32(unsigned char*& p, void* fromNextInstruction, void* to);
+
+// False, with nothing written, unless the site is exactly cmp r32,imm8(expected) + jcc.
+static bool InstallGateDetour(GateDetour& g) {
+    unsigned char* site = static_cast<unsigned char*>(Rva(g.rva));
+    if (site[0] != 0x83 || (site[1] & 0xF8) != 0xF8 || site[2] != g.expected) return false;
+    unsigned char cc; int32_t rel;
+    if ((site[3] & 0xF0) == 0x70) { cc = site[3] & 0x0F; rel = static_cast<signed char>(site[4]); g.length = 5; }
+    else if (site[3] == 0x0F && (site[4] & 0xF0) == 0x80) { cc = site[4] & 0x0F; std::memcpy(&rel, site + 5, 4); g.length = 9; }
+    else return false;
+    unsigned char* stub = static_cast<unsigned char*>(AllocExec(24));
+    if (!stub) return false;
+    unsigned char* p = stub;
+    EmitU8(p, 0x81); EmitU8(p, site[1]); EmitU32(p, static_cast<uint32_t>(g.bound));   // cmp r32, imm32
+    EmitU8(p, 0x0F); EmitU8(p, 0x80 | cc); EmitRel32(p, p + 4, site + g.length + rel); // jcc near, same target
+    EmitU8(p, 0xE9); EmitRel32(p, p + 4, site + g.length);                              // jmp back
+    unsigned char patch[9] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    unsigned char* q = patch;
+    EmitU8(q, 0xE9); EmitRel32(q, site + 5, stub);
+    std::memcpy(g.original, site, g.length);
+    if (!WriteMemory(site, patch, g.length)) { VirtualFree(stub, 0, MEM_RELEASE); return false; }
+    g.stub = stub;
+    return true;
+}
+
+static void RemoveGateDetour(GateDetour& g) {
+    if (!g.stub) return;
+    WriteMemory(Rva(g.rva), g.original, g.length);
+    VirtualFree(g.stub, 0, MEM_RELEASE);
+    g.stub = nullptr;
+}
+
 static uint32_t g_customCategoryCount = 0;
 
 // Version-label array relocation (details at InstallVersionArrayRelocation below).
@@ -160,17 +208,17 @@ static const uint32_t kSortNativeHi   = 46;        // last native one
 // natives are slots 0..18 -- the three of them plus the sixteen game eras.
 static const uint32_t kNativeSrcFirst = 0;
 static const uint32_t kCustomCatBase  = 19;        // first wheel slot we own (47 -> 19 -> 16 -> 19)
-static const uint32_t kWheelMax       = 127;       // signed imm8 ceiling in the gate instructions
+static const uint32_t kWheelMax       = 256;       // what the relocated tables hold (kCats); the gates are detoured
 static CategoryMemoryEdit g_sortEdits[] = {
     {0x44820, kSortBiasedOrig, kSortReloc, 0, 4, false},
     {0x449BC, kSortBiasedOrig, kSortReloc, 0, 4, false},
 };
 // Both gates, in both copies of the routine. The `cmp eax,0x13` floors stay: 47 clears them.
-static CategoryMemoryEdit g_sortGuardEdits[] = {
-    {0x447F5, 46, 127, 0, 1, false},   // outer gate, first copy
-    {0x4481A, 46, 127, 0, 1, false},   // inner gate on the array read
-    {0x44991, 46, 127, 0, 1, false},   // outer gate, twin
-    {0x449B6, 46, 127, 0, 1, false},   // inner gate, twin
+static GateDetour g_sortGuardEdits[] = {
+    {0x447F3, 46, kWheelMax - 1, {}, 0, nullptr},   // outer gate, first copy
+    {0x44818, 46, kWheelMax - 1, {}, 0, nullptr},   // inner gate on the array read
+    {0x4498F, 46, kWheelMax - 1, {}, 0, nullptr},   // outer gate, twin
+    {0x449B4, 46, kWheelMax - 1, {}, 0, nullptr},   // inner gate, twin
 };
 static bool g_sortRelocated = false;
 
@@ -182,7 +230,7 @@ static bool InstallSortstyleRelocation() {
             return false;
         }
     for (const auto& e : g_sortGuardEdits)
-        if (memcmp(Rva(e.rva), &e.expected, e.length) != 0) {
+        if (static_cast<unsigned char*>(Rva(e.rva))[2] != e.expected) {
             LogLine("[sortstyle] gate widen ABORTED: rva=0x%05lx is not the expected imm8 %lu",
                     (unsigned long)e.rva, (unsigned long)e.expected);
             return false;
@@ -192,14 +240,11 @@ static bool InstallSortstyleRelocation() {
         if (!WriteMemory(Rva(e.rva), &e.replacement, e.length)) return false;
         e.installed = true;
     }
-    for (auto& e : g_sortGuardEdits) {
-        memcpy(&e.original, Rva(e.rva), e.length);
-        if (!WriteMemory(Rva(e.rva), &e.replacement, e.length)) return false;
-        e.installed = true;
-    }
+    for (auto& e : g_sortGuardEdits)
+        if (!InstallGateDetour(e)) return false;
     g_sortRelocated = true;
-    LogLine("[sortstyle] array 0x%lx -> 0x%lx (2 reads, bias dropped), gates 19..46 -> 19..127",
-            (unsigned long)kSortBiasedOrig, (unsigned long)kSortReloc);
+    LogLine("[sortstyle] array 0x%lx -> 0x%lx (2 reads, bias dropped), gates 19..46 -> 19..%lu",
+            (unsigned long)kSortBiasedOrig, (unsigned long)kSortReloc, (unsigned long)(kWheelMax - 1));
     return true;
 }
 
@@ -209,11 +254,7 @@ static void RemoveSortstyleRelocation() {
         WriteMemory(Rva(e.rva), &e.original, e.length);
         e.installed = false;
     }
-    for (auto& e : g_sortGuardEdits) {
-        if (!e.installed) continue;
-        WriteMemory(Rva(e.rva), &e.original, e.length);
-        e.installed = false;
-    }
+    for (auto& e : g_sortGuardEdits) RemoveGateDetour(e);
     g_sortRelocated = false;
 }
 // ---------------------------------------------------------------------------------------------
@@ -257,8 +298,8 @@ static bool g_versionRelocated = false;
 // 0x33322 is the one that matters: it sits in the same function as the master reads above and the
 // relocated array read at 0x33367. The other two belong to a separate screen that shows the same
 // label; widening them too keeps the two paths consistent.
-static CategoryMemoryEdit g_verGuardEdits[] = {
-    {0x33322, 18, 127, 0, 1, false},
+static GateDetour g_verGuardEdits[] = {
+    {0x33320, 18, kWheelMax - 1, {}, 0, nullptr},
     // 0x435DC picks WHICH animation object shows the category, and the ranges are not one gate but
     // two branches:
     //     cat 2..18            -> lea ecx,[esi+0xBEAF4]   Version_View, the one-line label
@@ -267,35 +308,28 @@ static CategoryMemoryEdit g_verGuardEdits[] = {
     // Custom categories are 47+, so they fell off the end. Widening the FIRST range (as an earlier
     // attempt did) routed them to the one-line object; the two-line overlay is the second branch,
     // so the ceiling that has to move is the 46 at 0x43604 -- and the 18 stays as it was.
-    {0x43604, 46, 127, 0, 1, false},
-    {0x4479B, 18, 127, 0, 1, false},
-    {0x44937, 18, 127, 0, 1, false},
+    {0x43602, 46, kWheelMax - 1, {}, 0, nullptr},
+    {0x44799, 18, kWheelMax - 1, {}, 0, nullptr},
+    {0x44935, 18, kWheelMax - 1, {}, 0, nullptr},
 };
 
 static bool InstallVersionGuardWiden() {
     for (const auto& e : g_verGuardEdits) {
-        if (memcmp(Rva(e.rva), &e.expected, e.length) != 0) {
+        if (static_cast<unsigned char*>(Rva(e.rva))[2] != e.expected) {
             LogLine("[version] guard widen ABORTED: rva=0x%05lx is not the expected imm8 %lu",
                     (unsigned long)e.rva, (unsigned long)e.expected);
             return false;
         }
     }
-    for (auto& e : g_verGuardEdits) {
-        memcpy(&e.original, Rva(e.rva), e.length);
-        if (!WriteMemory(Rva(e.rva), &e.replacement, e.length)) return false;
-        e.installed = true;
-    }
-    LogLine("[version] label-update category range widened 2..18 -> 2..127 (%u sites)",
-            (unsigned)(sizeof(g_verGuardEdits)/sizeof(g_verGuardEdits[0])));
+    for (auto& e : g_verGuardEdits)
+        if (!InstallGateDetour(e)) return false;
+    LogLine("[version] label-update category range widened 2..18 -> 2..%lu (%u sites)",
+            (unsigned long)(kWheelMax - 1), (unsigned)(sizeof(g_verGuardEdits)/sizeof(g_verGuardEdits[0])));
     return true;
 }
 
 static void RemoveVersionGuardWiden() {
-    for (auto& e : g_verGuardEdits) {
-        if (!e.installed) continue;
-        WriteMemory(Rva(e.rva), &e.original, e.length);
-        e.installed = false;
-    }
+    for (auto& e : g_verGuardEdits) RemoveGateDetour(e);
 }
 
 // Bumped whenever the inject rewrites master[], so the filter's id index rebuilds.
@@ -367,23 +401,31 @@ static uint32_t g_lazySongnameObject = 0;
 static std::vector<std::vector<LazySongnameEntry>> g_lazySongnames;
 static std::vector<unsigned char> g_lazySongnameLoaded;
 
+static GateDetour g_categoryGates[] = {
+    {0x372ee, 0x2f, 0, {}, 0, nullptr}, // [0] loader count      (cmp eax,0x2f / jl  loop)
+    {0x322d9, 0x2f, 0, {}, 0, nullptr}, // [1] renderer count    (cmp edi,0x2f / jl  loop, near)
+    {0x446f4, 0x2e, 0, {}, 0, nullptr}, // [2] forward max index (cmp eax,0x2e / jge wrap)
+};
 static CategoryMemoryEdit g_categoryEdits[] = {
-    {0x372f0, 0x2f,       0,          0, 1, false}, // [0] loader count
-    {0x322db, 0x2f,       0,          0, 1, false}, // [1] renderer count
-    {0x446f6, 0x2e,       0,          0, 1, false}, // [2] forward max index (cmp eax,0x2e imm8)
     // backward wrap: `mov [esi+0xbc57c], 0x2e` = c7 86 |7c c5 0b 00| |2e 00 00 00|. The imm32
     // STARTS at 0x448d6 (0x448d9 is its last byte). length 4 so we set the full DWORD to 48.
-    {0x448d6, 0x2e,       0,          0, 4, false}, // [3] backward wrap selected-index reset (imm32)
-    {0x91ad0, 0x4592e000, 0,          0, 4, false}, // [4] wheel span 4700
-    {0x91ad4, 0x4512e000, 0,          0, 4, false}, // [5] half span 2350
-    {0x91acc, 0xc512e000, 0,          0, 4, false}, // [6] negative half span
-    {0x93a94, 0xc592e800, 0,          0, 4, false}, // [7] -span-1
-    {0x93a98, 0xc592d800, 0,          0, 4, false}, // [8] -span+1
-    // [9..12] texture-array base relocation (disp32 in `[ebx+disp]`, length-preserving):
-    {0x32224, 0xbc4b8,    0,          0, 4, false}, // [9]  small array — renderer (fun_432200)
-    {0x372b7, 0xbc4b8,    0,          0, 4, false}, // [10] small array — loader (fun_43673d)
-    {0x322ea, 0xc0084,    0,          0, 4, false}, // [11] big array — renderer post-loop
-    {0x382a6, 0xc0084,    0,          0, 4, false}, // [12] big array — loader
+    {0x448d6, 0x2e,       0,          0, 4, false}, // [0] backward wrap selected-index reset (imm32)
+    // The pager's per-mode skip bands (decomp m4445c0): 5KeyMix jumps over slots 35..36 and
+    // RubyMix over 30..36 -- the LV views those modes lack. Those slots are custom categories
+    // now, and the bands made them unreachable by paging. `jne` past the band tests becomes a
+    // `jmp` straight to the plain +1 / -1 step.
+    {0x44702, 0x1675,     0x1feb,     0, 2, false}, // [1] page down: jne band -> jmp step
+    {0x44893, 0x1675,     0x30eb,     0, 2, false}, // [2] page up:   jne band -> jmp step
+    {0x91ad0, 0x4592e000, 0,          0, 4, false}, // [3] wheel span 4700
+    {0x91ad4, 0x4512e000, 0,          0, 4, false}, // [4] half span 2350
+    {0x91acc, 0xc512e000, 0,          0, 4, false}, // [5] negative half span
+    {0x93a94, 0xc592e800, 0,          0, 4, false}, // [6] -span-1
+    {0x93a98, 0xc592d800, 0,          0, 4, false}, // [7] -span+1
+    // [8..11] texture-array base relocation (disp32 in `[ebx+disp]`, length-preserving):
+    {0x32224, 0xbc4b8,    0,          0, 4, false}, // [8]  small array — renderer (fun_432200)
+    {0x372b7, 0xbc4b8,    0,          0, 4, false}, // [9]  small array — loader (fun_43673d)
+    {0x322ea, 0xc0084,    0,          0, 4, false}, // [10] big array — renderer post-loop
+    {0x382a6, 0xc0084,    0,          0, 4, false}, // [11] big array — loader
 };
 
 static void EmitU8(unsigned char*& p, unsigned char v) { *p++ = v; }
@@ -903,9 +945,8 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
         LogLine("[texdiag] songs=%lu scanned=%lu maxTexIdx=%lu nullSlots=%lu garbageIdx=%lu | sel=%lu selTexIdx=%d",
                 (unsigned long)slot, (unsigned long)scanned, (unsigned long)maxIdx,
                 (unsigned long)nullCnt, (unsigned long)garbageCnt, (unsigned long)sel, (int)sf);
-        // KResourceContainer texture pool (static object @0x530c2c): +8 size, +0xc base, +0x10 bump.
-        // The "Exceed pool size" overflow → null text-texture → 5Key crash. This tells the TRUE runtime
-        // pool size (did the 1GB EXE-const patch take?) and how full it is at SongSelect entry.
+        // The .str clip pool (KProfile @0x530c2c): +8 size, +0xc base, +0x10 bump. Confirms the
+        // EXE immediate in use and how full it is at SongSelect entry (expected: under 1MB).
         uint32_t pSize = SafeRead32(0x530c2c + 8), pBase = SafeRead32(0x530c2c + 0xc), pBump = SafeRead32(0x530c2c + 0x10);
         LogLine("[texpool] size=%luMB base=%08lx used=%luMB",
                 (unsigned long)(pSize >> 20), (unsigned long)pBase,
@@ -1757,10 +1798,10 @@ static bool InstallCustomCategoryPatches() {
     // inject (copied from a native slot), so the render reads a valid handle → no crash.
     const uint32_t categoryCount = kCustomCatBase + g_customCategoryCount;
     const uint32_t lastCategory = categoryCount - 1;
-    g_categoryEdits[0].replacement = categoryCount;   // loader count (load 49 icons)
-    g_categoryEdits[1].replacement = categoryCount;   // renderer count
-    g_categoryEdits[2].replacement = lastCategory;
-    g_categoryEdits[3].replacement = lastCategory;
+    g_categoryGates[0].bound = categoryCount;         // loader count
+    g_categoryGates[1].bound = categoryCount;         // renderer count
+    g_categoryGates[2].bound = lastCategory;
+    g_categoryEdits[0].replacement = lastCategory;
 
     // Renderer STAYS at 47 — the wheel texture array at obj+0xbc4b8 is EXACTLY 47 entries:
     // obj+0xbc574 (== 0xbc4b8 + 47*4) is the NEXT field (selected-category render state, set
@@ -1769,33 +1810,39 @@ static bool InstallCustomCategoryPatches() {
     // tail so slots 47.. are real memory, then extend the renderer. Only when the object is
     // actually grown (capacity patched); otherwise keep the wheel at 47 (no icon, stable).
     if (g_capacityPatched && g_catTexSmallBase && g_catTexBigBase) {
-        g_categoryEdits[1].replacement  = categoryCount;     // [1] renderer draws 47+N
-        g_categoryEdits[9].replacement  = g_catTexSmallBase; // small base → free tail
-        g_categoryEdits[10].replacement = g_catTexSmallBase;
-        g_categoryEdits[11].replacement = g_catTexBigBase;   // big base → free tail
-        g_categoryEdits[12].replacement = g_catTexBigBase;
+        g_categoryGates[1].bound        = categoryCount;     // renderer draws 47+N
+        g_categoryEdits[8].replacement  = g_catTexSmallBase; // small base → free tail
+        g_categoryEdits[9].replacement  = g_catTexSmallBase;
+        g_categoryEdits[10].replacement = g_catTexBigBase;   // big base → free tail
+        g_categoryEdits[11].replacement = g_catTexBigBase;
     } else {
-        g_categoryEdits[1].replacement  = 47;                // no growth → keep all 47 natives
-        g_categoryEdits[9].replacement  = g_categoryEdits[9].expected;  // no-op (write back)
+        g_categoryGates[1].bound        = 47;                // no growth → keep all 47 natives
+        g_categoryEdits[8].replacement  = g_categoryEdits[8].expected;  // no-op (write back)
+        g_categoryEdits[9].replacement  = g_categoryEdits[9].expected;
         g_categoryEdits[10].replacement = g_categoryEdits[10].expected;
         g_categoryEdits[11].replacement = g_categoryEdits[11].expected;
-        g_categoryEdits[12].replacement = g_categoryEdits[12].expected;
     }
     float span = (float)categoryCount * 100.0f;
     float half = span * 0.5f;
     float negativeHalf = -half;
     float negativeSpanMinusOne = -span - 1.0f;
     float negativeSpanPlusOne = -span + 1.0f;
-    memcpy(&g_categoryEdits[4].replacement, &span, 4);
-    memcpy(&g_categoryEdits[5].replacement, &half, 4);
-    memcpy(&g_categoryEdits[6].replacement, &negativeHalf, 4);
-    memcpy(&g_categoryEdits[7].replacement, &negativeSpanMinusOne, 4);
-    memcpy(&g_categoryEdits[8].replacement, &negativeSpanPlusOne, 4);
+    memcpy(&g_categoryEdits[3].replacement, &span, 4);
+    memcpy(&g_categoryEdits[4].replacement, &half, 4);
+    memcpy(&g_categoryEdits[5].replacement, &negativeHalf, 4);
+    memcpy(&g_categoryEdits[6].replacement, &negativeSpanMinusOne, 4);
+    memcpy(&g_categoryEdits[7].replacement, &negativeSpanPlusOne, 4);
 
     // texture-base redirect REMOVED — that was the crash. Object keeps its own array.
     for (const auto& edit : g_categoryEdits) {
         if (memcmp(Rva(edit.rva), &edit.expected, edit.length) != 0) {
             LogLine("[category] patch validation failed rva=0x%05lx", (unsigned long)edit.rva);
+            return false;
+        }
+    }
+    for (auto& g : g_categoryGates) {
+        if (static_cast<unsigned char*>(Rva(g.rva))[2] != g.expected) {
+            LogLine("[category] gate validation failed rva=0x%05lx", (unsigned long)g.rva);
             return false;
         }
     }
@@ -1806,6 +1853,13 @@ static bool InstallCustomCategoryPatches() {
             return false;
         }
         edit.installed = true;
+    }
+    for (auto& g : g_categoryGates) {
+        if (!InstallGateDetour(g)) {
+            LogLine("[category] gate detour failed rva=0x%05lx", (unsigned long)g.rva);
+            RemoveCustomCategoryPatches();
+            return false;
+        }
     }
     LogLine("[category] native wheel extended categories=%lu custom=%lu slots=%lu..%lu reloc=%d small=0x%lx big=0x%lx",
             static_cast<unsigned long>(categoryCount), static_cast<unsigned long>(g_customCategoryCount),
@@ -1822,6 +1876,7 @@ static bool InstallCustomCategoryPatches() {
 }
 
 static void RemoveCustomCategoryPatches() {
+    for (auto& g : g_categoryGates) RemoveGateDetour(g);
     for (auto& edit : g_categoryEdits) {
         if (!edit.installed) continue;
         WriteMemory(Rva(edit.rva), &edit.original, edit.length);
@@ -2245,10 +2300,10 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
     // memory region in the process -- two thousand of them -- and writes eight log lines, on a path
     // the player hits constantly. Removed; ReportProcessFootprint is still there to call by hand if
     // memory growth ever needs chasing again.
-    // How full the texture pool gets. It is a bump allocator that never frees, patched in the EXE
-    // from 32MB to 512MB, and it is 71% of the process footprint -- so the question for doubling the
-    // library is not whether the catalogue fits (it does, at 154MB) but whether twice the generated
-    // art still fits in here. Reported only when it climbs, so a quiet session says nothing.
+    // How full the .str clip pool (KProfile @0x530c2c, see mod_main) gets within a screen. It is a
+    // bump allocator reset at screen teardown; natives need at most 18MB of it in gameplay and
+    // customs none, and it was 512MB resident until the EXE immediate went back down to 64MB.
+    // Reported only when it climbs, so a quiet session says nothing.
     {
         const uint32_t base = SafeRead32(0x530c2c + 0xc), bump = SafeRead32(0x530c2c + 0x10);
         const uint32_t usedMb = (base && bump >= base) ? ((bump - base) >> 20) : 0;

@@ -3445,7 +3445,18 @@ static std::string directVisualCandidate(const CustomBmsSong& song, const std::s
         path = JoinPath(song.songDir, path);
     if (!isNativeBmsVisual(path) || (!wantedExt.empty() && !endsWith(path, wantedExt.c_str())))
         return std::string();
-    return fileExistsLocal(path) ? path : std::string();
+    // KGraphics::loadBmpTexture (decomp kgraphics2.cpp @0x407c60) reads the WHOLE file into a
+    // static 8 MB buffer at 0x530c48 with no size check, and the texture profile sits right after
+    // it. A BMS stagefile past that (1920x1080 32-bit is 8.3 MB) would overwrite .data, so it is
+    // not served; the generated art stands in.
+    WIN32_FILE_ATTRIBUTE_DATA ad{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &ad)) return std::string();
+    if (ad.nFileSizeHigh || ad.nFileSizeLow >= 0x800000u) {
+        LogLine("[direct] visual '%s' is %lu bytes, past the game's 8MB bmp buffer; skipped",
+                path.c_str(), (unsigned long)ad.nFileSizeLow);
+        return std::string();
+    }
+    return path;
 }
 
 std::string ResolveDirectBmsVisual(const CustomBmsSong& song, const std::string& request) {
@@ -5109,8 +5120,9 @@ static void LogProcessFootprint(const char* why) {
 // Who owns the committed memory.
 //
 // The region walk below says HOW MUCH is committed and of what kind, but not who asked for it, and
-// that is the whole question: the largest single thing in this process is a 512MB private region
-// that never appeared in the VirtualAlloc log. It could not have: our hook patches the IAT of
+// that is the whole question: the largest single thing in this process was a 512MB private region
+// that never appeared in the VirtualAlloc log (it turned out to be the game's .str clip pool,
+// KProfile @0x530c2c, since put back to 64MB -- see mod_main). It could not have: our hook patches the IAT of
 // EZ2B.exe, so a DLL calling VirtualAlloc through its own IAT is invisible -- and a HEAP growing is
 // invisible to IAT hooking altogether, because ntdll does not import the function, it implements it.
 //
