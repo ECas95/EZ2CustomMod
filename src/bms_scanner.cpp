@@ -5546,7 +5546,79 @@ static bool WriteFlatAbmFile(const std::string& abmPath, int w, int h, int bpp, 
     return writeBinaryFile(abmPath, out);
 }
 
+// One renderer at a time. The game thread renders what the cursor needs right now, the art
+// prefetch thread renders what it will need next; the lock keeps them off the same files and
+// makes the GDI+ start-up below a single event.
+static CRITICAL_SECTION g_visualGenLock;
+static bool g_visualGenLockReady = false;
+static void VisualGenLockInit() {
+    if (g_visualGenLockReady) return;
+    InitializeCriticalSection(&g_visualGenLock);
+    g_visualGenLockReady = true;
+}
+struct VisualGenGuard {
+    VisualGenGuard() { VisualGenLockInit(); EnterCriticalSection(&g_visualGenLock); }
+    ~VisualGenGuard() { LeaveCriticalSection(&g_visualGenLock); }
+};
+
+static void GenerateVisualAssetCacheLocked(const CustomBmsSong& song, const char* onlyRole);
 static void GenerateVisualAssetCache(const CustomBmsSong& song, const char* onlyRole = nullptr) {
+    VisualGenGuard guard;
+    GenerateVisualAssetCacheLocked(song, onlyRole);
+}
+
+// ---- art prefetch ------------------------------------------------------------------------------
+static std::vector<std::string> g_artQueue;          // ids still to render, front first
+static CRITICAL_SECTION g_artQueueLock;
+static bool g_artQueueLockReady = false;
+static HANDLE g_artThread = nullptr;
+static volatile LONG g_artBusy = 0;
+
+static DWORD WINAPI artPrefetchProc(void*) {
+    unsigned rendered = 0, seen = 0;
+    const DWORD t0 = GetTickCount();
+    for (;;) {
+        std::string id;
+        EnterCriticalSection(&g_artQueueLock);
+        if (!g_artQueue.empty()) { id = g_artQueue.front(); g_artQueue.erase(g_artQueue.begin()); }
+        LeaveCriticalSection(&g_artQueueLock);
+        if (id.empty()) break;
+        const CustomBmsSong* song = FindCustomSongById(id.c_str());
+        if (!song || song->cacheDir.empty()) continue;
+        ++seen;
+        // Cheap when the files exist: each role checks for its .abm before rendering anything.
+        for (const char* role : {"songname", "discsmall", "disc"}) {
+            const std::string abm = JoinPath(JoinPath(song->cacheDir, role), song->id + ".abm");
+            if (fileExistsLocal(abm)) continue;
+            ensureDir(JoinPath(GetExeDirectory(), Config().cacheRoot));
+            ensureDir(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), song->mode));
+            ensureDir(song->cacheDir);
+            GenerateVisualAssetCache(*song, role);
+            ++rendered;
+        }
+    }
+    if (rendered)
+        LogLine("[artprefetch] %u assets rendered for %u songs in %lu ms", rendered, seen,
+                (unsigned long)(GetTickCount() - t0));
+    InterlockedExchange(&g_artBusy, 0);
+    return 0;
+}
+
+void ArtPrefetchRequest(const std::vector<std::string>& ids) {
+    if (!Config().artPrefetch) return;
+    if (!g_artQueueLockReady) { InitializeCriticalSection(&g_artQueueLock); g_artQueueLockReady = true; }
+    EnterCriticalSection(&g_artQueueLock);
+    g_artQueue = ids;
+    LeaveCriticalSection(&g_artQueueLock);
+    if (InterlockedCompareExchange(&g_artBusy, 1, 0) != 0) return;   // the running thread drains the new list
+    if (g_artThread) { CloseHandle(g_artThread); g_artThread = nullptr; }
+    g_artThread = CreateThread(nullptr, 0, artPrefetchProc, nullptr, CREATE_SUSPENDED, nullptr);
+    if (!g_artThread) { InterlockedExchange(&g_artBusy, 0); return; }
+    SetThreadPriority(g_artThread, THREAD_PRIORITY_BELOW_NORMAL);
+    ResumeThread(g_artThread);
+}
+
+static void GenerateVisualAssetCacheLocked(const CustomBmsSong& song, const char* onlyRole) {
     if (song.cacheDir.empty()) return;
     const bool all = onlyRole == nullptr;
     const std::string role = onlyRole ? onlyRole : "";
@@ -6470,6 +6542,43 @@ static void LogCatalogMemory(const char* why) {
 }
 
 
+// The song-select page holds at most kWheelPageCap rows per category (the visible rows[] sit in
+// the object before the live fields at 0xbc44c, and 872 x 0x374 is where they run into them).
+// Rather than truncate a big folder -- songs quietly missing from the end of the list -- it is
+// published as several wheel categories, "FOLDER 1/3", "FOLDER 2/3" ..., filled in title order.
+// Everything downstream keys on song.category, and the details.txt / bg.png lookups derive the
+// folder from songDir, so a part behaves exactly like a folder of its own. Runs after the
+// auto-generated modes exist, so each mode is split on its own count, and after the scan cache
+// is saved, so the cache keeps the real folder names.
+static const size_t kWheelPageCap = 800;   // under the 872 rows, with the RANDOM row and margin
+
+static void SplitOversizedCategories() {
+    std::map<std::string, std::vector<size_t>> groups;      // "mode\category" (lowered) -> songs
+    for (size_t i = 0; i < g_songs.size(); ++i)
+        groups[lowerCopy(g_songs[i].mode) + "\\" + lowerCopy(g_songs[i].category)].push_back(i);
+    unsigned split = 0;
+    for (auto& g : groups) {
+        std::vector<size_t>& idx = g.second;
+        if (idx.size() <= kWheelPageCap) continue;
+        std::stable_sort(idx.begin(), idx.end(), [](size_t a, size_t b) {
+            return lowerCopy(g_songs[a].title) < lowerCopy(g_songs[b].title);
+        });
+        const size_t parts = (idx.size() + kWheelPageCap - 1) / kWheelPageCap;
+        const size_t per = (idx.size() + parts - 1) / parts;
+        const std::string folder = g_songs[idx[0]].category;
+        for (size_t k = 0; k < idx.size(); ++k) {
+            char name[128];
+            snprintf(name, sizeof(name), "%s %lu/%lu", folder.c_str(), (unsigned long)(k / per + 1), (unsigned long)parts);
+            g_songs[idx[k]].category = name;
+        }
+        LogLine("[category] '%s' (%s) has %lu songs: published as %lu parts of up to %lu",
+                folder.c_str(), g_songs[idx[0]].mode.c_str(), (unsigned long)idx.size(),
+                (unsigned long)parts, (unsigned long)per);
+        ++split;
+    }
+    if (split) DropCatalogueCaches();
+}
+
 void ScanBMSData() {
     // Anything memoised from the catalogue dies with it. The per-mode category lists are keyed on
     // the catalogue's size, and a rescan that happened to land on the same count would otherwise
@@ -6511,6 +6620,7 @@ void ScanBMSData() {
     FindClose(hMode);
     SaveScanCache();          // before the virtual copies exist; only scanned songs are stored
     ExpandAutoGeneratedModes();
+    SplitOversizedCategories();
     LogCatalogOrderCheck();
     // Category labels/splashes are the only generated UI artifacts left. They are shared
     // per category (not per song) and keep the current native wheel integration readable.

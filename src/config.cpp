@@ -53,6 +53,8 @@ ModConfig LoadConfig() {
     cfg.customTop5 = readBool("Gameplay", "CustomTop5", true, ini);
     cfg.hudPanelX = readInt("Gameplay", "HudPanelX", 296, ini);
     cfg.hudPanelY = readInt("Gameplay", "HudPanelY", 86, ini);
+    cfg.fpsLimit = readInt("Gameplay", "FpsLimit", 0, ini);
+    cfg.artPrefetch = readBool("Gameplay", "ArtPrefetch", true, ini);
     cfg.scanCache = readBool("BMSData", "ScanCache", true, ini);
     cfg.enableFunctionTrace = readBool("Debug", "EnableFunctionTrace", true, ini);
     cfg.altEnter = readBool("Video", "AltEnter", true, ini);

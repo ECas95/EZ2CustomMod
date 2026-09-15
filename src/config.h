@@ -24,6 +24,8 @@ struct ModConfig {
     bool constantSpeed = true;     // keep the scroll speed in BPM terms across songs
     bool customTop5 = true;        // show the game's own Top-5 files for custom songs
     int  hudPanelX = 296, hudPanelY = 86;    // where the 320x72 notice lands on the 640x480 screen
+    int  fpsLimit = 0;             // hold frames to 1/N s at the frame end; 0 = the display paces
+    bool artPrefetch = true;       // render a category's wheel art on a background thread
     // Reuse the previous run's BMS parse for folders that have not changed.
     bool scanCache = true;
     bool enableFunctionTrace = true;

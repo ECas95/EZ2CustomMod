@@ -101,6 +101,10 @@ void EnsureSongPreview(const CustomBmsSong& song);   // SongSelect hover preview
 // Direct mode: start decoding the song's compressed keysounds in the background while the cursor
 // rests on it, so the load that follows a confirm finds them ready. Safe to call every frame.
 void KeysoundPrefetchRequest(const char* id);
+// Render the wheel art (songname, small disc, disc) of these songs on a background thread, in the
+// order given, so that browsing the category finds the files instead of rendering them on the
+// game thread. A new list replaces the previous one.
+void ArtPrefetchRequest(const std::vector<std::string>& ids);
 // Direct mode: the per-chart judgement/level .ini the game loads with the chart, by requested name.
 std::string EnsureSongIni(const CustomBmsSong& song, const std::string& requestedName);
 

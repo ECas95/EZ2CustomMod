@@ -128,7 +128,7 @@ static uint32_t g_customCategoryCount = 0;
 
 // Version-label array relocation (details at InstallVersionArrayRelocation below).
 static const uint32_t kVerArrayOrig  = 0xBFFC0;   // 196592 * 4
-static const uint32_t kVerArrayReloc = 0x111000;  // clear of 0x110000/0x110800 (508 bytes each)
+static const uint32_t kVerArrayReloc = 0x111000;  // 1024 entries, clear of the small wheel array at 0x110000
 // Version labels for the kept natives, compacted the same way: 16 of them at slots 0..15.
 // Custom labels still ask for Version_19.bmp upward -- the FILE numbering is untouched, so the
 // redirect in mod_main keeps its base and the native files 16..18 are not shadowed.
@@ -139,7 +139,7 @@ static const uint32_t kVerCustomFile  = 19;        // first custom Version_NN.bm
 //     3A10D  lea edi,[esi+0xBE8D8]         ; its animation object, slot 1
 // (B at 0xBFFC0 drives a different object at +0xBEAF4 slot 2.) Single read site, so one patch.
 static const uint32_t kVerAOrig  = 0xBFF74;
-static const uint32_t kVerAReloc = 0x112000;   // clear of B at 0x111000 (43 entries = 172 bytes)
+static const uint32_t kVerAReloc = 0x112000;   // 1024 entries, clear of B at 0x111000
 static CategoryMemoryEdit g_verAEdits[] = {
     {0x3A107, kVerAOrig, kVerAReloc, 0, 4, false},
 };
@@ -175,7 +175,7 @@ static bool g_verARelocated = false;
 // 0xC0014 = sortstyle[2]. The relocated array drops the bias and is indexed by category directly,
 // so slot N belongs to category N for every N -- natives copied in, customs loaded on top.
 static const uint32_t kSortBiasedOrig = 0xBFFC8;   // [base + cat*4], cat 19..46 -> sortstyle[2..29]
-static const uint32_t kSortReloc      = 0x113000;  // clear of A at 0x112000; 128 entries = 512 bytes
+static const uint32_t kSortReloc      = 0x113000;  // 1024 entries, clear of A at 0x112000
 static const uint32_t kSortNativeLo   = 19;        // first category served out of the array
 static const uint32_t kSortNativeHi   = 46;        // last native one
 
@@ -213,7 +213,10 @@ static const uint32_t kSortNativeHi   = 46;        // last native one
 // natives are slots 0..18 -- the three of them plus the sixteen game eras.
 static const uint32_t kNativeSrcFirst = 0;
 static const uint32_t kCustomCatBase  = 19;        // first wheel slot we own (47 -> 19 -> 16 -> 19)
-static const uint32_t kWheelMax       = 256;       // what the relocated tables hold (kCats); the gates are detoured
+// Every native gate on the index is detoured to an imm32, so this is only what OUR tables hold:
+// the relocated id/count tables (kCats) and the four texture arrays in the object's reloc gap,
+// 1024 entries apiece at 0x110000 / 0x111000 / 0x112000 / 0x113000 / 0x114000.
+static const uint32_t kWheelMax       = 1024;
 static CategoryMemoryEdit g_sortEdits[] = {
     {0x44820, kSortBiasedOrig, kSortReloc, 0, 4, false},
     {0x449BC, kSortBiasedOrig, kSortReloc, 0, 4, false},
@@ -605,7 +608,7 @@ static uint32_t CatCountTable() { return g_catCountBuf ? g_catCountBuf : (kCatCo
 static uint32_t CatNameTable()  { return g_catIdBuf    ? g_catIdBuf    : (kCatNameTableBase  + CatShift()); }
 static void EnsureCategoryTablesRelocated() {
     if (g_catIdBuf) return;
-    const uint32_t kCats = 256;
+    const uint32_t kCats = kWheelMax;
     void* cnt = VirtualAlloc(nullptr, kCats * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     void* ids = VirtualAlloc(nullptr, kCats * kCatNameStride * kCatNameSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!cnt || !ids) { LogLine("[category] reloc alloc FAILED"); return; }
@@ -869,7 +872,7 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     // This is where the category's song list actually lands, so it has to use the SAME base as the
     // icons, counts and overlays -- writing lists at 47 while the wheel draws slot 19 gives a row of
     // categories that exist and are empty.
-    for (size_t ci = 0; ci < categories.size() && (kCustomCatBase + ci) < 256; ++ci) {
+    for (size_t ci = 0; ci < categories.size() && (kCustomCatBase + ci) < kWheelMax; ++ci) {
         const uint32_t cat = kCustomCatBase + (uint32_t)ci;
         uint32_t k = 0, available = 0;
         for (const auto& song : allSongs) {
@@ -1091,6 +1094,13 @@ static uint32_t g_snLastSelected = 0xFFFFFFFFu;
 // Defined with the filter, below; the per-frame hook re-rolls through it.
 static void RollRandomRow(uint32_t obj, uint32_t count);
 
+// A window still being filled: LoadSongnameWindow stops after kWindowLoadsPerFrame texture loads
+// and leaves this set, and the per-frame hook calls it again next frame. Each load is a file open
+// plus a surface (and, for art not yet generated, a GDI+ render), so 23 in one frame was a hitch
+// on every scroll step; a few per frame is invisible.
+static bool g_snWindowPending = false;
+static const unsigned kWindowLoadsPerFrame = 4;
+
 static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible, const char* why) {
     // `selected` arrives straight off the renderer's stack and is NOT always a valid row: entering a
     // native category (LV1, LV2, ...) hands us a frame whose [esp+12] still holds something else.
@@ -1117,7 +1127,13 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
     typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
     LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
     unsigned long loaded = 0, discs = 0, blocked = 0;
-    for (int32_t k = -half; k <= half; ++k) {
+    g_snWindowPending = false;
+    // Outward from the cursor -- 0, -1, +1, -2, +2 ... -- so the rows on screen fill first and the
+    // margin last; with the per-frame budget that order is what the player sees.
+    for (int32_t step = 0; step <= half * 2; ++step) {
+        const int32_t k = (step & 1) ? -((step + 1) / 2) : (step / 2);
+        if (k < -half || k > half) continue;
+        if (loaded + discs >= kWindowLoadsPerFrame) { g_snWindowPending = true; break; }
         // Unconditionally non-negative: `+ visible * 2` only ever compensated for k, so any
         // selected that was out of range still produced a negative remainder.
         int32_t raw = ((int32_t)selected + k) % (int32_t)visible;
@@ -1717,6 +1733,26 @@ static void FrameTimeTick() {
     for (int i = 0; i < kModTimeBuckets; ++i) { g_modTime[i] = 0; g_modCalls[i] = 0; }
 }
 
+// [Gameplay] FpsLimit=N: hold every frame to at least 1/N s. Off (0) by default -- with a 60 Hz
+// display the game's own Flip(DDFLIP_WAIT) paces it -- it is for a display the game cannot sync
+// to. Sleeps down to the last two milliseconds (timeBeginPeriod(1) is already in effect from the
+// game's own start-up), then spins them, so the interval is exact without burning a core.
+static void FpsLimitTick() {
+    const int limit = Config().fpsLimit;
+    if (limit <= 0) return;
+    static long long s_freq = 0, s_next = 0;
+    if (!s_freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_freq = f.QuadPart ? f.QuadPart : 1; }
+    const long long interval = s_freq / limit;
+    long long now = ModTimeNow();
+    if (!s_next || now > s_next + interval) s_next = now;   // first frame, or we fell far behind
+    while (now < s_next) {
+        const long long left = s_next - now;
+        if (left * 1000 > s_freq * 2) Sleep(1); else YieldProcessor();
+        now = ModTimeNow();
+    }
+    s_next += interval;
+}
+
 static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs);
 
 extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, PushadRegs* regs) {
@@ -1743,6 +1779,7 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
             const uint32_t arg = *reinterpret_cast<uint32_t*>(regs->originalEsp + 4 + 4);
             if (arg == 1) {
                 if (GetTickCount() - g_ssFrameStamp < 250) HudPanelDraw();
+                FpsLimitTick();
                 FrameTimeTick();
             }
         }
@@ -1801,6 +1838,8 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
             g_snObject = regs->ecx;
             g_snLastSelected = selected;
             LoadSongnameWindow(regs->ecx, selected, visible, "scroll");
+        } else if (selected < visible && g_snWindowPending) {
+            LoadSongnameWindow(regs->ecx, selected, visible, "continue");
         }
         return; // called every frame; never trace-spam this renderer
     }
@@ -2014,8 +2053,8 @@ static bool InstallSongCapacityPatches(uint32_t newCap) {
     // master[], letting master[] grow (commit-on-inject) without pushing the texarrays into
     // uncommitted memory. 127 categories * 4 bytes each fits easily in the ~0x4AB70 gap.
     if (ok) {
-        g_catTexSmallBase = 0x110000;            // in [0x103540, 0x14E0B0], page-aligned
-        g_catTexBigBase   = 0x110800;
+        g_catTexSmallBase = 0x110000;            // in [0x103540, 0x14E0B0], page-aligned; 1024 x 4
+        g_catTexBigBase   = 0x114000;            // past the version/sortstyle arrays; 1024 x 4
         LogLine("[capacity] category texture arrays in reloc-gap small=0x%lx big=0x%lx (alloc 0x%lx)",
                 (unsigned long)g_catTexSmallBase, (unsigned long)g_catTexBigBase, (unsigned long)allocSize);
     }
@@ -2592,6 +2631,24 @@ static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSele
     g_snObject = obj;
     g_snLastSelected = selected;
     LoadSongnameWindow(obj, selected, written, "category");
+    // Everything else in the category renders on the art thread, cursor outward, so scrolling
+    // finds its files ready instead of paying GDI+ on the game thread per row.
+    if (Config().artPrefetch && written > 1) {
+        std::vector<std::string> ids;
+        ids.reserve(written);
+        for (uint32_t step = 0; step < written * 2; ++step) {
+            const int32_t k = (step & 1) ? -((int32_t)(step + 1) / 2) : (int32_t)(step / 2);
+            int32_t raw = ((int32_t)selected + k) % (int32_t)written;
+            if (raw < 0) raw += (int32_t)written;
+            if (raw == 0) continue;                        // the RANDOM row
+            if (ids.size() >= (size_t)written - 1) break;
+            const char* id = reinterpret_cast<const char*>(obj + kVisibleBase + (uint32_t)raw * kEntryBytes + kEntryIdOff);
+            if (id[0] != 'b' || id[1] != 'm' || id[2] != 's') continue;
+            std::string sid(id, strnlen(id, 15));
+            if (std::find(ids.begin(), ids.end(), sid) == ids.end()) ids.push_back(sid);
+        }
+        ArtPrefetchRequest(ids);
+    }
 
     // Name the category for the overlay: it finds bg.png / ico.png by folder name.
     {
@@ -2933,7 +2990,7 @@ void InstallTraceHooks() {
         }
         uint32_t newCap = 436u + custom + 64u;
         if (newCap < 700u)    newCap = 700u;
-        if (newCap > 60000u)  newCap = 60000u; // 64MB object inflate holds ~70k master entries (LAA=4GB)
+        if (newCap > 150000u) newCap = 150000u; // the object inflate follows newCap: 150k x 884 = 132MB
         InstallSongCapacityPatches(newCap);
     }
     if (customCategory && g_capacityPatched) {
