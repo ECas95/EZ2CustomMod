@@ -807,6 +807,12 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
         // falling back to the lowest available difficulty.
         if (lvl[0] <= 0) lvl[0] = (lvl[1] > 0) ? lvl[1] : (lvl[2] > 0) ? lvl[2] : (lvl[3] > 0) ? lvl[3] : 1;
         for (int i = 0; i < 4; ++i) { float f = (float)(lvl[i] < 0 ? 0 : lvl[i]); SafeWriteBytes(entry + lvlOff[i], &f, 4); }
+        // The EZ column. The difficulty stepper (decomp songselectdiffsel.cpp) lets the cursor rest
+        // on its leftmost column only while the float at entry+0x210 is nonzero -- the tail of the
+        // 0x108-byte name buffer, which no native ever fills. A song with a fifth chart puts its
+        // level there; everything the column then needs (chart, ini, ranking) our hooks key on
+        // the "-ez" suffix, and the level digit is drawn by EzColumnDraw.
+        { float f = (float)(s.levelEZ > 0 ? s.levelEZ : 0); SafeWriteBytes(entry + 0x210, &f, 4); }
 
         // BPM. Same failure as the small disc above: the record is seeded from master[0], so every
         // custom song inherited BABY DANCE's 111 and the whole library read 111 in the wheel.
@@ -1265,6 +1271,7 @@ static void DumpSongSelectStructure(uint32_t ecx, uint32_t param2) {
 
 static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSelection);
 static DWORD g_ssFrameStamp = 0;    // last tick the song-select per-frame hook ran
+static uint32_t g_ssFrameObj = 0;   // and the object it saw
 
 // ---- song-select extras: sort, category jumps, custom Top-5 -----------------------------------
 //
@@ -1362,6 +1369,8 @@ static int SongLevelForColumn(const CustomBmsSong& s, uint32_t column) {
     int lv = column == 1 ? s.levelHD : column == 3 ? s.levelSHD : column == 4 ? s.levelEX : s.levelNM;
     return lv > 0 ? lv : s.levelNM;
 }
+static const uint32_t kColumnCursorVar = 0x4abd14;    // g_4abd14: 0 = the EZ column, 1..4 NM..EX
+
 
 // Reorder one custom category's id list. Always from the folder order, so every mode is a pure
 // function of it and FOLDER ORDER is exact; the page is then re-seeded by the caller.
@@ -1416,13 +1425,13 @@ static void SortCategoryIds(uint32_t cat, int mode, uint32_t column) {
 // five 8-byte names, five scores) and writes it after a play -- for customs too. Its song-select
 // loader (ctor, m430cf0) only ran over the natives, so the custom rows' tables held garbage and the
 // draw had to be suppressed. This is that loader, run for the row the cursor is on.
-static void FillCustomTop5(uint32_t obj, uint32_t row, const char* id) {
+static void FillCustomTop5(uint32_t obj, uint32_t row, const char* id, bool ez) {
     char modeName[64] = {};
     if (!CanReadPtr(reinterpret_cast<void*>(kModeNameVar), 64)) return;
     lstrcpynA(modeName, reinterpret_cast<const char*>(kModeNameVar), 63);
     const uint32_t entry = obj + kVisibleBase + row * kEntryBytes;
     if (!CanReadPtr(reinterpret_cast<void*>(entry), kEntryBytes)) return;
-    static const char* const suffix[5] = {"", "-hd", "", "-shd", "-ex"};
+    const char* const suffix[5] = {ez ? "-ez" : "", "-hd", "", "-shd", "-ex"};
     for (int course = 0; course < 5; ++course) {
         char names[5][8];
         int scores[5];
@@ -1778,7 +1787,7 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
         if (regs) {
             const uint32_t arg = *reinterpret_cast<uint32_t*>(regs->originalEsp + 4 + 4);
             if (arg == 1) {
-                if (GetTickCount() - g_ssFrameStamp < 250) HudPanelDraw();
+                if (GetTickCount() - g_ssFrameStamp < 250) { EzColumnDraw(g_ssFrameObj); HudPanelDraw(); }
                 FpsLimitTick();
                 FrameTimeTick();
             }
@@ -1788,6 +1797,7 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
 
     if (h->rva == 0x33D50 && regs) {
         g_ssFrameStamp = GetTickCount();
+        g_ssFrameObj = regs->ecx;
         // BuildStub does pushfd before pushad, so PUSHAD's saved ESP is function-entry ESP - 4.
         uint32_t functionEsp = regs->originalEsp + 4;
         uint32_t selected = *reinterpret_cast<uint32_t*>(functionEsp + 12);
@@ -1799,11 +1809,13 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
                 // the cursor lands on it; until then (or with the feature off) the draw is
                 // suppressed, since the table bytes come from master[] and mean nothing.
                 static uint32_t s_top5Obj = 0, s_top5Row = 0xFFFFFFFFu;
+                static bool s_top5Ez = false;
                 static char s_top5Id[16] = {};
-                const bool same = s_top5Obj == regs->ecx && s_top5Row == selected && strncmp(s_top5Id, id, 15) == 0;
+                const bool ez = SafeRead32(kColumnCursorVar) == 0;
+                const bool same = s_top5Obj == regs->ecx && s_top5Row == selected && s_top5Ez == ez && strncmp(s_top5Id, id, 15) == 0;
                 if (Config().customTop5 && !same) {
-                    FillCustomTop5(regs->ecx, selected, std::string(id, strnlen(id, 15)).c_str());
-                    s_top5Obj = regs->ecx; s_top5Row = selected;
+                    FillCustomTop5(regs->ecx, selected, std::string(id, strnlen(id, 15)).c_str(), ez);
+                    s_top5Obj = regs->ecx; s_top5Row = selected; s_top5Ez = ez;
                     lstrcpynA(s_top5Id, id, 16);
                 }
                 if (!Config().customTop5) *reinterpret_cast<uint32_t*>(functionEsp + 20) = 0;

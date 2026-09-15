@@ -894,6 +894,8 @@ static const int      kBlendDestColor = 9;                  // with kBlendInvSrc
 
 static void*       g_panelTex = nullptr;
 static void*       g_panelSurf = nullptr;
+static void*       g_ezLabelTex = nullptr;     // the EZ column's label, see EzColumnDraw
+static void*       g_ezLabelSurf = nullptr;    // what it pointed at when loaded: a rebuilt pool changes it
 static void*       g_panelMaskTex = nullptr;
 static void*       g_panelMaskSurf = nullptr;
 static bool        g_panelInitTried = false;
@@ -1117,6 +1119,67 @@ void HudPanelReset() {
     g_panelInitTried = false;
     g_panelDirty = true;
     g_panelVisible = false;
+    g_ezLabelTex = g_ezLabelSurf = nullptr;
+}
+
+// ---- the EZ column -----------------------------------------------------------------------------
+//
+// drawLevels (decomp songselect.cpp @0x4343b0) draws the four level digits at x = 169/249/329/409
+// and, when the cursor sits on the dormant leftmost column (g_4abd14 == 0), draws nothing at all.
+// The column itself is native: the stepper accepts it while the row's entry+0x210 float is set.
+// So this draws what the game leaves out -- the EZ digit at x = 89 always, lit when chosen, and
+// the four native digits (dim) while the cursor is on EZ -- from the game's own digit textures at
+// obj+0xc040c, with the banner's slide (obj+0xc0470) so it rides in and out with the rest.
+void EzColumnDraw(uint32_t obj) {
+    if (!obj) return;
+    const uint32_t* row = nullptr;
+    const uint32_t sel = *reinterpret_cast<uint32_t*>(obj + 0x84);
+    const uint32_t visible = *reinterpret_cast<uint32_t*>(obj + 0x7c);
+    if (sel >= visible) return;
+    row = reinterpret_cast<const uint32_t*>(obj + 0x12c + sel * 0x374);
+    float ez = 0.0f, slide = 0.0f;
+    memcpy(&ez, reinterpret_cast<const char*>(row) + 0x210, 4);
+    memcpy(&slide, reinterpret_cast<const void*>(obj + 0xc0470), 4);
+    if (!(ez > 0.0f && ez < 100.0f)) return;
+    const float y = 207.0f - (512.0f - slide);
+    if (y < -40.0f) return;                              // the banner is out
+    const int column = *reinterpret_cast<int*>(0x4abd14);
+    auto digit = [&](float level) -> uint32_t {
+        int lv = (int)level;
+        if (lv < 0) lv = 0;
+        if (lv > 21) lv = 21;
+        return *reinterpret_cast<uint32_t*>(obj + 0xc040c + (uint32_t)lv * 4);
+    };
+    auto draw     = reinterpret_cast<DrawSpriteFn>(Rva(0x03f80));
+    auto setBlend = reinterpret_cast<SetBlendFn>(Rva(0x0a490));
+    void* ctx = reinterpret_cast<void*>(kRenderCtx);
+    const uint32_t lit = 0xff46e1ffu, dim = 0xffffffffu;
+    setBlend(ctx, kBlendOne, kBlendOne);
+    if (uint32_t t = digit(ez))
+        draw(ctx, t, FloatBits(89.0f), FloatBits(y), 0.0f, 0.0f, column == 0 ? lit : dim);
+    if (column == 0) {
+        const float xs[4] = {169.0f, 249.0f, 329.0f, 409.0f};
+        const uint32_t offs[4] = {0x214, 0x220, 0x22c, 0x238};
+        for (int i = 0; i < 4; ++i) {
+            float lv = 0.0f;
+            memcpy(&lv, reinterpret_cast<const char*>(row) + offs[i], 4);
+            if (uint32_t t = digit(lv)) draw(ctx, t, FloatBits(xs[i]), FloatBits(y), 0.0f, 0.0f, dim);
+        }
+    }
+    // The label, once per pool life: a pooled texture of our own, additive so its black is clear.
+    if (!OverlayTexUsable(g_ezLabelTex, g_ezLabelSurf)) {
+        void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
+        auto loadTexture = reinterpret_cast<DirectLoadTexture_t>(Rva(0x08d00));
+        void* t = nullptr;
+        g_ezLabelTex = g_ezLabelSurf = nullptr;
+        if (renderer && loadTexture(renderer, "system\\disc\\bmslabelez.bmp", &t, "bms-label-ez") && t) {
+            g_ezLabelTex = t;
+            g_ezLabelSurf = *reinterpret_cast<void**>(t);
+        }
+    }
+    if (g_ezLabelTex)
+        draw(ctx, reinterpret_cast<uint32_t>(g_ezLabelTex), FloatBits(90.0f), FloatBits(y - 36.0f), 0.0f, 0.0f, column == 0 ? lit : dim);
+    setBlend(ctx, kBlendOne, kBlendZero);
 }
 
 // ---- song-select BGA preview -------------------------------------------------------------------
@@ -1873,10 +1936,42 @@ static void ApplyConstantSpeed(void* chart, bool custom) {
     g_lastLoadBpm = bpm;
 }
 
+// The EZ column publishes the same plain name as NM (decomp songselecttier.cpp m434de0 maps
+// readout 0 to the bare name), so the column cursor g_4abd14 == 0 is what tells them apart at
+// chart load. The request gets "-ez" before its extension for our own chart pick, and the game's
+// text slot -- which its .ini load and rank files are built from next -- is rewritten to match.
+static std::string EzRequestFor(const char* request) {
+    std::string r = request ? request : "";
+    if (*reinterpret_cast<int*>(0x4abd14) != 0) return r;
+    std::string low = LowerAscii(r);
+    if (low.find("-hd") != std::string::npos || low.find("-shd") != std::string::npos ||
+        low.find("-ex") != std::string::npos || low.find("-ez") != std::string::npos) return r;
+    size_t dot = r.rfind('.');
+    if (dot == std::string::npos) return r;
+    return r.substr(0, dot) + "-ez" + r.substr(dot);
+}
+
+static void PublishEzTextSlot(const char* request) {
+    // g_textSlots[g_elemCount] (decomp modename.cpp): 32 x 128 at 0x1b2ec18, index at 0x1b2e718.
+    const uint32_t elem = *reinterpret_cast<uint32_t*>(0x1b2e718);
+    if (elem >= 32) return;
+    char* slot = reinterpret_cast<char*>(0x1b2ec18 + elem * 128);
+    std::string r = request ? request : "";
+    size_t dash = LowerAscii(r).find("1p-");
+    size_t dot = r.rfind('.');
+    if (dash == std::string::npos || dot == std::string::npos || dot <= dash + 3) return;
+    std::string name = r.substr(dash + 3, dot - dash - 3);      // "<id>-ez"
+    lstrcpynA(slot, name.c_str(), 127);
+    LogLine("[ez] column chosen: text slot -> '%s'", slot);
+}
+
 static int __fastcall HookSongPackage(void* self, void*, const char* request) {
     ResetDirectBmsVideo();
     ResetDirectBmsVideoRuntime();
-    if (LoadCustomBmsDirect(self, request)) {
+    const std::string ezRequest = EzRequestFor(request);
+    const bool ezChosen = ezRequest != (request ? request : "");
+    if (LoadCustomBmsDirect(self, ezChosen ? ezRequest.c_str() : request)) {
+        if (ezChosen) PublishEzTextSlot(ezRequest.c_str());
         ApplyConstantSpeed(self, true);
         const std::string& videoPath = DirectBmsVideoPath();
         if (!videoPath.empty()) {
@@ -2420,6 +2515,10 @@ static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share,
         }
         if (lower.find("bmspanel") != std::string::npos) {
             HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmPanel);
+            if (vh != INVALID_HANDLE_VALUE) return vh;
+        }
+        if (lower.find("bmslabelez") != std::string::npos) {
+            HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmLabelEz);
             if (vh != INVALID_HANDLE_VALUE) return vh;
         }
         if (lower.find("bmsrandom") != std::string::npos) {

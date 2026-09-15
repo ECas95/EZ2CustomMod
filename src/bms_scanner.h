@@ -79,10 +79,14 @@ struct CustomBmsSong {
     int levelHD = 0;
     int levelSHD = 0;
     int levelEX = 0;
+    // The fifth chart, shown in the wheel's dormant leftmost column (see the EZ notes in
+    // trace_hooks/mod_main): the easiest chart of a song that ships five or more.
+    int levelEZ = 0;
     float bpmNM = 0.0f;
     float bpmHD = 0.0f;
     float bpmSHD = 0.0f;
     float bpmEX = 0.0f;
+    float bpmEZ = 0.0f;
 };
 
 void ScanBMSData();
@@ -159,7 +163,9 @@ enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3,
        // Blank grounds for the per-category overlays, at the two sizes they are drawn.
        kCatAbmOverlayBg = 6, kCatAbmOverlayIco = 7,
        // Blank ground for the HUD panel (mod_main HudPanel*), at the size it is drawn.
-       kCatAbmPanel = 8 };
+       kCatAbmPanel = 8,
+       // The "EZ" column label the game's banner does not have.
+       kCatAbmLabelEz = 9 };
 bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int kind,
                               std::vector<unsigned char>& out);
 

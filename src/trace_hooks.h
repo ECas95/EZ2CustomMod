@@ -28,6 +28,10 @@ void HudPanelHide();
 void HudPanelDraw();
 void HudPanelReset();
 
+// The EZ difficulty column: its level digit (and, with the cursor on it, the four the game stops
+// drawing) plus its label, drawn at the end of the song-select frame. Defined in mod_main.
+void EzColumnDraw(uint32_t obj);
+
 // Constant scroll speed: the row the cursor rests on tells its BPM, the chart-load hook applies
 // the speed. Defined in mod_main.
 void ConstantSpeedNoteSelection(float bpm, const char* id);
