@@ -153,7 +153,9 @@ enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3,
        // never has to borrow a texture the game also uses -- see EnsurePreviewSurface.
        kCatAbmPreviewBase = 5,
        // Blank grounds for the per-category overlays, at the two sizes they are drawn.
-       kCatAbmOverlayBg = 6, kCatAbmOverlayIco = 7 };
+       kCatAbmOverlayBg = 6, kCatAbmOverlayIco = 7,
+       // Blank ground for the HUD panel (mod_main HudPanel*), at the size it is drawn.
+       kCatAbmPanel = 8 };
 bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int kind,
                               std::vector<unsigned char>& out);
 

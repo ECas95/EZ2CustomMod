@@ -18,3 +18,16 @@ void BgaPreviewStop(uint32_t obj);
 void CategoryOverlaySetCategory(const char* name);
 void CategoryOverlayDraw();
 void CategoryOverlayReset();
+
+// The mod's notice card in song select (sort mode, category jumps, speed). Defined in mod_main.
+// `hint` is the short amber key label in the corner ("EFX4", "PEDAL+EFX3"); holdMs is how long
+// the card stays fully up before fading.
+void HudPanelShow(const char* title, const char* line, const char* sub, const char* hint,
+                  unsigned long holdMs);
+void HudPanelHide();
+void HudPanelDraw();
+void HudPanelReset();
+
+// Constant scroll speed: the row the cursor rests on tells its BPM, the chart-load hook applies
+// the speed. Defined in mod_main.
+void ConstantSpeedNoteSelection(float bpm, const char* id);

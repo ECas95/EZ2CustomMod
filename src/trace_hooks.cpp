@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <map>
+#include <cstdio>
 
 struct TraceHook {
     const char* name;
@@ -1241,6 +1243,243 @@ static void DumpSongSelectStructure(uint32_t ecx, uint32_t param2) {
 // version and sortstyle arrays. Extracted from the 0x35070 trace hook so the replacement
 // filter (FilterCategoryImpl) can run the same preparation -- it stands in for the original
 // function, so nothing else is left to do it.
+
+static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSelection);
+
+// ---- song-select extras: sort, category jumps, custom Top-5 -----------------------------------
+//
+// The cabinet's inputs in song select, from the decomp (songselectinput.cpp / songselectupdate2.cpp
+// / songselectdiffsel.cpp): slots 4/5 are the Start buttons, 6 = EFX1 opens the option panel
+// (f_20c6bc), 7/8 = EFX2/EFX3 page the category strip while the panel is closed, 9 = EFX4 is only
+// read while the panel is open, and 0x11/0x19 are the pedals, which the pager explicitly refuses to
+// act under. So with the panel closed, EFX4 and PEDAL+EFX2/EFX3 are free, and that is what these
+// use. Nothing native changes: every check the game makes before paging is made here too.
+static const uint32_t kBigInstancePtr = 0x1b2e710;    // Obj40C180* g_bigInstance
+static const uint32_t kModeNameVar    = 0x1b2e680;    // char g_modeName[]
+static const uint32_t kObjOptionPanel = 0x20c6bc;     // f_20c6bc: >0 while the option panel is open
+static const uint32_t kObjSelState    = 0xbfdb4;      // f_bfdb4: 4 browsing, 5 difficulty stepper
+static const uint32_t kObjCatIndex    = 0xbc57c;      // f_bc57c: the strip's category index
+static const uint32_t kObjDiffColumn  = 0x20c6d4;     // f_20c6d4: 0 NM, 1 HD, 3 SHD, 4 EX
+static const uint32_t kObjDiscState   = 0xf8;         // f_f8: 1 = reload the disc art
+static const uint32_t kObjF34         = 0x34;
+static const uint32_t kObjPreviewWait = 0x20e894;     // f_20e894: frames until the preview .wav
+static const uint32_t kObjSndMove     = 0xbfd10;      // EzSoundObject* m_sndMove
+static const uint32_t kObjSndPreview  = 0xbfd20;      // EzSoundObject* m_sndPreview
+static const uint32_t kObjVersionView = 0xbeaf4;      // Obj402860 m_beaf4 (one-line label)
+static const uint32_t kObjSortView    = 0xbed10;      // Obj402860 m_bed10 (two-line overlay)
+static const uint32_t kObjHotNewTex   = 0xc000c;      // KTexture* f_c000c[2]
+static const int kSlotEfx1 = 6, kSlotEfx2 = 7, kSlotEfx3 = 8, kSlotEfx4 = 9, kSlotPedal1 = 0x11, kSlotPedal2 = 0x19;
+static const int kInputPressed = 2, kInputHeld = 3;
+
+static int InputState(int slot) {
+    const uint32_t big = SafeRead32(kBigInstancePtr);
+    if (!big) return 0;
+    return (int)SafeRead32(big + 8 + (uint32_t)slot * 20 + 8);
+}
+
+// A press edge, once: state 2 lasts the whole frame and the draw that hosts this hook can run more
+// than once in it, so the transition is what counts, not the state.
+static bool InputPressed(int slot) {
+    static int s_last[32] = {};
+    const int cur = InputState(slot);
+    const bool edge = cur == kInputPressed && s_last[slot & 31] != kInputPressed;
+    s_last[slot & 31] = cur;
+    return edge;
+}
+
+// m_sndMove->q5(); m_sndMove->q4(0) -- the pager's own blip.
+static void PlayMoveBlip(uint32_t obj) {
+    const uint32_t snd = SafeRead32(obj + kObjSndMove);
+    if (!snd || !CanReadPtr(reinterpret_cast<void*>(snd), 4)) return;
+    const uint32_t vt = SafeRead32(snd);
+    if (!vt || !CanReadPtr(reinterpret_cast<void*>(vt), 6 * 4)) return;
+    typedef void (__thiscall* Stop)(void*);
+    typedef void (__thiscall* Play)(void*, int);
+    reinterpret_cast<Stop>(SafeRead32(vt + 5 * 4))(reinterpret_cast<void*>(snd));
+    reinterpret_cast<Play>(SafeRead32(vt + 4 * 4))(reinterpret_cast<void*>(snd), 0);
+}
+
+// What the pager does after m435070 (decomp m4445c0): the disc reload, the preview restart and the
+// category label animation. Sortstyle/version arrays are the relocated ones, indexed by category.
+static void AfterCategorySeed(uint32_t obj, uint32_t cat) {
+    const uint32_t one = 1, zero = 0;
+    SafeWriteBytes(obj + kObjF34, &one, 4);
+    SafeWriteBytes(obj + kObjDiscState, &one, 4);
+    SafeWriteBytes(obj + kObjPreviewWait, &zero, 4);
+    const uint32_t preview = SafeRead32(obj + kObjSndPreview);
+    if (preview && CanReadPtr(reinterpret_cast<void*>(preview), 4)) {
+        const uint32_t vt = SafeRead32(preview);
+        if (vt && CanReadPtr(reinterpret_cast<void*>(vt), 6 * 4))
+            reinterpret_cast<void (__thiscall*)(void*)>(SafeRead32(vt + 5 * 4))(reinterpret_cast<void*>(preview));
+    }
+    typedef int  (__thiscall* SetCell)(void*, int, int, int);
+    typedef void (__thiscall* Reset)(void*);
+    auto setCell = reinterpret_cast<SetCell>(Rva(0x02910));
+    auto reset   = reinterpret_cast<Reset>(Rva(0x02990));
+    if (cat >= 2 && cat <= 18) {
+        const uint32_t ver = SafeRead32(obj + kVisibleBase + 0x10c + 0x264);   // rows[0].f264
+        const uint32_t tex = g_versionRelocated ? SafeRead32(obj + kVerArrayReloc + ver * 4)
+                                                : SafeRead32(obj + kVerArrayOrig + ver * 4);
+        if (tex) { setCell(reinterpret_cast<void*>(obj + kObjVersionView), 2, 0, (int)tex); reset(reinterpret_cast<void*>(obj + kObjVersionView)); }
+    } else {
+        uint32_t tex = 0;
+        if (cat <= 1) tex = SafeRead32(obj + kObjHotNewTex + cat * 4);
+        else if (g_sortRelocated) tex = SafeRead32(obj + kSortReloc + cat * 4);
+        if (tex) { setCell(reinterpret_cast<void*>(obj + kObjSortView), 2, 0, (int)tex); reset(reinterpret_cast<void*>(obj + kObjSortView)); }
+    }
+}
+
+// ---- sort -------------------------------------------------------------------------------------
+enum SortMode { kSortFolder = 0, kSortLevelUp, kSortLevelDown, kSortTitle, kSortBpm, kSortShuffle, kSortModes };
+static const char* const kSortNames[kSortModes] = {
+    "FOLDER ORDER", "LEVEL  LOW > HIGH", "LEVEL  HIGH > LOW", "TITLE  A > Z", "BPM  SLOW > FAST", "SHUFFLE"
+};
+static int g_sortMode = kSortFolder;
+static std::map<uint32_t, std::vector<std::string>> g_folderOrder;   // category -> ids as injected
+
+static int SongLevelForColumn(const CustomBmsSong& s, uint32_t column) {
+    int lv = column == 1 ? s.levelHD : column == 3 ? s.levelSHD : column == 4 ? s.levelEX : s.levelNM;
+    return lv > 0 ? lv : s.levelNM;
+}
+
+// Reorder one custom category's id list. Always from the folder order, so every mode is a pure
+// function of it and FOLDER ORDER is exact; the page is then re-seeded by the caller.
+static void SortCategoryIds(uint32_t cat, int mode, uint32_t column) {
+    uint32_t count = SafeRead32(CatCountTable() + cat * 4);
+    if (count > kCatNameStride) count = kCatNameStride;
+    const uint32_t base = CatNameTable() + cat * kCatNameStride * kCatNameSize;
+    if (!count || !CanReadPtr(reinterpret_cast<void*>(base), count * kCatNameSize)) return;
+    std::vector<std::string>& folder = g_folderOrder[cat];
+    if (folder.size() != count) {
+        folder.clear();
+        for (uint32_t k = 0; k < count; ++k)
+            folder.push_back(std::string(reinterpret_cast<const char*>(base + k * kCatNameSize), kCatNameSize));
+    }
+    std::vector<std::string> ids = folder;
+    struct Key { std::string id; int level; float bpm; std::string title; };
+    std::vector<Key> keys;
+    keys.reserve(ids.size());
+    for (const std::string& raw : ids) {
+        Key k{raw, 0, 0.0f, std::string()};
+        std::string id = raw.c_str();                       // up to the NUL
+        if (const CustomBmsSong* s = FindCustomSongById(id.c_str())) {
+            k.level = SongLevelForColumn(*s, column);
+            k.bpm = s->bpmNM;
+            k.title = s->title;
+            std::transform(k.title.begin(), k.title.end(), k.title.begin(), [](unsigned char c) { return (char)tolower(c); });
+        }
+        keys.push_back(k);
+    }
+    switch (mode) {
+    case kSortLevelUp:   std::stable_sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) { return a.level < b.level; }); break;
+    case kSortLevelDown: std::stable_sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) { return a.level > b.level; }); break;
+    case kSortTitle:     std::stable_sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) { return a.title < b.title; }); break;
+    case kSortBpm:       std::stable_sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) { return a.bpm < b.bpm; }); break;
+    case kSortShuffle: {
+        // ponytail: LCG seeded from the clock -- a shuffle, not a lottery.
+        uint32_t seed = GetTickCount() ^ (cat * 2654435761u);
+        for (size_t i = keys.size(); i > 1; --i) {
+            seed = seed * 1664525u + 1013904223u;
+            std::swap(keys[i - 1], keys[(seed >> 8) % i]);
+        }
+        break;
+    }
+    default: break;
+    }
+    for (uint32_t k = 0; k < count; ++k)
+        SafeWriteBytes(base + k * kCatNameSize, keys[k].id.data(), kCatNameSize);
+}
+
+// ---- custom Top-5 ------------------------------------------------------------------------------
+// The game keeps a rank file per song and difficulty (sound\rank_<mode>_<id>[-hd|-shd|-ex].bin:
+// five 8-byte names, five scores) and writes it after a play -- for customs too. Its song-select
+// loader (ctor, m430cf0) only ran over the natives, so the custom rows' tables held garbage and the
+// draw had to be suppressed. This is that loader, run for the row the cursor is on.
+static void FillCustomTop5(uint32_t obj, uint32_t row, const char* id) {
+    char modeName[64] = {};
+    if (!CanReadPtr(reinterpret_cast<void*>(kModeNameVar), 64)) return;
+    lstrcpynA(modeName, reinterpret_cast<const char*>(kModeNameVar), 63);
+    const uint32_t entry = obj + kVisibleBase + row * kEntryBytes;
+    if (!CanReadPtr(reinterpret_cast<void*>(entry), kEntryBytes)) return;
+    static const char* const suffix[5] = {"", "-hd", "", "-shd", "-ex"};
+    for (int course = 0; course < 5; ++course) {
+        char names[5][8];
+        int scores[5];
+        for (int i = 0; i < 5; ++i) { memcpy(names[i], "EZ2AC_FN", 8); scores[i] = 0; }
+        if (course != 2) {
+            char path[MAX_PATH];
+            snprintf(path, sizeof(path), "%s\\sound\\rank_%s_%s%s.bin", GetExeDirectory().c_str(), modeName, id, suffix[course]);
+            FILE* f = fopen(path, "rb");
+            if (f) {
+                if (fread(names, 8, 5, f) != 5 || fread(scores, 4, 5, f) != 5) {
+                    for (int i = 0; i < 5; ++i) { memcpy(names[i], "EZ2AC_FN", 8); scores[i] = 0; }
+                }
+                fclose(f);
+            }
+        }
+        SafeWriteBytes(entry + 0x244 + (uint32_t)course * 0x28, names, sizeof(names));
+        SafeWriteBytes(entry + 0x30c + (uint32_t)course * 0x14, scores, sizeof(scores));
+    }
+}
+
+// Per frame in song select, with the object in hand. `selected`/`visible` are validated by the caller.
+static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visible) {
+    // A card that says what the extra keys do, once per song-select entry.
+    static uint32_t s_welcomedObj = 0;
+    if (s_welcomedObj != obj) {
+        s_welcomedObj = obj;
+        if (Config().categorySort && g_customCategoryCount)
+            HudPanelShow("EZ2CustomMod", "EFX4: SORT CATEGORY", "PEDAL + EFX2 / EFX3: JUMP 10 CATEGORIES", "", 3500);
+    }
+    if (!Config().categorySort || !g_customCategoryCount) return;
+    if (SafeRead32(obj + kObjOptionPanel) != 0) return;          // the option panel owns EFX now
+    if (SafeRead32(obj + kObjSelState) != 4) return;             // browsing, not the difficulty stepper
+    const int pedal1 = InputState(kSlotPedal1), pedal2 = InputState(kSlotPedal2);
+    const bool pedal = pedal1 == kInputHeld || pedal1 == kInputPressed || pedal2 == kInputHeld || pedal2 == kInputPressed;
+    const uint32_t cat = SafeRead32(obj + kObjCatIndex);
+    const uint32_t catCount = kCustomCatBase + g_customCategoryCount;
+    const uint32_t column = SafeRead32(obj + kObjDiffColumn);
+
+    // EFX4: cycle the sort of the current custom category.
+    const bool efx4 = InputPressed(kSlotEfx4);
+    if (!pedal && efx4 && cat >= kCustomCatBase && cat < catCount) {
+        g_sortMode = (g_sortMode + 1) % kSortModes;
+        SortCategoryIds(cat, g_sortMode, column);
+        FilterCategoryImpl(obj, cat, 1);                         // keep the cursor on the same song
+        PlayMoveBlip(obj);
+        char sub[96];
+        snprintf(sub, sizeof(sub), "%lu songs  -  EFX4 again for the next order", (unsigned long)(visible ? visible - 1 : 0));
+        HudPanelShow("SORT", kSortNames[g_sortMode], sub, "EFX4", 2200);
+        LogLine("[sort] cat=%lu mode=%d (%s)", (unsigned long)cat, g_sortMode, kSortNames[g_sortMode]);
+        return;
+    }
+    // PEDAL + EFX2 / EFX3: ten categories at a time, wrapping like the pager does.
+    if (pedal && catCount > 1) {
+        int step = 0;
+        const bool efx3 = InputPressed(kSlotEfx3), efx2 = InputPressed(kSlotEfx2);
+        if (efx3) step = 10;
+        else if (efx2) step = -10;
+        if (!step) return;
+        uint32_t next = (uint32_t)(((int)cat + step) % (int)catCount + (int)catCount) % catCount;
+        SafeWriteBytes(obj + kObjCatIndex, &next, 4);
+        if (next >= kCustomCatBase && g_sortMode != kSortFolder) SortCategoryIds(next, g_sortMode, column);
+        FilterCategoryImpl(obj, next, 0);
+        AfterCategorySeed(obj, next);
+        PlayMoveBlip(obj);
+        std::string name;
+        if (next >= kCustomCatBase) {
+            std::vector<std::string> cats = CustomCategoriesForModeOrLargest(GetActiveMode());
+            if (next - kCustomCatBase < cats.size()) name = cats[next - kCustomCatBase];
+        } else {
+            static const char* const natives[19] = {"HOT", "NEW", "ALL", "1ST", "S/E", "2ND", "3RD", "4TH", "PLATINUM", "6TH", "7TH", "CV", "BE", "BERA", "EC", "EV", "AE", "NT", "TT"};
+            name = natives[next];
+        }
+        char sub[96];
+        snprintf(sub, sizeof(sub), "category %lu of %lu", (unsigned long)next + 1, (unsigned long)catCount);
+        HudPanelShow("CATEGORY", name.c_str(), sub, step > 0 ? "PEDAL+EFX3" : "PEDAL+EFX2", 1800);
+    }
+}
+
 static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
     DumpSongSelectStructure(obj, cat);
     InjectCustomSongsIntoSongSelect(obj, "pre-filter", cat);
@@ -1440,6 +1679,7 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
     // Top of the song-select frame: the category overlay goes down before the HUD does.
     if (h->rva == 0x433B9) {
         CategoryOverlayDraw();
+        HudPanelDraw();
         return;                     // runs every frame; never trace-spam this renderer
     }
 
@@ -1448,13 +1688,29 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
         uint32_t functionEsp = regs->originalEsp + 4;
         uint32_t selected = *reinterpret_cast<uint32_t*>(functionEsp + 12);
         uint32_t visible = *reinterpret_cast<uint32_t*>(regs->ecx + 0x7C);
-        if (selected < visible && selected < 436) {
+        if (selected < visible && selected < g_visibleCap) {
             const char* id = reinterpret_cast<const char*>(regs->ecx + 0x238 + selected * 0x374);
             if (id[0] == 'b' && id[1] == 'm' && id[2] == 's') {
-                *reinterpret_cast<uint32_t*>(functionEsp + 20) = 0;
-                static bool logged = false;
-                if (!logged) { logged = true; LogLine("[rank] custom Top-5 suppressed id='%.15s' selected=%lu", id, (unsigned long)selected); }
+                // The row's Top-5 tables are filled from the game's own rank files the first frame
+                // the cursor lands on it; until then (or with the feature off) the draw is
+                // suppressed, since the table bytes come from master[] and mean nothing.
+                static uint32_t s_top5Obj = 0, s_top5Row = 0xFFFFFFFFu;
+                static char s_top5Id[16] = {};
+                const bool same = s_top5Obj == regs->ecx && s_top5Row == selected && strncmp(s_top5Id, id, 15) == 0;
+                if (Config().customTop5 && !same) {
+                    FillCustomTop5(regs->ecx, selected, std::string(id, strnlen(id, 15)).c_str());
+                    s_top5Obj = regs->ecx; s_top5Row = selected;
+                    lstrcpynA(s_top5Id, id, 16);
+                }
+                if (!Config().customTop5) *reinterpret_cast<uint32_t*>(functionEsp + 20) = 0;
             }
+            // Constant speed: the row's BPM for the difficulty column the cursor is in.
+            const uint32_t column = SafeRead32(regs->ecx + kObjDiffColumn);
+            const uint32_t slot = column == 1 ? 1 : column == 3 ? 2 : column == 4 ? 3 : 0;
+            float bpm = 0.0f;
+            memcpy(&bpm, reinterpret_cast<const void*>(regs->ecx + kVisibleBase + selected * kEntryBytes + kEntryBpmOff[slot]), 4);
+            ConstantSpeedNoteSelection(bpm, id);
+            SongSelectExtrasTick(regs->ecx, selected, visible);
         }
         // Selection-driven songname loading. This runs every frame, so it does nothing at all
         // unless the highlighted entry changed -- one comparison in the common case.

@@ -789,9 +789,8 @@ static bool EnsureOverlaySurfaces() {
     return ok;
 }
 
-static bool BlitImageToSurface(void* surface, const std::string& png, int w, int h) {
-    std::vector<unsigned char> px;
-    if (!RenderImageToBgr(png, w, h, px) || px.empty()) return false;
+static bool BlitBgrToSurface(void* surface, const std::vector<unsigned char>& px, int w, int h) {
+    if (px.empty()) return false;
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     info.bmiHeader.biWidth = w;
@@ -808,6 +807,12 @@ static bool BlitImageToSurface(void* surface, const std::string& png, int w, int
                                      DIB_RGB_COLORS, SRCCOPY);
     reinterpret_cast<DirectSurfaceReleaseDC_t>(vt[26])(surface, dc);
     return copied != 0 && (DWORD)copied != GDI_ERROR;
+}
+
+static bool BlitImageToSurface(void* surface, const std::string& png, int w, int h) {
+    std::vector<unsigned char> px;
+    if (!RenderImageToBgr(png, w, h, px) || px.empty()) return false;
+    return BlitBgrToSurface(surface, px, w, h);
 }
 
 // Told by the filter which category the wheel moved to.
@@ -876,6 +881,165 @@ void CategoryOverlayReset() {
     g_ovInitTried = false;
     g_ovCategory.clear();
     g_ovHaveBg = g_ovHaveIco = false;
+    HudPanelReset();
+}
+
+// ---- HUD panel ---------------------------------------------------------------------------------
+//
+// The mod's own notice in song select, in the spirit of the game's option panel: a dark card
+// with a title, a big line and a small line, that slides in when something the player did needs
+// an answer (a sort, a category jump, a speed change), holds, and fades. Same machinery as the
+// category overlays -- one surface of ours behind a pooled texture, drawn through the game's own
+// sprite blitter -- so it costs 90KB for the session and nothing per song.
+static const int kPanelW = 320, kPanelH = 96;
+static const COLORREF kPanelBg     = RGB(11, 18, 32);
+static const COLORREF kPanelAccent = RGB(70, 225, 255);    // the wheel's highlight tint, 0xff46e1ff
+static const COLORREF kPanelTitle  = RGB(70, 225, 255);
+static const COLORREF kPanelText   = RGB(255, 255, 255);
+static const COLORREF kPanelSub    = RGB(190, 200, 215);
+static const COLORREF kPanelHint   = RGB(255, 174, 0);      // the RANDOM row's amber
+static const DWORD    kPanelFadeIn = 120, kPanelFadeOut = 220;
+
+static void*       g_panelTex = nullptr;
+static void*       g_panelSurf = nullptr;
+static bool        g_panelInitTried = false;
+static std::string g_panelTitle, g_panelLine, g_panelSub, g_panelHint;
+static bool        g_panelDirty = false;
+static DWORD       g_panelShownAt = 0, g_panelHoldMs = 0;
+static bool        g_panelVisible = false;
+
+static std::wstring PanelWide(const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (n <= 1) n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(n > 0 ? (size_t)n : 1, L'\0');
+    if (n > 0 && !MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n))
+        MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, &w[0], n);
+    while (!w.empty() && w.back() == L'\0') w.pop_back();
+    return w;
+}
+
+// The card's pixels: GDI into a top-down 24-bit DIB, Arial bold like the rest of the mod's art.
+static bool RenderPanelBgr(std::vector<unsigned char>& out) {
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = kPanelW;
+    info.bmiHeader.biHeight = -kPanelH;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 24;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC hdc = CreateCompatibleDC(nullptr);
+    if (!hdc) return false;
+    HBITMAP bmp = CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp || !bits) { DeleteDC(hdc); return false; }
+    HGDIOBJ oldBmp = SelectObject(hdc, bmp);
+    RECT all = {0, 0, kPanelW, kPanelH};
+    HBRUSH bg = CreateSolidBrush(kPanelBg);
+    FillRect(hdc, &all, bg);
+    DeleteObject(bg);
+    RECT bar = {0, 0, 4, kPanelH};
+    HBRUSH accent = CreateSolidBrush(kPanelAccent);
+    FillRect(hdc, &bar, accent);
+    DeleteObject(accent);
+    SetBkMode(hdc, TRANSPARENT);
+    auto text = [&](const std::string& s, int px, int weight, COLORREF col, RECT r, UINT fmt) {
+        if (s.empty()) return;
+        HFONT font = CreateFontW(-px, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                                 DEFAULT_PITCH | FF_SWISS, L"Arial");
+        HGDIOBJ old = SelectObject(hdc, font);
+        std::wstring w = PanelWide(s);
+        RECT sh = r; OffsetRect(&sh, 1, 1);
+        SetTextColor(hdc, RGB(0, 0, 0));
+        DrawTextW(hdc, w.c_str(), -1, &sh, fmt | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SetTextColor(hdc, col);
+        DrawTextW(hdc, w.c_str(), -1, &r, fmt | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SelectObject(hdc, old);
+        DeleteObject(font);
+    };
+    text(g_panelTitle, 15, FW_BOLD, kPanelTitle, RECT{14, 8, kPanelW - 70, 28}, DT_LEFT);
+    text(g_panelHint,  13, FW_BOLD, kPanelHint,  RECT{kPanelW - 110, 9, kPanelW - 10, 26}, DT_RIGHT);
+    text(g_panelLine,  22, FW_BOLD, kPanelText,  RECT{14, 30, kPanelW - 10, 62}, DT_LEFT);
+    text(g_panelSub,   14, FW_NORMAL, kPanelSub, RECT{14, 64, kPanelW - 10, 88}, DT_LEFT);
+    GdiFlush();
+    out.assign(static_cast<unsigned char*>(bits), static_cast<unsigned char*>(bits) + kPanelW * kPanelH * 3);
+    SelectObject(hdc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(hdc);
+    return true;
+}
+
+static bool EnsurePanelSurface() {
+    if (g_panelTex) return true;
+    if (g_panelInitTried) return false;
+    void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
+    if (!renderer) return false;
+    g_panelInitTried = true;
+    bool ok = MakeOverlaySurface(renderer, "system\\disc\\bmspanel.bmp", "bms-panel",
+                                 kPanelW, kPanelH, &g_panelTex, &g_panelSurf);
+    LogLine("[panel] surface %s", ok ? "ready" : "FAILED");
+    return ok;
+}
+
+// Show (or update) the notice. Calling again while it is up replaces the text and restarts the
+// hold, so a button held down reads as one live card rather than a stack of them.
+void HudPanelShow(const char* title, const char* line, const char* sub, const char* hint, DWORD holdMs) {
+    if (!Config().hudPanel) return;
+    std::string t = title ? title : "", l = line ? line : "", s = sub ? sub : "", h = hint ? hint : "";
+    if (t != g_panelTitle || l != g_panelLine || s != g_panelSub || h != g_panelHint) {
+        g_panelTitle = t; g_panelLine = l; g_panelSub = s; g_panelHint = h;
+        g_panelDirty = true;
+    }
+    const DWORD now = GetTickCount();
+    // A card already fully up just gets its hold restarted; one still fading in keeps its start.
+    if (!g_panelVisible) g_panelShownAt = now;
+    else if (now - g_panelShownAt > kPanelFadeIn) g_panelShownAt = now - kPanelFadeIn;
+    g_panelHoldMs = holdMs;
+    g_panelVisible = true;
+}
+
+void HudPanelHide() { g_panelVisible = false; }
+
+// After the category overlay, so it lands on top of it and under nothing of ours.
+void HudPanelDraw() {
+    if (!g_panelVisible || !Config().hudPanel) return;
+    const DWORD now = GetTickCount();
+    const DWORD age = now - g_panelShownAt;
+    if (age > kPanelFadeIn + g_panelHoldMs + kPanelFadeOut) { g_panelVisible = false; return; }
+    if (!EnsurePanelSurface()) return;
+    if (!OverlayTexUsable(g_panelTex, g_panelSurf)) {
+        void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
+        if (!renderer || !RepointOverlayTexture(renderer, "system\\disc\\bmspanel.bmp", "bms-panel",
+                                                g_panelSurf, &g_panelTex)) return;
+        g_panelDirty = true;                      // the pool was rebuilt; repaint to be safe
+    }
+    if (g_panelDirty) {
+        std::vector<unsigned char> px;
+        if (RenderPanelBgr(px)) BlitBgrToSurface(g_panelSurf, px, kPanelW, kPanelH);
+        g_panelDirty = false;
+    }
+    float k = 1.0f;                               // 0..1 visibility
+    if (age < kPanelFadeIn) k = (float)age / (float)kPanelFadeIn;
+    else if (age > kPanelFadeIn + g_panelHoldMs) k = 1.0f - (float)(age - kPanelFadeIn - g_panelHoldMs) / (float)kPanelFadeOut;
+    if (k < 0.0f) k = 0.0f;
+    if (k > 1.0f) k = 1.0f;
+    const uint32_t alpha = (uint32_t)(k * 0.88f * 255.0f);
+    const float x = (float)Config().hudPanelX;
+    const float y = (float)Config().hudPanelY + (1.0f - k) * 14.0f;   // slides up as it appears
+    auto draw     = reinterpret_cast<DrawSpriteFn>(Rva(0x03f80));
+    auto setBlend = reinterpret_cast<SetBlendFn>(Rva(0x0a490));
+    void* ctx = reinterpret_cast<void*>(kRenderCtx);
+    setBlend(ctx, kBlendSrcAlpha, kBlendInvSrcAlpha);
+    draw(ctx, reinterpret_cast<uint32_t>(g_panelTex), FloatBits(x), FloatBits(y),
+         (float)kPanelW, (float)kPanelH, (alpha << 24) | 0x00FFFFFFu);
+    setBlend(ctx, kBlendOne, kBlendZero);
+}
+
+void HudPanelReset() {
+    g_panelTex = g_panelSurf = nullptr;
+    g_panelInitTried = false;
+    g_panelDirty = true;
+    g_panelVisible = false;
 }
 
 // ---- song-select BGA preview -------------------------------------------------------------------
@@ -1590,10 +1754,48 @@ static void __fastcall HookDirectVideoFrame(void* self, void*) {
     if (RealVideoFrame) RealVideoFrame(self);
 }
 
+// ---- constant scroll speed ---------------------------------------------------------------------
+//
+// The game's speed is a percentage (g_speedPercent @0x1b2e890, 50..999 in steps of 25) that the
+// player adjusts with the effector buttons in play, and it stays as set from song to song -- so a
+// 90 BPM ballad and a 200 BPM chart scroll at the same multiplier. This keeps what the player
+// actually tuned, BPM x speed, constant: each chart load reads the speed the previous song was
+// left at, converts it with that song's BPM, and re-applies it for the new one. The first load of
+// a session changes nothing.
+static const uint32_t kSpeedPercentVar = 0x1b2e890;
+static float g_selBpm = 0.0f;           // the row under the cursor, per song select frame
+static float g_lastLoadBpm = 0.0f;      // the BPM the current speed was tuned against
+
+void ConstantSpeedNoteSelection(float bpm, const char*) {
+    if (bpm > 20.0f && bpm < 1000.0f) g_selBpm = bpm;
+}
+
+static void ApplyConstantSpeed(void* chart, bool custom) {
+    if (!Config().constantSpeed || !chart) return;
+    float bpm = 0.0f;
+    memcpy(&bpm, reinterpret_cast<const char*>(chart) + 0x8c, 4);   // EzChart::f8c
+    if (!(bpm > 20.0f && bpm < 1000.0f)) bpm = g_selBpm;
+    if (!(bpm > 20.0f && bpm < 1000.0f)) return;
+    int* speed = reinterpret_cast<int*>(kSpeedPercentVar);
+    if (IsBadReadPtr(speed, 4) || IsBadWritePtr(speed, 4)) return;
+    const int before = *speed;
+    if (g_lastLoadBpm > 0.0f && before >= 50 && before <= 999) {
+        const float effective = (float)before * g_lastLoadBpm;      // percent x BPM, the tuned value
+        int want = (int)(effective / bpm + 12.5f) / 25 * 25;
+        if (want < 50) want = 50;
+        if (want > 999) want = 999;
+        if (want != before) *speed = want;
+        LogLine("[speed] %s bpm %.1f -> %.1f: speed %d%% -> %d%% (keeps %.0f BPM-equivalent)",
+                custom ? "custom" : "native", g_lastLoadBpm, bpm, before, want, effective / 100.0f);
+    }
+    g_lastLoadBpm = bpm;
+}
+
 static int __fastcall HookSongPackage(void* self, void*, const char* request) {
     ResetDirectBmsVideo();
     ResetDirectBmsVideoRuntime();
     if (LoadCustomBmsDirect(self, request)) {
+        ApplyConstantSpeed(self, true);
         const std::string& videoPath = DirectBmsVideoPath();
         if (!videoPath.empty()) {
             lstrcpynA(g_directVideoPath, videoPath.c_str(), MAX_PATH);
@@ -1606,7 +1808,9 @@ static int __fastcall HookSongPackage(void* self, void*, const char* request) {
     }
     ResetDirectBmsVideo();
     ResetDirectBmsVideoRuntime();
-    return RealSongPackage ? RealSongPackage(self, request) : 0;
+    const int r = RealSongPackage ? RealSongPackage(self, request) : 0;
+    if (r) ApplyConstantSpeed(self, false);
+    return r;
 }
 
 static bool InstallDirectBmsHook() {
@@ -2121,6 +2325,10 @@ static HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPS
         }
         if (lower.find("bmspreviewbase") != std::string::npos) {
             HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmPreviewBase);
+            if (vh != INVALID_HANDLE_VALUE) return vh;
+        }
+        if (lower.find("bmspanel") != std::string::npos) {
+            HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmPanel);
             if (vh != INVALID_HANDLE_VALUE) return vh;
         }
         if (lower.find("bmsrandom") != std::string::npos) {

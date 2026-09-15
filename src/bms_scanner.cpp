@@ -5027,6 +5027,9 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
     if (kind == kCatAbmOverlayIco)
         return RenderSplashBytes(out, std::string(), std::string(), 480, 480, true, false) &&
                AbmFromBmpBytes(out);
+    if (kind == kCatAbmPanel)
+        return RenderSplashBytes(out, std::string(), std::string(), 320, 96, true, false) &&
+               AbmFromBmpBytes(out);
 
     std::vector<std::string> cats = GetCustomBmsCategoriesForMode(mode);
     if (categoryIndex >= cats.size()) return false;
