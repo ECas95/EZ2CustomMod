@@ -54,6 +54,9 @@ static TraceHook g_hooks[] = {
     {"FUN_00457A90 Ranking UI",         0x57A90, 7, true},
     {"FUN_00433D50 SongSelect top5 draw",0x33D50,9, true},
     {"SongSelect after-background",0x433B9,7, true},
+    // Obj40BB00::doOp7 @0x40a470 (decomp com_wrappers.cpp): every phase of the song-select draw
+    // ends in doOp7(1). Hooked so the mod's notice card can be drawn after the HUD, on top.
+    {"FUN_0040A470 frame end",      0x0A470, 7, true},
     {"FUN_00435070 SongSelect list/filter",0x35070,5, true},
     // 0x35390 hook tried & REVERTED: at its ENTRY the master array isn't built yet
     // (435390 itself parses ALLSONG then preloads), so our inject bailed (master=0) and
@@ -1245,6 +1248,7 @@ static void DumpSongSelectStructure(uint32_t ecx, uint32_t param2) {
 // function, so nothing else is left to do it.
 
 static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSelection);
+static DWORD g_ssFrameStamp = 0;    // last tick the song-select per-frame hook ran
 
 // ---- song-select extras: sort, category jumps, custom Top-5 -----------------------------------
 //
@@ -1429,7 +1433,7 @@ static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visib
     if (s_welcomedObj != obj) {
         s_welcomedObj = obj;
         if (Config().categorySort && g_customCategoryCount)
-            HudPanelShow("EZ2CustomMod", "EFX4: SORT CATEGORY", "PEDAL + EFX2 / EFX3: JUMP 10 CATEGORIES", "", 3500);
+            HudPanelShow("EZ2CustomMod", "SORT CATEGORY", "PEDAL + E2 / E3 : JUMP 10 CATEGORIES", "E4", 3500);
     }
     if (!Config().categorySort || !g_customCategoryCount) return;
     if (SafeRead32(obj + kObjOptionPanel) != 0) return;          // the option panel owns EFX now
@@ -1448,8 +1452,8 @@ static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visib
         FilterCategoryImpl(obj, cat, 1);                         // keep the cursor on the same song
         PlayMoveBlip(obj);
         char sub[96];
-        snprintf(sub, sizeof(sub), "%lu songs  -  EFX4 again for the next order", (unsigned long)(visible ? visible - 1 : 0));
-        HudPanelShow("SORT", kSortNames[g_sortMode], sub, "EFX4", 2200);
+        snprintf(sub, sizeof(sub), "%lu songs  -  E4 again for the next order", (unsigned long)(visible ? visible - 1 : 0));
+        HudPanelShow("SORT", kSortNames[g_sortMode], sub, "E4", 2200);
         LogLine("[sort] cat=%lu mode=%d (%s)", (unsigned long)cat, g_sortMode, kSortNames[g_sortMode]);
         return;
     }
@@ -1476,7 +1480,7 @@ static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visib
         }
         char sub[96];
         snprintf(sub, sizeof(sub), "category %lu of %lu", (unsigned long)next + 1, (unsigned long)catCount);
-        HudPanelShow("CATEGORY", name.c_str(), sub, step > 0 ? "PEDAL+EFX3" : "PEDAL+EFX2", 1800);
+        HudPanelShow("CATEGORY", name.c_str(), sub, step > 0 ? "PEDAL+E3" : "PEDAL+E2", 1800);
     }
 }
 
@@ -1679,11 +1683,20 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
     // Top of the song-select frame: the category overlay goes down before the HUD does.
     if (h->rva == 0x433B9) {
         CategoryOverlayDraw();
-        HudPanelDraw();
         return;                     // runs every frame; never trace-spam this renderer
+    }
+    // End of a frame: doOp7(1). Only song select's frames -- the ones the per-frame hook below has
+    // stamped in the last few ticks -- get the card; other screens pass through untouched.
+    if (h->rva == 0x0A470) {
+        if (regs) {
+            const uint32_t arg = *reinterpret_cast<uint32_t*>(regs->originalEsp + 4 + 4);
+            if (arg == 1 && GetTickCount() - g_ssFrameStamp < 250) HudPanelDraw();
+        }
+        return;
     }
 
     if (h->rva == 0x33D50 && regs) {
+        g_ssFrameStamp = GetTickCount();
         // BuildStub does pushfd before pushad, so PUSHAD's saved ESP is function-entry ESP - 4.
         uint32_t functionEsp = regs->originalEsp + 4;
         uint32_t selected = *reinterpret_cast<uint32_t*>(functionEsp + 12);

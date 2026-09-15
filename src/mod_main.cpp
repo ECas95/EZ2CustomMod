@@ -886,22 +886,33 @@ void CategoryOverlayReset() {
 
 // ---- HUD panel ---------------------------------------------------------------------------------
 //
-// The mod's own notice in song select, in the spirit of the game's option panel: a dark card
-// with a title, a big line and a small line, that slides in when something the player did needs
-// an answer (a sort, a category jump, a speed change), holds, and fades. Same machinery as the
-// category overlays -- one surface of ours behind a pooled texture, drawn through the game's own
-// sprite blitter -- so it costs 90KB for the session and nothing per song.
-static const int kPanelW = 320, kPanelH = 96;
-static const COLORREF kPanelBg     = RGB(11, 18, 32);
-static const COLORREF kPanelAccent = RGB(70, 225, 255);    // the wheel's highlight tint, 0xff46e1ff
-static const COLORREF kPanelTitle  = RGB(70, 225, 255);
-static const COLORREF kPanelText   = RGB(255, 255, 255);
-static const COLORREF kPanelSub    = RGB(190, 200, 215);
-static const COLORREF kPanelHint   = RGB(255, 174, 0);      // the RANDOM row's amber
+// The mod's own notice in song select, built the way the game builds its panels (decoded from
+// System\SongSelect: TT_course_notice1, TT_UseKey2_panel, Rank\p_rank_panel + _mask): a rounded
+// black card with a thin grey border, cyan title, white bold body behind a yellow triangle, and the
+// red key badges the game itself uses for the effector buttons. Two textures, drawn like the
+// natives draw theirs: the MASK first with the (DESTCOLOR, INVSRCALPHA) pair, which multiplies the
+// background down to near black inside the shape and leaves it alone outside, then the ART with the
+// additive pair, where black adds nothing -- so the corners are round and the fade is a modulation
+// colour, with no alpha channel anywhere. Drawn at the end of the song-select frame (doOp7(1)), so
+// it lands on top of the HUD.
+static const int kPanelW = 320, kPanelH = 72;
+static const int kPanelRadius = 9;
+static const COLORREF kPanelFill    = RGB(12, 14, 20);
+static const COLORREF kPanelBorder  = RGB(110, 114, 120);   // the key panel's grey rim
+static const COLORREF kPanelTitle   = RGB(50, 214, 255);    // "CATEGORY 01" cyan
+static const COLORREF kPanelText    = RGB(255, 255, 255);
+static const COLORREF kPanelSub     = RGB(200, 204, 210);
+static const COLORREF kPanelArrow   = RGB(255, 208, 0);     // the effector rows' triangle
+static const COLORREF kBadgeRed     = RGB(190, 16, 26), kBadgeRedHi = RGB(236, 40, 52), kBadgeRedRim = RGB(90, 8, 12);
+static const COLORREF kBadgeGrey    = RGB(110, 114, 122), kBadgeGreyHi = RGB(160, 164, 172), kBadgeGreyRim = RGB(50, 52, 56);
+static const COLORREF kMaskInside   = RGB(30, 30, 30);      // what the background is multiplied by
 static const DWORD    kPanelFadeIn = 120, kPanelFadeOut = 220;
+static const int      kBlendDestColor = 9;                  // with kBlendInvSrcAlpha: the mask pair
 
 static void*       g_panelTex = nullptr;
 static void*       g_panelSurf = nullptr;
+static void*       g_panelMaskTex = nullptr;
+static void*       g_panelMaskSurf = nullptr;
 static bool        g_panelInitTried = false;
 static std::string g_panelTitle, g_panelLine, g_panelSub, g_panelHint;
 static bool        g_panelDirty = false;
@@ -918,8 +929,72 @@ static std::wstring PanelWide(const std::string& s) {
     return w;
 }
 
-// The card's pixels: GDI into a top-down 24-bit DIB, Arial bold like the rest of the mod's art.
-static bool RenderPanelBgr(std::vector<unsigned char>& out) {
+static HFONT PanelFont(int px, int weight) {
+    // Slightly condensed, like the game's own sprite type.
+    return CreateFontW(-px, (int)(px * 0.42f), 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                       DEFAULT_PITCH | FF_SWISS, L"Arial");
+}
+
+static void PanelText(HDC hdc, const std::string& s, int px, int weight, COLORREF col, RECT r, UINT fmt, bool shadow) {
+    if (s.empty()) return;
+    HFONT font = PanelFont(px, weight);
+    HGDIOBJ old = SelectObject(hdc, font);
+    std::wstring w = PanelWide(s);
+    if (shadow) {
+        RECT sh = r; OffsetRect(&sh, 1, 1);
+        SetTextColor(hdc, RGB(0, 0, 0));
+        DrawTextW(hdc, w.c_str(), -1, &sh, fmt | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+    SetTextColor(hdc, col);
+    DrawTextW(hdc, w.c_str(), -1, &r, fmt | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(hdc, old);
+    DeleteObject(font);
+}
+
+// A key badge in the game's style: glossy rounded square, white bold glyph. Red for the effector
+// buttons, grey for the pedal. Returns the width used.
+static int PanelBadge(HDC hdc, int x, int y, const std::string& label, bool red) {
+    const int h = 15;
+    const int w = label.size() <= 2 ? 19 : 8 + (int)label.size() * 7;
+    HBRUSH rim = CreateSolidBrush(red ? kBadgeRedRim : kBadgeGreyRim);
+    HBRUSH lo  = CreateSolidBrush(red ? kBadgeRed : kBadgeGrey);
+    HBRUSH hi  = CreateSolidBrush(red ? kBadgeRedHi : kBadgeGreyHi);
+    HPEN   none = (HPEN)GetStockObject(NULL_PEN);
+    HGDIOBJ oldPen = SelectObject(hdc, none);
+    HGDIOBJ oldBrush = SelectObject(hdc, rim);
+    RoundRect(hdc, x, y, x + w + 1, y + h + 1, 5, 5);
+    SelectObject(hdc, lo);
+    RoundRect(hdc, x + 1, y + 1, x + w, y + h, 4, 4);
+    SelectObject(hdc, hi);
+    RECT top = {x + 2, y + 2, x + w - 1, y + h / 2};
+    FillRect(hdc, &top, hi);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(rim); DeleteObject(lo); DeleteObject(hi);
+    PanelText(hdc, label, 10, FW_BOLD, RGB(255, 255, 255), RECT{x, y, x + w, y + h}, DT_CENTER | DT_VCENTER, false);
+    return w;
+}
+
+// "E4", "PEDAL+E3": badges joined by a small plus, laid out right-to-left from `right`.
+static void PanelHint(HDC hdc, const std::string& hint, int right, int y) {
+    std::vector<std::string> parts;
+    std::string cur;
+    for (char c : hint) { if (c == '+') { parts.push_back(cur); cur.clear(); } else cur += c; }
+    if (!cur.empty()) parts.push_back(cur);
+    int width = 0;
+    for (size_t i = 0; i < parts.size(); ++i) width += (parts[i].size() <= 2 ? 19 : 8 + (int)parts[i].size() * 7) + (i ? 10 : 0);
+    int x = right - width;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i) { PanelText(hdc, "+", 11, FW_BOLD, kPanelText, RECT{x - 1, y - 1, x + 10, y + 15}, DT_CENTER | DT_VCENTER, false); x += 10; }
+        const bool red = parts[i].size() <= 2;      // E1..E4; anything longer is the pedal
+        x += PanelBadge(hdc, x, y, parts[i], red);
+    }
+}
+
+// Both textures' pixels: the art (black outside the card, content inside) and the mask (white
+// outside, dark inside). GDI into top-down 24-bit DIBs.
+static bool RenderPanelBgr(std::vector<unsigned char>& art, std::vector<unsigned char>& mask) {
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     info.bmiHeader.biWidth = kPanelW;
@@ -927,57 +1002,70 @@ static bool RenderPanelBgr(std::vector<unsigned char>& out) {
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 24;
     info.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
     HDC hdc = CreateCompatibleDC(nullptr);
     if (!hdc) return false;
-    HBITMAP bmp = CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bmp || !bits) { DeleteDC(hdc); return false; }
-    HGDIOBJ oldBmp = SelectObject(hdc, bmp);
-    RECT all = {0, 0, kPanelW, kPanelH};
-    HBRUSH bg = CreateSolidBrush(kPanelBg);
-    FillRect(hdc, &all, bg);
-    DeleteObject(bg);
-    RECT bar = {0, 0, 4, kPanelH};
-    HBRUSH accent = CreateSolidBrush(kPanelAccent);
-    FillRect(hdc, &bar, accent);
-    DeleteObject(accent);
-    SetBkMode(hdc, TRANSPARENT);
-    auto text = [&](const std::string& s, int px, int weight, COLORREF col, RECT r, UINT fmt) {
-        if (s.empty()) return;
-        HFONT font = CreateFontW(-px, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                                 DEFAULT_PITCH | FF_SWISS, L"Arial");
-        HGDIOBJ old = SelectObject(hdc, font);
-        std::wstring w = PanelWide(s);
-        RECT sh = r; OffsetRect(&sh, 1, 1);
-        SetTextColor(hdc, RGB(0, 0, 0));
-        DrawTextW(hdc, w.c_str(), -1, &sh, fmt | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        SetTextColor(hdc, col);
-        DrawTextW(hdc, w.c_str(), -1, &r, fmt | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        SelectObject(hdc, old);
-        DeleteObject(font);
-    };
-    text(g_panelTitle, 15, FW_BOLD, kPanelTitle, RECT{14, 8, kPanelW - 70, 28}, DT_LEFT);
-    text(g_panelHint,  13, FW_BOLD, kPanelHint,  RECT{kPanelW - 110, 9, kPanelW - 10, 26}, DT_RIGHT);
-    text(g_panelLine,  22, FW_BOLD, kPanelText,  RECT{14, 30, kPanelW - 10, 62}, DT_LEFT);
-    text(g_panelSub,   14, FW_NORMAL, kPanelSub, RECT{14, 64, kPanelW - 10, 88}, DT_LEFT);
-    GdiFlush();
-    out.assign(static_cast<unsigned char*>(bits), static_cast<unsigned char*>(bits) + kPanelW * kPanelH * 3);
-    SelectObject(hdc, oldBmp);
-    DeleteObject(bmp);
+    bool ok = true;
+    for (int pass = 0; pass < 2 && ok; ++pass) {
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!bmp || !bits) { ok = false; break; }
+        HGDIOBJ oldBmp = SelectObject(hdc, bmp);
+        RECT all = {0, 0, kPanelW, kPanelH};
+        HBRUSH ground = CreateSolidBrush(pass == 0 ? RGB(0, 0, 0) : RGB(255, 255, 255));
+        FillRect(hdc, &all, ground);
+        DeleteObject(ground);
+        HPEN none = (HPEN)GetStockObject(NULL_PEN);
+        HGDIOBJ oldPen = SelectObject(hdc, none);
+        if (pass == 1) {
+            HBRUSH inside = CreateSolidBrush(kMaskInside);
+            HGDIOBJ ob = SelectObject(hdc, inside);
+            RoundRect(hdc, 0, 0, kPanelW + 1, kPanelH + 1, kPanelRadius * 2, kPanelRadius * 2);
+            SelectObject(hdc, ob);
+            DeleteObject(inside);
+        } else {
+            HBRUSH rim = CreateSolidBrush(kPanelBorder);
+            HGDIOBJ ob = SelectObject(hdc, rim);
+            RoundRect(hdc, 0, 0, kPanelW + 1, kPanelH + 1, kPanelRadius * 2, kPanelRadius * 2);
+            HBRUSH fill = CreateSolidBrush(kPanelFill);
+            SelectObject(hdc, fill);
+            RoundRect(hdc, 2, 2, kPanelW - 1, kPanelH - 1, kPanelRadius * 2 - 3, kPanelRadius * 2 - 3);
+            SelectObject(hdc, ob);
+            DeleteObject(rim); DeleteObject(fill);
+            SetBkMode(hdc, TRANSPARENT);
+            PanelText(hdc, g_panelTitle, 14, FW_BOLD, kPanelTitle, RECT{14, 7, kPanelW - 120, 24}, DT_LEFT, true);
+            PanelHint(hdc, g_panelHint, kPanelW - 14, 6);
+            // The triangle the effector rows put before their text.
+            POINT tri[3] = {{14, 30}, {14, 42}, {22, 36}};
+            HBRUSH arrow = CreateSolidBrush(kPanelArrow);
+            HGDIOBJ oa = SelectObject(hdc, arrow);
+            Polygon(hdc, tri, 3);
+            SelectObject(hdc, oa);
+            DeleteObject(arrow);
+            PanelText(hdc, g_panelLine, 19, FW_BOLD, kPanelText, RECT{28, 24, kPanelW - 12, 49}, DT_LEFT, true);
+            PanelText(hdc, g_panelSub, 12, FW_NORMAL, kPanelSub, RECT{28, 50, kPanelW - 12, 66}, DT_LEFT, true);
+        }
+        SelectObject(hdc, oldPen);
+        GdiFlush();
+        std::vector<unsigned char>& out = pass == 0 ? art : mask;
+        out.assign(static_cast<unsigned char*>(bits), static_cast<unsigned char*>(bits) + kPanelW * kPanelH * 3);
+        SelectObject(hdc, oldBmp);
+        DeleteObject(bmp);
+    }
     DeleteDC(hdc);
-    return true;
+    return ok;
 }
 
 static bool EnsurePanelSurface() {
-    if (g_panelTex) return true;
+    if (g_panelTex && g_panelMaskTex) return true;
     if (g_panelInitTried) return false;
     void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
     if (!renderer) return false;
     g_panelInitTried = true;
     bool ok = MakeOverlaySurface(renderer, "system\\disc\\bmspanel.bmp", "bms-panel",
-                                 kPanelW, kPanelH, &g_panelTex, &g_panelSurf);
-    LogLine("[panel] surface %s", ok ? "ready" : "FAILED");
+                                 kPanelW, kPanelH, &g_panelTex, &g_panelSurf) &&
+              MakeOverlaySurface(renderer, "system\\disc\\bmspanelmask.bmp", "bms-panel-mask",
+                                 kPanelW, kPanelH, &g_panelMaskTex, &g_panelMaskSurf);
+    LogLine("[panel] surfaces %s", ok ? "ready" : "FAILED");
     return ok;
 }
 
@@ -1000,22 +1088,27 @@ void HudPanelShow(const char* title, const char* line, const char* sub, const ch
 
 void HudPanelHide() { g_panelVisible = false; }
 
-// After the category overlay, so it lands on top of it and under nothing of ours.
+// Called at the end of the song-select frame, after the HUD.
 void HudPanelDraw() {
     if (!g_panelVisible || !Config().hudPanel) return;
     const DWORD now = GetTickCount();
     const DWORD age = now - g_panelShownAt;
     if (age > kPanelFadeIn + g_panelHoldMs + kPanelFadeOut) { g_panelVisible = false; return; }
     if (!EnsurePanelSurface()) return;
-    if (!OverlayTexUsable(g_panelTex, g_panelSurf)) {
+    if (!OverlayTexUsable(g_panelTex, g_panelSurf) || !OverlayTexUsable(g_panelMaskTex, g_panelMaskSurf)) {
         void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
-        if (!renderer || !RepointOverlayTexture(renderer, "system\\disc\\bmspanel.bmp", "bms-panel",
-                                                g_panelSurf, &g_panelTex)) return;
+        if (!renderer) return;
+        if (!RepointOverlayTexture(renderer, "system\\disc\\bmspanel.bmp", "bms-panel", g_panelSurf, &g_panelTex) ||
+            !RepointOverlayTexture(renderer, "system\\disc\\bmspanelmask.bmp", "bms-panel-mask", g_panelMaskSurf, &g_panelMaskTex))
+            return;
         g_panelDirty = true;                      // the pool was rebuilt; repaint to be safe
     }
     if (g_panelDirty) {
-        std::vector<unsigned char> px;
-        if (RenderPanelBgr(px)) BlitBgrToSurface(g_panelSurf, px, kPanelW, kPanelH);
+        std::vector<unsigned char> art, mask;
+        if (RenderPanelBgr(art, mask)) {
+            BlitBgrToSurface(g_panelSurf, art, kPanelW, kPanelH);
+            BlitBgrToSurface(g_panelMaskSurf, mask, kPanelW, kPanelH);
+        }
         g_panelDirty = false;
     }
     float k = 1.0f;                               // 0..1 visibility
@@ -1023,20 +1116,22 @@ void HudPanelDraw() {
     else if (age > kPanelFadeIn + g_panelHoldMs) k = 1.0f - (float)(age - kPanelFadeIn - g_panelHoldMs) / (float)kPanelFadeOut;
     if (k < 0.0f) k = 0.0f;
     if (k > 1.0f) k = 1.0f;
-    const uint32_t alpha = (uint32_t)(k * 0.88f * 255.0f);
+    const uint32_t a = (uint32_t)(k * 255.0f);
+    const uint32_t grey = (a << 24) | (a << 16) | (a << 8) | a;   // fades both passes, see above
     const float x = (float)Config().hudPanelX;
-    const float y = (float)Config().hudPanelY + (1.0f - k) * 14.0f;   // slides up as it appears
+    const float y = (float)Config().hudPanelY - (1.0f - k) * 10.0f;   // settles down as it appears
     auto draw     = reinterpret_cast<DrawSpriteFn>(Rva(0x03f80));
     auto setBlend = reinterpret_cast<SetBlendFn>(Rva(0x0a490));
     void* ctx = reinterpret_cast<void*>(kRenderCtx);
-    setBlend(ctx, kBlendSrcAlpha, kBlendInvSrcAlpha);
-    draw(ctx, reinterpret_cast<uint32_t>(g_panelTex), FloatBits(x), FloatBits(y),
-         (float)kPanelW, (float)kPanelH, (alpha << 24) | 0x00FFFFFFu);
+    setBlend(ctx, kBlendDestColor, kBlendInvSrcAlpha);
+    draw(ctx, reinterpret_cast<uint32_t>(g_panelMaskTex), FloatBits(x), FloatBits(y), (float)kPanelW, (float)kPanelH, grey);
+    setBlend(ctx, kBlendOne, kBlendOne);
+    draw(ctx, reinterpret_cast<uint32_t>(g_panelTex), FloatBits(x), FloatBits(y), (float)kPanelW, (float)kPanelH, grey);
     setBlend(ctx, kBlendOne, kBlendZero);
 }
 
 void HudPanelReset() {
-    g_panelTex = g_panelSurf = nullptr;
+    g_panelTex = g_panelSurf = g_panelMaskTex = g_panelMaskSurf = nullptr;
     g_panelInitTried = false;
     g_panelDirty = true;
     g_panelVisible = false;

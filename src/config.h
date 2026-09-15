@@ -23,7 +23,7 @@ struct ModConfig {
     bool categorySort = true;      // EFX4 cycles the sort of the current custom category
     bool constantSpeed = true;     // keep the scroll speed in BPM terms across songs
     bool customTop5 = true;        // show the game's own Top-5 files for custom songs
-    int  hudPanelX = 160, hudPanelY = 372;   // where the 320x96 notice lands on the 640x480 screen
+    int  hudPanelX = 296, hudPanelY = 86;    // where the 320x72 notice lands on the 640x480 screen
     // Reuse the previous run's BMS parse for folders that have not changed.
     bool scanCache = true;
     bool enableFunctionTrace = true;

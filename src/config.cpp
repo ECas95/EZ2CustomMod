@@ -51,8 +51,8 @@ ModConfig LoadConfig() {
     cfg.categorySort = readBool("Gameplay", "CategorySort", true, ini);
     cfg.constantSpeed = readBool("Gameplay", "ConstantSpeed", true, ini);
     cfg.customTop5 = readBool("Gameplay", "CustomTop5", true, ini);
-    cfg.hudPanelX = readInt("Gameplay", "HudPanelX", 160, ini);
-    cfg.hudPanelY = readInt("Gameplay", "HudPanelY", 372, ini);
+    cfg.hudPanelX = readInt("Gameplay", "HudPanelX", 296, ini);
+    cfg.hudPanelY = readInt("Gameplay", "HudPanelY", 86, ini);
     cfg.scanCache = readBool("BMSData", "ScanCache", true, ini);
     cfg.enableFunctionTrace = readBool("Debug", "EnableFunctionTrace", true, ini);
     cfg.altEnter = readBool("Video", "AltEnter", true, ini);
