@@ -469,12 +469,11 @@ static const uint32_t kModelTickScale = kEzTicksPerMeasure / kNativeTicksPerMeas
 // 36/48/72/96/120 -- so 6 is not a duration anyone authored, it is the floor the format uses for
 // an instantaneous note.
 //
-// Ours emitted 0, because len was only ever assigned when resolving a long note. A zero-length note
-// gives the engine a single instant to match an input against, which is exactly what "you have to
-// be extremely precise and sometimes it still does not register" looks like from the player's side.
-//
-// 6 of the native grid, which is 12 of ours.
-static const int kMinNoteLenTicks = 6 * (int)kModelTickScale;
+// The field is NOT in grid units and the engine never rescales it: Panel::m42b2f0 (decomp
+// gamepanels.cpp) routes a hit to the hold drawer when `st.width > 6` and to the tap drawer
+// otherwise, straight off the record's u16. So the floor is the native 6 whatever our grid is;
+// scaling it to 12 "for the 384 grid" turned every custom tap into a hold.
+static const int kMinNoteLenTicks = 6;
 
 static uint32_t bmsTickToEzTick(const ParsedBmsForEz& bms, int measure, int index, int div) {
     double pos = 0.0;
@@ -4066,6 +4065,9 @@ static size_t g_pcmCacheBytes = 0;
 static const size_t kPcmCacheBudget = 384u << 20;
 static HANDLE g_prefetchThread = nullptr;
 static volatile LONG g_prefetchGeneration = 0;          // bumped to stop the running thread
+static volatile LONG g_prefetchCancel = 0;              // polled inside the decoders, per chunk
+static volatile LONG g_prefetchBusy = 0;                // one thread in flight, ever
+static std::string g_prefetchPending;                   // the song asked for while one was busy
 
 static void pcmCacheInit() {
     if (g_pcmCacheLockReady) return;
@@ -4105,7 +4107,12 @@ static DWORD WINAPI keysoundPrefetchProc(void* arg) {
     for (const auto& src : sources) {
         if (InterlockedCompareExchange(&g_prefetchGeneration, 0, 0) != job->generation) { stopped = true; break; }
         DecodedPcm d;
-        if (!mediaFoundationDecodePcmLocal(src, 0, d.pcm, d.channels, d.rate, d.bits)) continue;
+        // In-process decodes poll the cancel flag per chunk; anything else (Media Foundation,
+        // ffmpeg) runs to the end of the file, which is the old behaviour and rare.
+        if (!DecodeAudioInProcess(src, 0, d.pcm, d.channels, d.rate, d.bits, &g_prefetchCancel)) {
+            if (InterlockedCompareExchange(&g_prefetchCancel, 0, 0)) { stopped = true; break; }
+            if (!mediaFoundationDecodePcmLocal(src, 0, d.pcm, d.channels, d.rate, d.bits)) continue;
+        }
         EnterCriticalSection(&g_pcmCacheLock);
         if (g_pcmCacheSongId == job->id) {
             if (g_pcmCacheBytes + d.pcm.size() <= kPcmCacheBudget) {
@@ -4123,38 +4130,64 @@ static DWORD WINAPI keysoundPrefetchProc(void* arg) {
                 job->id.c_str(), (unsigned long)files, (unsigned long)sources.size(),
                 (unsigned long)(bytes >> 10), (unsigned long)(GetTickCount() - t0),
                 full ? " (budget full)" : "", stopped ? " (cursor moved)" : "");
+    InterlockedExchange(&g_prefetchBusy, 0);
     return 0;
 }
 
-// Song select calls this once the cursor has rested on a custom song. Cheap when it is the song
-// already being prefetched; otherwise the previous prefetch is dropped and a new one starts.
+static void startPrefetchThread(const CustomBmsSong& song) {
+    const LONG generation = InterlockedIncrement(&g_prefetchGeneration);
+    InterlockedExchange(&g_prefetchCancel, 0);
+    if (g_prefetchThread) { CloseHandle(g_prefetchThread); g_prefetchThread = nullptr; }
+    EnterCriticalSection(&g_pcmCacheLock);
+    g_pcmCache.clear();
+    g_pcmCacheBytes = 0;
+    g_pcmCacheSongId = song.id;
+    LeaveCriticalSection(&g_pcmCacheLock);
+    std::unique_ptr<PrefetchJob> job(new PrefetchJob{song.id, song.songDir, song.charts, generation});
+    InterlockedExchange(&g_prefetchBusy, 1);
+    // Below normal: the game thread must always win the CPU over a decode that only saves time later.
+    g_prefetchThread = CreateThread(nullptr, 0, keysoundPrefetchProc, job.get(), CREATE_SUSPENDED, nullptr);
+    if (!g_prefetchThread) { InterlockedExchange(&g_prefetchBusy, 0); return; }
+    SetThreadPriority(g_prefetchThread, THREAD_PRIORITY_BELOW_NORMAL);
+    ResumeThread(g_prefetchThread);
+    job.release();
+}
+
+// Song select calls this every frame once the cursor has rested on a custom song. One decode
+// thread exists at a time: a request for a different song cancels the running one (the decoders
+// poll the flag per chunk, so it exits within milliseconds) and the new song starts once it has.
+// Several threads racing the game for the CPU was what made the wheel crawl.
 void KeysoundPrefetchRequest(const char* id) {
     if (!id || !*id || !DirectBmsEnabled()) return;
     pcmCacheInit();
     static std::string s_requested;
-    if (s_requested == id) return;
-    const CustomBmsSong* song = FindCustomSongById(id);
-    if (!song) return;
-    s_requested = id;
-    const LONG generation = InterlockedIncrement(&g_prefetchGeneration);
-    if (g_prefetchThread) { CloseHandle(g_prefetchThread); g_prefetchThread = nullptr; }   // it exits on its own
-    EnterCriticalSection(&g_pcmCacheLock);
-    g_pcmCache.clear();
-    g_pcmCacheBytes = 0;
-    g_pcmCacheSongId = id;
-    LeaveCriticalSection(&g_pcmCacheLock);
-    std::unique_ptr<PrefetchJob> job(new PrefetchJob{song->id, song->songDir, song->charts, generation});
-    g_prefetchThread = CreateThread(nullptr, 0, keysoundPrefetchProc, job.get(), 0, nullptr);
-    if (g_prefetchThread) job.release();
+    if (s_requested != id) {
+        s_requested = id;
+        g_prefetchPending = id;
+        if (InterlockedCompareExchange(&g_prefetchBusy, 0, 0)) {
+            InterlockedIncrement(&g_prefetchGeneration);
+            InterlockedExchange(&g_prefetchCancel, 1);
+        }
+    }
+    if (g_prefetchPending.empty() || InterlockedCompareExchange(&g_prefetchBusy, 0, 0)) return;
+    const CustomBmsSong* song = FindCustomSongById(g_prefetchPending.c_str());
+    g_prefetchPending.clear();
+    if (song) startPrefetchThread(*song);
 }
 
 // What a load takes out of the cache: everything decoded for this song, or nothing.
 static std::map<std::string, DecodedPcm> takePrefetchedPcm(const std::string& id) {
     std::map<std::string, DecodedPcm> out;
     if (!g_pcmCacheLockReady) return out;
-    InterlockedIncrement(&g_prefetchGeneration);             // the thread stops after its current file
+    g_prefetchPending.clear();
+    EnterCriticalSection(&g_pcmCacheLock);
+    const bool ours = g_pcmCacheSongId == id;
+    LeaveCriticalSection(&g_pcmCacheLock);
+    // Our own song mid-decode is worth waiting for (at normal priority now); any other is cancelled.
     if (g_prefetchThread) {
-        WaitForSingleObject(g_prefetchThread, 15000);
+        if (ours) SetThreadPriority(g_prefetchThread, THREAD_PRIORITY_NORMAL);
+        else { InterlockedIncrement(&g_prefetchGeneration); InterlockedExchange(&g_prefetchCancel, 1); }
+        WaitForSingleObject(g_prefetchThread, ours ? 20000 : 2000);
         CloseHandle(g_prefetchThread);
         g_prefetchThread = nullptr;
     }

@@ -55,8 +55,11 @@ static bool readWholeFile(const std::string& path, std::vector<unsigned char>& o
     return ok;
 }
 
+static bool cancelled(volatile long* cancel) { return cancel && *cancel; }
+
 static bool decodeOgg(const std::vector<unsigned char>& file, uint32_t maxSeconds,
-                      std::vector<unsigned char>& pcm, uint32_t& channels, uint32_t& rate) {
+                      std::vector<unsigned char>& pcm, uint32_t& channels, uint32_t& rate,
+                      volatile long* cancel) {
     int error = 0;
     stb_vorbis* v = stb_vorbis_open_memory(file.data(), (int)file.size(), &error, nullptr);
     if (!v) return false;
@@ -71,6 +74,7 @@ static bool decodeOgg(const std::vector<unsigned char>& file, uint32_t maxSecond
     const int chunkFrames = (int)(sizeof(chunk) / sizeof(chunk[0]) / channels);
     size_t frames = 0;
     for (;;) {
+        if (cancelled(cancel)) { stb_vorbis_close(v); return false; }
         int got = stb_vorbis_get_samples_short_interleaved(v, (int)channels, chunk, chunkFrames * (int)channels);
         if (got <= 0) break;
         const unsigned char* b = reinterpret_cast<const unsigned char*>(chunk);
@@ -83,7 +87,8 @@ static bool decodeOgg(const std::vector<unsigned char>& file, uint32_t maxSecond
 }
 
 static bool decodeMp3(const std::vector<unsigned char>& file, uint32_t maxSeconds,
-                      std::vector<unsigned char>& pcm, uint32_t& channels, uint32_t& rate) {
+                      std::vector<unsigned char>& pcm, uint32_t& channels, uint32_t& rate,
+                      volatile long* cancel) {
     mp3dec_ex_t dec;
     if (mp3dec_ex_open_buf(&dec, file.data(), file.size(), MP3D_SEEK_TO_SAMPLE) != 0) return false;
     channels = (uint32_t)dec.info.channels;
@@ -93,7 +98,14 @@ static bool decodeMp3(const std::vector<unsigned char>& file, uint32_t maxSecond
     size_t want = (size_t)dec.samples;
     if (maxSeconds) want = std::min<size_t>(want, (size_t)maxSeconds * rate * channels);
     pcm.resize(want * 2);
-    size_t got = mp3dec_ex_read(&dec, reinterpret_cast<mp3d_sample_t*>(pcm.data()), want);
+    const size_t chunk = (size_t)rate * channels;          // one second per read, so a cancel lands fast
+    size_t got = 0;
+    while (got < want) {
+        if (cancelled(cancel)) { mp3dec_ex_close(&dec); pcm.clear(); return false; }
+        const size_t n = mp3dec_ex_read(&dec, reinterpret_cast<mp3d_sample_t*>(pcm.data()) + got, std::min(chunk, want - got));
+        if (!n) break;
+        got += n;
+    }
     mp3dec_ex_close(&dec);
     pcm.resize(got * 2);
     return got > 0;
@@ -101,15 +113,16 @@ static bool decodeMp3(const std::vector<unsigned char>& file, uint32_t maxSecond
 
 bool DecodeAudioInProcess(const std::string& path, uint32_t maxSeconds,
                           std::vector<unsigned char>& pcm,
-                          uint32_t& channels, uint32_t& rate, uint32_t& bits) {
+                          uint32_t& channels, uint32_t& rate, uint32_t& bits,
+                          volatile long* cancel) {
     pcm.clear(); channels = rate = bits = 0;
     const bool ogg = endsWithNoCase(path, ".ogg");
     const bool mp3 = endsWithNoCase(path, ".mp3");
     if (!ogg && !mp3) return false;
     std::vector<unsigned char> file;
     if (!readWholeFile(path, file)) return false;
-    bool ok = ogg ? decodeOgg(file, maxSeconds, pcm, channels, rate)
-                  : decodeMp3(file, maxSeconds, pcm, channels, rate);
+    bool ok = ogg ? decodeOgg(file, maxSeconds, pcm, channels, rate, cancel)
+                  : decodeMp3(file, maxSeconds, pcm, channels, rate, cancel);
     if (!ok) { pcm.clear(); channels = rate = 0; return false; }
     bits = 16;
     return true;

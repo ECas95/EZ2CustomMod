@@ -10,9 +10,12 @@
 // can fall through to Media Foundation / ffmpeg.
 //
 // maxSeconds > 0 stops decoding after that much audio (the hover preview only needs a few seconds).
+// `cancel`, when given, is polled between chunks (about a second of audio apiece); a nonzero
+// value abandons the decode and returns false, so a background decode can be stopped quickly.
 bool DecodeAudioInProcess(const std::string& path, uint32_t maxSeconds,
                           std::vector<unsigned char>& pcm,
-                          uint32_t& channels, uint32_t& rate, uint32_t& bits);
+                          uint32_t& channels, uint32_t& rate, uint32_t& bits,
+                          volatile long* cancel = nullptr);
 
 // Linear resample + channel fold/duplicate of 16-bit PCM into 16-bit `outChannels` at `outRate`.
 // The .ssf writer needs stereo 44.1k because the engine's preview mixer ignores the header rate.

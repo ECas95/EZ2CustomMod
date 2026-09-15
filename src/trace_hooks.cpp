@@ -1254,10 +1254,11 @@ static DWORD g_ssFrameStamp = 0;    // last tick the song-select per-frame hook 
 //
 // The cabinet's inputs in song select, from the decomp (songselectinput.cpp / songselectupdate2.cpp
 // / songselectdiffsel.cpp): slots 4/5 are the Start buttons, 6 = EFX1 opens the option panel
-// (f_20c6bc), 7/8 = EFX2/EFX3 page the category strip while the panel is closed, 9 = EFX4 is only
-// read while the panel is open, and 0x11/0x19 are the pedals, which the pager explicitly refuses to
-// act under. So with the panel closed, EFX4 and PEDAL+EFX2/EFX3 are free, and that is what these
-// use. Nothing native changes: every check the game makes before paging is made here too.
+// (f_20c6bc), 7/8 = EFX2/EFX3 page the category strip while the panel is closed, 9 = EFX4 toggles
+// the target bar / ranking display (g_1b2eb74) while it is closed, and 0x11/0x19 are the pedals.
+// Both the pager and the EFX4 toggle explicitly do nothing while a pedal is pressed, so
+// PEDAL + EFX2/EFX3/EFX4 are free, and that is what these use. Nothing native changes: every check
+// the game makes before acting is made here too.
 static const uint32_t kBigInstancePtr = 0x1b2e710;    // Obj40C180* g_bigInstance
 static const uint32_t kModeNameVar    = 0x1b2e680;    // char g_modeName[]
 static const uint32_t kObjOptionPanel = 0x20c6bc;     // f_20c6bc: >0 while the option panel is open
@@ -1433,7 +1434,7 @@ static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visib
     if (s_welcomedObj != obj) {
         s_welcomedObj = obj;
         if (Config().categorySort && g_customCategoryCount)
-            HudPanelShow("EZ2CustomMod", "SORT CATEGORY", "PEDAL + E2 / E3 : JUMP 10 CATEGORIES", "E4", 3500);
+            HudPanelShow("EZ2CustomMod", "SORT CATEGORY", "PEDAL + E2 / E3 : JUMP 10 CATEGORIES", "PEDAL+E4", 3500);
     }
     if (!Config().categorySort || !g_customCategoryCount) return;
     if (SafeRead32(obj + kObjOptionPanel) != 0) return;          // the option panel owns EFX now
@@ -1444,16 +1445,16 @@ static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visib
     const uint32_t catCount = kCustomCatBase + g_customCategoryCount;
     const uint32_t column = SafeRead32(obj + kObjDiffColumn);
 
-    // EFX4: cycle the sort of the current custom category.
+    // PEDAL + EFX4: cycle the sort of the current custom category.
     const bool efx4 = InputPressed(kSlotEfx4);
-    if (!pedal && efx4 && cat >= kCustomCatBase && cat < catCount) {
+    if (pedal && efx4 && cat >= kCustomCatBase && cat < catCount) {
         g_sortMode = (g_sortMode + 1) % kSortModes;
         SortCategoryIds(cat, g_sortMode, column);
         FilterCategoryImpl(obj, cat, 1);                         // keep the cursor on the same song
         PlayMoveBlip(obj);
         char sub[96];
-        snprintf(sub, sizeof(sub), "%lu songs  -  E4 again for the next order", (unsigned long)(visible ? visible - 1 : 0));
-        HudPanelShow("SORT", kSortNames[g_sortMode], sub, "E4", 2200);
+        snprintf(sub, sizeof(sub), "%lu songs  -  PEDAL + E4 again for the next order", (unsigned long)(visible ? visible - 1 : 0));
+        HudPanelShow("SORT", kSortNames[g_sortMode], sub, "PEDAL+E4", 2200);
         LogLine("[sort] cat=%lu mode=%d (%s)", (unsigned long)cat, g_sortMode, kSortNames[g_sortMode]);
         return;
     }
