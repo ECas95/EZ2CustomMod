@@ -3653,9 +3653,17 @@ static bool modeIsSevenKey(const std::string& mode) {
 // a title with '[' in it would read as a section header and skip the sections after it.
 static std::string BuildSongIni(const CustomBmsSong& song, const CustomBmsChart& chart) {
     const std::string m = NormalizeModeName(song.mode);
-    const char* judge = m == "ez2Catch"  ? "Kool = 5\r\nCool = 18\r\nGood = 40\r\nMiss = 56\r\n"
-                      : m == "turnTable" ? "Kool = 10\r\nCool = 21\r\nGood = 45\r\nMiss = 60\r\n"
-                      :                    "Kool = 6\r\nCool = 24\r\nGood = 50\r\nMiss = 70\r\n";
+    // The windows are in CHART TICKS: the loader sets m_nTPB = resolution x 4 (decomp
+    // ez2djload.cpp), so a native chart's tick is 1/192 beat and ours, at kEzTicksPerMeasure,
+    // is 1/384. The native numbers therefore have to be scaled by the grid ratio, or every
+    // window on a custom chart is half as many milliseconds as on a native one.
+    const int k = (int)kModelTickScale;
+    int kool = 6, cool = 24, good = 50, miss = 70;
+    if (m == "ez2Catch")       { kool = 5;  cool = 18; good = 40; miss = 56; }
+    else if (m == "turnTable") { kool = 10; cool = 21; good = 45; miss = 60; }
+    char judge[96];
+    snprintf(judge, sizeof(judge), "Kool = %d\r\nCool = %d\r\nGood = %d\r\nMiss = %d\r\n",
+             kool * k, cool * k, good * k, miss * k);
     const char* gauge = m == "ez2Catch"  ? "Cool = 0.2\r\nGood = 0.0\r\nMiss = 0.0\r\nFail = -4.0\r\n"
                       : m == "turnTable" ? "Cool = 0.2\r\nGood = 0.1\r\nMiss = -1.5\r\nFail = -4.0\r\n"
                       : m == "clubMix"   ? "Cool = 0.4\r\nGood = 0.3\r\nMiss = -1.5\r\nFail = -4.0\r\n"
@@ -3687,11 +3695,18 @@ std::string EnsureSongIni(const CustomBmsSong& song, const std::string& requeste
     if (!chart) for (size_t i = 0; i < song.chartMeta.size() && !chart; ++i) if (song.chartMeta[i].slot == 0) chart = &song.chartMeta[i];
     if (!chart) return std::string();
     std::string dst = JoinPath(song.cacheDir, requestedName);
-    if (cacheIsFresh(dst, JoinPath(song.songDir, chart->file))) return dst;
+    const std::string ini = BuildSongIni(song, *chart);
+    // Fresh AND the size the current text would have: the cipher keeps the length, so an ini
+    // written by an older version of BuildSongIni (other window values) is replaced, not served.
+    if (cacheIsFresh(dst, JoinPath(song.songDir, chart->file))) {
+        WIN32_FILE_ATTRIBUTE_DATA ad{};
+        if (GetFileAttributesExA(dst.c_str(), GetFileExInfoStandard, &ad) &&
+            ad.nFileSizeHigh == 0 && ad.nFileSizeLow == ini.size()) return dst;
+    }
     ensureDir(JoinPath(GetExeDirectory(), Config().cacheRoot));
     ensureDir(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), song.mode));
     ensureDir(song.cacheDir);
-    bool ok = writeEncryptedTextFileRuntime(dst, BuildSongIni(song, *chart), 0x0a8568);
+    bool ok = writeEncryptedTextFileRuntime(dst, ini, 0x0a8568);
     LogLine("[direct] ini id='%s' slot=%d level=%s file='%s' ok=%d", song.id.c_str(), slot,
             chart->playLevel.c_str(), requestedName.c_str(), ok ? 1 : 0);
     return ok ? dst : std::string();

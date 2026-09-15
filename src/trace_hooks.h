@@ -31,3 +31,10 @@ void HudPanelReset();
 // Constant scroll speed: the row the cursor rests on tells its BPM, the chart-load hook applies
 // the speed. Defined in mod_main.
 void ConstantSpeedNoteSelection(float bpm, const char* id);
+
+// Frame-time meter. Every hook of ours adds the QPC ticks it spent to one of these buckets; the
+// frame-end hook reports frame pacing and the buckets every few seconds, so a stutter can be
+// attributed (or not) to the mod. Defined in trace_hooks.
+enum ModTimeBucket { kModTimeTrace = 0, kModTimeFiles = 1, kModTimeVideo = 2, kModTimeBuckets = 3 };
+void ModTimeAdd(int bucket, long long qpcTicks);
+long long ModTimeNow();

@@ -724,27 +724,18 @@ static bool MakeOverlaySurface(void* renderer, const char* baseName, const char*
     int desc[31]{};
     void* surface = createSurface(renderer, desc, w, h, 0);
     if (!surface) return false;
-    *reinterpret_cast<void**>(texture) = surface;   // not released; see RepointOverlayTexture
-    *texOut = texture;
-    *surfOut = surface;
-    return true;
-}
-
-// Re-point a pooled texture at a surface we own. loadTexture returns the existing entry when the
-// pool still has this filename and a fresh one when it does not, so this is cheap in the common
-// case and self-healing after a reset.
-static bool RepointOverlayTexture(void* renderer, const char* baseName, const char* altName,
-                                  void* surface, void** texOut) {
-    auto loadTexture = reinterpret_cast<DirectLoadTexture_t>(Rva(0x08d00));
-    void* texture = nullptr;
-    if (!loadTexture(renderer, baseName, &texture, altName) || !texture) return false;
-    // The displaced surface is NOT released. It looks like a leak and it is a small one -- a couple
-    // of tiles for the life of the process -- but releasing it is what crashed at pc=00000000:
-    // after the pool is rebuilt the pointer here is recycled memory, its vtable is not a vtable,
-    // and vt[2] is not a function. We did not create that surface and cannot know whether anything
-    // else still holds it, so it is not ours to free.
+    // The node's current surface is the blank tile the loader just made (a fresh node) or the
+    // surface of ours it held before (a node that survived because the pool did): live either
+    // way, and about to be displaced, so it is released here rather than leaked once per screen.
+    void* displaced = *reinterpret_cast<void**>(texture);
+    if (displaced && displaced != surface && !IsBadReadPtr(displaced, sizeof(void*))) {
+        void** vt = *reinterpret_cast<void***>(displaced);
+        if (vt && !IsBadReadPtr(vt, 3 * sizeof(void*)))
+            reinterpret_cast<DirectSurfaceRelease_t>(vt[2])(displaced);
+    }
     *reinterpret_cast<void**>(texture) = surface;
     *texOut = texture;
+    *surfOut = surface;
     return true;
 }
 
@@ -758,19 +749,17 @@ static bool OverlayTexUsable(void* tex, void* surf) {
 
 // Playing a song rebuilds the texture pool WITHOUT recreating the SongSelect object -- the log
 // shows the same ecx=40620000 before and after -- so tying this to the object pointer never fired.
-// The visible result was peculiar and worth remembering: the surfaces are ours and survived, so
-// the blit kept reporting success, while the texture objects the pool owned were freed underneath
-// and the draw silently produced nothing.
 //
-// So the textures are re-acquired on every category change instead of being cached for the session.
+// And the rebuild takes our surfaces with it: KGraphics::m408c80 (decomp kgraphics.cpp) walks
+// every pooled KTexture and calls Release() on its surface UNTIL THE COUNT HITS ZERO, ours
+// included. Repointing a fresh texture at the old surface pointer -- what this used to do -- put
+// a freed surface into SetTexture, which is the crash inside dgVoodoo after a song. So a texture
+// that no longer points at our surface means the whole set is gone: drop it and make it again.
 static void RefreshOverlayTextures() {
-    if (!g_ovBgSurf || !g_ovIcoSurf) return;
-    void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
-    if (!renderer) return;
-    RepointOverlayTexture(renderer, "system\\disc\\bmsoverlaybg.bmp",  "bms-overlay-bg",
-                          g_ovBgSurf,  &g_ovBgTex);
-    RepointOverlayTexture(renderer, "system\\disc\\bmsoverlayico.bmp", "bms-overlay-ico",
-                          g_ovIcoSurf, &g_ovIcoTex);
+    g_ovBgTex = g_ovBgSurf = g_ovIcoTex = g_ovIcoSurf = nullptr;
+    g_ovInitTried = false;
+    g_ovHaveBg = g_ovHaveIco = false;
+    g_ovCategory.clear();               // repainted below, since the surfaces are new
 }
 
 static bool EnsureOverlaySurfaces() {
@@ -831,10 +820,15 @@ void CategoryOverlayDraw() {
             LogLine("[overlay] tick want='%s' have='%s' bgTex=%p icoTex=%p",
                     g_ovWantCategory.c_str(), g_ovCategory.c_str(), g_ovBgTex, g_ovIcoTex);
     }
+    // A pool rebuild can land between category changes -- playing a song does exactly that -- so
+    // the textures are checked every frame, not only when the category moves.
+    if (!OverlayTexUsable(g_ovBgTex, g_ovBgSurf) || !OverlayTexUsable(g_ovIcoTex, g_ovIcoSurf)) {
+        RefreshOverlayTextures();
+        if (!EnsureOverlaySurfaces()) return;
+    }
     if (g_ovCategory != g_ovWantCategory) {
         g_ovCategory = g_ovWantCategory;
         g_ovHaveBg = g_ovHaveIco = false;
-        RefreshOverlayTextures();   // the pool may have been rebuilt since the last category
         if (!g_ovCategory.empty()) {
             const std::string mode = GetActiveMode();
             const std::string bg  = CategoryOverlayPath(mode, g_ovCategory, "bg");
@@ -847,17 +841,6 @@ void CategoryOverlayDraw() {
         }
     }
     if (!g_ovHaveBg && !g_ovHaveIco) return;
-
-    // A pool rebuild can land between category changes -- playing a song does exactly that -- so
-    // the textures are checked every frame, not only when the category moves.
-    if (!OverlayTexUsable(g_ovBgTex, g_ovBgSurf) || !OverlayTexUsable(g_ovIcoTex, g_ovIcoSurf)) {
-        RefreshOverlayTextures();
-        if (!OverlayTexUsable(g_ovBgTex, g_ovBgSurf) || !OverlayTexUsable(g_ovIcoTex, g_ovIcoSurf)) {
-            static unsigned s_lost = 0;
-            if (s_lost++ < 5) LogLine("[overlay] textures lost and not recoverable this frame");
-            return;
-        }
-    }
 
     auto draw     = reinterpret_cast<DrawSpriteFn>(Rva(0x03f80));
     auto setBlend = reinterpret_cast<SetBlendFn>(Rva(0x0a490));
@@ -1095,13 +1078,12 @@ void HudPanelDraw() {
     const DWORD age = now - g_panelShownAt;
     if (age > kPanelFadeIn + g_panelHoldMs + kPanelFadeOut) { g_panelVisible = false; return; }
     if (!EnsurePanelSurface()) return;
+    // The pool was rebuilt (a song was played): its teardown released our surfaces along with
+    // everything else, so both textures and both surfaces are made again -- never repointed.
     if (!OverlayTexUsable(g_panelTex, g_panelSurf) || !OverlayTexUsable(g_panelMaskTex, g_panelMaskSurf)) {
-        void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
-        if (!renderer) return;
-        if (!RepointOverlayTexture(renderer, "system\\disc\\bmspanel.bmp", "bms-panel", g_panelSurf, &g_panelTex) ||
-            !RepointOverlayTexture(renderer, "system\\disc\\bmspanelmask.bmp", "bms-panel-mask", g_panelMaskSurf, &g_panelMaskTex))
-            return;
-        g_panelDirty = true;                      // the pool was rebuilt; repaint to be safe
+        HudPanelReset();
+        g_panelVisible = true;
+        if (!EnsurePanelSurface()) return;
     }
     if (g_panelDirty) {
         std::vector<unsigned char> art, mask;
@@ -1840,12 +1822,15 @@ static void RenderDirectVideoFrame(void* self) {
 }
 
 static void __fastcall HookDirectVideoFrame(void* self, void*) {
+    const long long t0 = ModTimeNow();
     if (!g_directVideoDisabled && g_directVideoFfmpeg && self == g_directVideoObject) {
         RenderFfmpegVideoFrame(self);
+        ModTimeAdd(kModTimeVideo, ModTimeNow() - t0);
         return;
     }
     if (!g_directVideoDisabled && g_directVideoTargetReady && self == g_directVideoObject) {
         RenderDirectVideoFrame(self);
+        ModTimeAdd(kModTimeVideo, ModTimeNow() - t0);
         return;
     }
     if (RealVideoFrame) RealVideoFrame(self);
@@ -2402,7 +2387,16 @@ static BOOL WINAPI HookCloseHandle(HANDLE h) {
 }
 // ---------------------------------------------------------------------------------------------
 
+static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD creation, DWORD flags, HANDLE templ);
+
 static HANDLE WINAPI HookCreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD creation, DWORD flags, HANDLE templ) {
+    const long long t0 = ModTimeNow();
+    HANDLE h = HookCreateFileABody(name, access, share, sa, creation, flags, templ);
+    ModTimeAdd(kModTimeFiles, ModTimeNow() - t0);
+    return h;
+}
+
+static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD creation, DWORD flags, HANDLE templ) {
     if (!DirectBmsEnabled()) EnsureQuartzHook();
     DetectActiveModeFromPath(name, "CreateFileA");
     MaybeArmTracerOnCredits(name);

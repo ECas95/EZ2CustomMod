@@ -1675,7 +1675,57 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
 
 
 
+// ---- frame-time meter --------------------------------------------------------------------------
+static volatile long long g_modTime[kModTimeBuckets] = {};
+static long g_modCalls[kModTimeBuckets] = {};
+
+long long ModTimeNow() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+void ModTimeAdd(int bucket, long long qpcTicks) {
+    if (bucket < 0 || bucket >= kModTimeBuckets) return;
+    g_modTime[bucket] += qpcTicks;
+    ++g_modCalls[bucket];
+}
+
+// Called at every frame end (doOp7(1), any screen). Reports every 5 seconds: frames, average and
+// worst interval, how many ran past 25 ms, and what the mod's hooks cost inside that window.
+static void FrameTimeTick() {
+    static long long s_freq = 0, s_last = 0, s_windowStart = 0, s_worst = 0, s_sum = 0;
+    static long s_frames = 0, s_slow = 0;
+    if (!s_freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_freq = f.QuadPart ? f.QuadPart : 1; }
+    const long long now = ModTimeNow();
+    if (s_last) {
+        const long long dt = now - s_last;
+        s_sum += dt;
+        ++s_frames;
+        if (dt > s_worst) s_worst = dt;
+        if (dt * 1000 > s_freq * 25) ++s_slow;
+    } else {
+        s_windowStart = now;
+    }
+    s_last = now;
+    if (now - s_windowStart < s_freq * 5) return;
+    if (s_frames) {
+        const double ms = 1000.0 / (double)s_freq;
+        LogLine("[frametime] %ld frames in %.1fs: avg %.1f ms, worst %.1f ms, >25ms: %ld | mod: trace %.1f ms (%ld), files %.1f ms (%ld), video %.1f ms (%ld)",
+                s_frames, (double)(now - s_windowStart) / (double)s_freq,
+                (double)s_sum / (double)s_frames * ms, (double)s_worst * ms, s_slow,
+                (double)g_modTime[kModTimeTrace] * ms, g_modCalls[kModTimeTrace],
+                (double)g_modTime[kModTimeFiles] * ms, g_modCalls[kModTimeFiles],
+                (double)g_modTime[kModTimeVideo] * ms, g_modCalls[kModTimeVideo]);
+    }
+    s_windowStart = now; s_frames = 0; s_slow = 0; s_worst = 0; s_sum = 0;
+    for (int i = 0; i < kModTimeBuckets; ++i) { g_modTime[i] = 0; g_modCalls[i] = 0; }
+}
+
+static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs);
+
 extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, PushadRegs* regs) {
+    const long long t0 = ModTimeNow();
+    EZ2TraceHitBody(h, regs);
+    ModTimeAdd(kModTimeTrace, ModTimeNow() - t0);
+}
+
+static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
     if (!h) return;
     h->hitCount++;
 
@@ -1691,7 +1741,10 @@ extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, Pushad
     if (h->rva == 0x0A470) {
         if (regs) {
             const uint32_t arg = *reinterpret_cast<uint32_t*>(regs->originalEsp + 4 + 4);
-            if (arg == 1 && GetTickCount() - g_ssFrameStamp < 250) HudPanelDraw();
+            if (arg == 1) {
+                if (GetTickCount() - g_ssFrameStamp < 250) HudPanelDraw();
+                FrameTimeTick();
+            }
         }
         return;
     }
