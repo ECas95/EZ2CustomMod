@@ -1112,6 +1112,9 @@ void BgaPreviewTick(uint32_t obj, const char* selectedId) {
     // only ever appeared on custom songs.
     if (id.empty()) return;
     if (GetTickCount() - g_previewDwellSince < kPreviewDwellMs) return;   // still settling
+    // Same dwell as the preview: a custom song the cursor has settled on is likely to be played,
+    // so its compressed keysounds start decoding now, off this thread.
+    if (id.compare(0, 3, "bms") == 0) KeysoundPrefetchRequest(id.c_str());
 
     // Decode once per song, off the game's thread: ffmpeg takes hundreds of milliseconds and the
     // wheel must keep animating through it.

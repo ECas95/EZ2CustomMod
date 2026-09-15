@@ -98,6 +98,9 @@ std::string GetCustomSongBackingId(const char* id);
 // On-demand cache: scan writes only metadata; these decode the heavy audio at play/hover.
 void EnsureSongKeysounds(const CustomBmsSong& song); // first sample miss = song is played
 void EnsureSongPreview(const CustomBmsSong& song);   // SongSelect hover preview
+// Direct mode: start decoding the song's compressed keysounds in the background while the cursor
+// rests on it, so the load that follows a confirm finds them ready. Safe to call every frame.
+void KeysoundPrefetchRequest(const char* id);
 // Direct mode: the per-chart judgement/level .ini the game loads with the chart, by requested name.
 std::string EnsureSongIni(const CustomBmsSong& song, const std::string& requestedName);
 

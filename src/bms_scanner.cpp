@@ -6,6 +6,7 @@
 #include "logger.h"
 #include "fnex_crypto.h"
 #include "progress_popup.h"
+#include "audio_decode.h"
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -13,6 +14,7 @@
 #include <gdiplus.h>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 #include <set>
 #include <algorithm>
@@ -2938,6 +2940,9 @@ static bool mediaFoundationDecodePcmLocal(const std::string& src, uint32_t maxSe
                                           std::vector<unsigned char>& pcm,
                                           uint32_t& channels, uint32_t& rate, uint32_t& bits) {
     pcm.clear(); channels = rate = bits = 0;
+    // .ogg and .mp3 decode in process (stb_vorbis / minimp3): no Media Foundation start-up per
+    // file, and no ffmpeg.exe per file on XP where there is no Media Foundation at all.
+    if (DecodeAudioInProcess(src, maxSeconds, pcm, channels, rate, bits)) return true;
     if (!MediaFoundationAvailable()) return ffmpegDecodePcmLocal(src, maxSeconds, pcm, channels, rate, bits);
     int wideLen = MultiByteToWideChar(CP_ACP, 0, src.c_str(), -1, nullptr, 0);
     if (wideLen <= 0) return false;
@@ -3013,6 +3018,7 @@ static bool mediaFoundationToSsfLocal(const std::string& src, const std::string&
     std::vector<unsigned char> pcm;
     uint32_t channels = 0, rate = 0, bits = 0;
     if (!mediaFoundationDecodePcmLocal(src, maxSeconds, pcm, channels, rate, bits)) return false;
+    if (bits == 16) ConvertPcm16(pcm, channels, rate, 2, 44100);   // the in-process decoders keep the file's own format
     uint16_t ch16 = (uint16_t)channels, bits16 = (uint16_t)bits;
     uint16_t align = (uint16_t)(channels * bits / 8);
     uint32_t avg = rate * align, dataSize = (uint32_t)pcm.size();
@@ -3911,20 +3917,6 @@ static void* loadDirectPcm(void* audio, const std::string& path) {
     return createDirectSample(audio, path, format, pcm, pcmBytes);
 }
 
-static void* loadDirectCompressed(void* audio, const std::string& path) {
-    std::vector<unsigned char> pcm;
-    uint32_t channels = 0, rate = 0, bits = 0;
-    if (!mediaFoundationDecodePcmLocal(path, 0, pcm, channels, rate, bits)) return nullptr;
-    DirectWaveFormat format{};
-    format.formatTag = 1;
-    format.channels = (uint16_t)channels;
-    format.sampleRate = rate;
-    format.bits = (uint16_t)bits;
-    format.blockAlign = (uint16_t)(channels * bits / 8);
-    format.averageBytes = rate * format.blockAlign;
-    return createDirectSample(audio, path, format, pcm.data(), (uint32_t)pcm.size());
-}
-
 static const CustomBmsChart* selectDirectChart(const CustomBmsSong& song, const char* request) {
     std::string low = lowerCopy(request ? request : "");
     int slot = low.find("-shd") != std::string::npos ? 2
@@ -4057,6 +4049,185 @@ static void selectDirectBmsVideo(const CustomBmsSong& song, const ParsedBmsForEz
             (unsigned long)g_directBmsVideoStartMs, selectedLayer == 3 ? 0 : selectedLayer);
 }
 
+// ---- Keysound prefetch ----------------------------------------------------------------------
+// Decoded PCM for the song the cursor is resting on, so that confirming it costs a memcpy per
+// keysound instead of a decode. A background thread fills it (KeysoundPrefetchRequest, from song
+// select once the cursor has settled), LoadCustomBmsDirect drains it, and a request for a
+// different song throws it away. Bounded: past the budget the rest is decoded at load time.
+struct DecodedPcm {
+    std::vector<unsigned char> pcm;
+    uint32_t channels = 0, rate = 0, bits = 0;
+};
+static CRITICAL_SECTION g_pcmCacheLock;
+static bool g_pcmCacheLockReady = false;
+static std::string g_pcmCacheSongId;
+static std::map<std::string, DecodedPcm> g_pcmCache;    // by source path, lowercased
+static size_t g_pcmCacheBytes = 0;
+static const size_t kPcmCacheBudget = 384u << 20;
+static HANDLE g_prefetchThread = nullptr;
+static volatile LONG g_prefetchGeneration = 0;          // bumped to stop the running thread
+
+static void pcmCacheInit() {
+    if (g_pcmCacheLockReady) return;
+    InitializeCriticalSection(&g_pcmCacheLock);
+    g_pcmCacheLockReady = true;
+}
+
+static bool isNativeSamplePath(const std::string& p) {
+    return endsWith(p, ".wav") || endsWith(p, ".ssf") || endsWith(p, ".ezw");
+}
+
+struct PrefetchJob {
+    std::string id, songDir;
+    std::vector<std::string> charts;
+    LONG generation;
+};
+
+static DWORD WINAPI keysoundPrefetchProc(void* arg) {
+    std::unique_ptr<PrefetchJob> job(static_cast<PrefetchJob*>(arg));
+    const DWORD t0 = GetTickCount();
+    // Every compressed source any chart of the song names; the selected difficulty is not known
+    // yet and the charts of one song share nearly all of their keysounds.
+    std::vector<std::string> sources;
+    std::set<std::string> seen;
+    for (const auto& chart : job->charts) {
+        ParsedBmsForEz parsed;
+        if (!parseBmsForEz(JoinPath(job->songDir, chart), parsed)) continue;
+        for (const auto& wav : parsed.wavMap) {
+            std::string source, unused;
+            if (!resolveBmsAudioAsset(job->songDir, wav.second, source, unused)) continue;
+            if (isNativeSamplePath(source)) continue;
+            if (seen.insert(lowerPathLocal(source)).second) sources.push_back(source);
+        }
+    }
+    size_t files = 0, bytes = 0;
+    bool full = false, stopped = false;
+    for (const auto& src : sources) {
+        if (InterlockedCompareExchange(&g_prefetchGeneration, 0, 0) != job->generation) { stopped = true; break; }
+        DecodedPcm d;
+        if (!mediaFoundationDecodePcmLocal(src, 0, d.pcm, d.channels, d.rate, d.bits)) continue;
+        EnterCriticalSection(&g_pcmCacheLock);
+        if (g_pcmCacheSongId == job->id) {
+            if (g_pcmCacheBytes + d.pcm.size() <= kPcmCacheBudget) {
+                g_pcmCacheBytes += d.pcm.size();
+                bytes += d.pcm.size();
+                ++files;
+                g_pcmCache[lowerPathLocal(src)] = std::move(d);
+            } else full = true;
+        } else stopped = true;
+        LeaveCriticalSection(&g_pcmCacheLock);
+        if (full || stopped) break;
+    }
+    if (files || !sources.empty())
+        LogLine("[prefetch] id='%s' %lu/%lu compressed keysounds, %lu KB in %lu ms%s%s",
+                job->id.c_str(), (unsigned long)files, (unsigned long)sources.size(),
+                (unsigned long)(bytes >> 10), (unsigned long)(GetTickCount() - t0),
+                full ? " (budget full)" : "", stopped ? " (cursor moved)" : "");
+    return 0;
+}
+
+// Song select calls this once the cursor has rested on a custom song. Cheap when it is the song
+// already being prefetched; otherwise the previous prefetch is dropped and a new one starts.
+void KeysoundPrefetchRequest(const char* id) {
+    if (!id || !*id || !DirectBmsEnabled()) return;
+    pcmCacheInit();
+    static std::string s_requested;
+    if (s_requested == id) return;
+    const CustomBmsSong* song = FindCustomSongById(id);
+    if (!song) return;
+    s_requested = id;
+    const LONG generation = InterlockedIncrement(&g_prefetchGeneration);
+    if (g_prefetchThread) { CloseHandle(g_prefetchThread); g_prefetchThread = nullptr; }   // it exits on its own
+    EnterCriticalSection(&g_pcmCacheLock);
+    g_pcmCache.clear();
+    g_pcmCacheBytes = 0;
+    g_pcmCacheSongId = id;
+    LeaveCriticalSection(&g_pcmCacheLock);
+    std::unique_ptr<PrefetchJob> job(new PrefetchJob{song->id, song->songDir, song->charts, generation});
+    g_prefetchThread = CreateThread(nullptr, 0, keysoundPrefetchProc, job.get(), 0, nullptr);
+    if (g_prefetchThread) job.release();
+}
+
+// What a load takes out of the cache: everything decoded for this song, or nothing.
+static std::map<std::string, DecodedPcm> takePrefetchedPcm(const std::string& id) {
+    std::map<std::string, DecodedPcm> out;
+    if (!g_pcmCacheLockReady) return out;
+    InterlockedIncrement(&g_prefetchGeneration);             // the thread stops after its current file
+    if (g_prefetchThread) {
+        WaitForSingleObject(g_prefetchThread, 15000);
+        CloseHandle(g_prefetchThread);
+        g_prefetchThread = nullptr;
+    }
+    EnterCriticalSection(&g_pcmCacheLock);
+    if (g_pcmCacheSongId == id) out.swap(g_pcmCache);
+    g_pcmCache.clear();
+    g_pcmCacheBytes = 0;
+    g_pcmCacheSongId.clear();
+    LeaveCriticalSection(&g_pcmCacheLock);
+    return out;
+}
+
+// A keysound the game's own loader could not take: decoded by us, then handed to it as PCM.
+struct DeferredSample {
+    int id = 0;
+    std::string source;
+    DecodedPcm out;
+    bool ok = false;
+};
+struct DeferredQueue {
+    std::vector<DeferredSample>* items;
+    volatile LONG next;
+};
+
+static DWORD WINAPI deferredDecodeWorker(void* arg) {
+    DeferredQueue* q = static_cast<DeferredQueue*>(arg);
+    for (;;) {
+        const LONG i = InterlockedIncrement(&q->next) - 1;
+        if (i < 0 || (size_t)i >= q->items->size()) break;
+        DeferredSample& d = (*q->items)[(size_t)i];
+        if (d.ok) continue;
+        d.ok = mediaFoundationDecodePcmLocal(d.source, 0, d.out.pcm, d.out.channels, d.out.rate, d.out.bits);
+    }
+    return 0;
+}
+
+// Decode the not-yet-decoded entries on up to four threads (one per core, at most). The game
+// thread joins them; nothing here touches the game.
+static unsigned decodeDeferredParallel(std::vector<DeferredSample>& items) {
+    size_t todo = 0;
+    for (const auto& d : items) if (!d.ok) ++todo;
+    if (!todo) return 0;
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    unsigned threads = si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1;
+    if (threads > 4) threads = 4;
+    if (threads > todo) threads = (unsigned)todo;
+    DeferredQueue q{&items, 0};
+    if (threads <= 1) { deferredDecodeWorker(&q); return 1; }
+    HANDLE h[4] = {};
+    unsigned started = 0;
+    for (unsigned t = 0; t < threads; ++t) {
+        h[started] = CreateThread(nullptr, 0, deferredDecodeWorker, &q, 0, nullptr);
+        if (h[started]) ++started;
+    }
+    if (!started) { deferredDecodeWorker(&q); return 1; }
+    WaitForMultipleObjects(started, h, TRUE, INFINITE);
+    for (unsigned t = 0; t < started; ++t) CloseHandle(h[t]);
+    return started;
+}
+
+static void* createDirectSampleFromPcm(void* audio, const std::string& source, const DecodedPcm& d) {
+    if (d.pcm.empty() || !d.channels || !d.rate || !d.bits) return nullptr;
+    DirectWaveFormat format{};
+    format.formatTag = 1;
+    format.channels = (uint16_t)d.channels;
+    format.sampleRate = d.rate;
+    format.bits = (uint16_t)d.bits;
+    format.blockAlign = (uint16_t)(d.channels * d.bits / 8);
+    format.averageBytes = d.rate * format.blockAlign;
+    return createDirectSample(audio, source, format, d.pcm.data(), (uint32_t)d.pcm.size());
+}
+
 bool LoadCustomBmsDirect(void* songPackage, const char* request) {
     if (!songPackage || !request) return false;
     const CustomBmsSong* song = nullptr;
@@ -4064,6 +4235,7 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
     for (const auto& candidate : g_songs)
         if (lowRequest.find(lowerCopy(candidate.id)) != std::string::npos) { song = &candidate; break; }
     if (!song) return false;
+    const DWORD loadStart = GetTickCount();
     ResetDirectBmsVideo();
     const CustomBmsChart* chart = selectDirectChart(*song, request);
     if (!chart) { LogLine("[direct] no playable chart id='%s'", song->id.c_str()); return false; }
@@ -4131,6 +4303,10 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
         if (id > 0 && id < 0x800) referenced[id] = true;
     }
     int loaded = 0, missing = 0, unsupported = 0;
+    // The keysounds the game's loader cannot read (ogg, mp3, odd wavs) are gathered and decoded
+    // together -- from the hover prefetch when it has them, on several threads otherwise --
+    // instead of one at a time in this loop. Sample creation itself stays on this thread.
+    std::vector<DeferredSample> deferred;
     for (int id = 1; id < 0x800; ++id) {
         if (!referenced[id]) continue;
         auto definition = wavDefinitions.find(id);
@@ -4149,12 +4325,38 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
             if (!sample && nativePath != source) sample = loadSample(audio, source.c_str(), 0, 0);
         }
         if (!sample && endsWith(source, ".wav")) sample = loadDirectPcm(audio, source);
-        if (!sample && !endsWith(source, ".ssf") && !endsWith(source, ".ezw"))
-            sample = loadDirectCompressed(audio, source);
-        if (!sample) { ++unsupported; continue; }
-        *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(songPackage) + 0xc9d1c + id * 4) = sample;
-        ++loaded;
+        if (sample) {
+            *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(songPackage) + 0xc9d1c + id * 4) = sample;
+            ++loaded;
+            continue;
+        }
+        if (endsWith(source, ".ssf") || endsWith(source, ".ezw")) { ++unsupported; continue; }
+        DeferredSample d;
+        d.id = id;
+        d.source = source;
+        deferred.push_back(std::move(d));
     }
+    size_t prefetched = 0;
+    unsigned decodeThreads = 0;
+    const DWORD decodeStart = GetTickCount();
+    if (!deferred.empty()) {
+        std::map<std::string, DecodedPcm> cache = takePrefetchedPcm(song->id);
+        for (auto& d : deferred) {
+            auto it = cache.find(lowerPathLocal(d.source));
+            if (it == cache.end()) continue;
+            d.out = std::move(it->second);
+            d.ok = true;
+            ++prefetched;
+        }
+        decodeThreads = decodeDeferredParallel(deferred);
+        for (auto& d : deferred) {
+            void* sample = d.ok ? createDirectSampleFromPcm(audio, d.source, d.out) : nullptr;
+            if (!sample) { ++unsupported; continue; }
+            *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(songPackage) + 0xc9d1c + d.id * 4) = sample;
+            ++loaded;
+        }
+    }
+    const DWORD decodeMs = GetTickCount() - decodeStart;
 
     unsigned char* object = reinterpret_cast<unsigned char*>(songPackage);
     memset(object + 8, 0, 0x1d1c - 8);
@@ -4182,6 +4384,9 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
     finalize(songPackage, 0, 64);
     LogLine("[direct] loaded id='%s' chart='%s' samples=%d missing=%d unsupported=%d %s",
             song->id.c_str(), chart->file.c_str(), loaded, missing, unsupported, report.c_str());
+    LogLine("[direct] keysounds: %lu decoded here (%lu prefetched on hover, %u threads, %lu ms), load total %lu ms",
+            (unsigned long)deferred.size(), (unsigned long)prefetched, decodeThreads,
+            (unsigned long)decodeMs, (unsigned long)(GetTickCount() - loadStart));
     return true;
 }
 
@@ -6359,8 +6564,18 @@ bool IsCustomSongId(const char* id) { return FindCustomSongById(id) != nullptr; 
 
 const CustomBmsSong* FindCustomSongById(const char* id) {
     if (!id) return nullptr;
-    for (const auto& s : g_songs) if (_stricmp(id, s.id.c_str()) == 0) return &s;
-    return nullptr;
+    // Rebuilt whenever the catalogue changes size: a linear _stricmp over 179k songs was 2-5 ms
+    // per call, and the hover prefetch asks on every cursor stop.
+    static std::unordered_map<std::string, size_t> s_index;
+    static size_t s_stamp = (size_t)-1;
+    if (s_stamp != g_songs.size()) {
+        s_index.clear();
+        s_index.reserve(g_songs.size() * 2);
+        for (size_t i = 0; i < g_songs.size(); ++i) s_index.emplace(lowerCopy(g_songs[i].id), i);
+        s_stamp = g_songs.size();
+    }
+    auto it = s_index.find(lowerCopy(id));
+    return it == s_index.end() ? nullptr : &g_songs[it->second];
 }
 
 std::string GetCustomSongBackingId(const char* id) {

@@ -1,4 +1,5 @@
 #include "logger.h"
+#include <share.h>
 #include "config.h"
 #include <windows.h>
 #include <cstdio>
@@ -15,7 +16,9 @@ void LogInit() {
     std::string dir = JoinPath(GetExeDirectory(), "logs");
     CreateDirectoryA(dir.c_str(), nullptr);
     std::string path = JoinPath(dir, "EZ2CustomMod.log");
-    fopen_s(&g_log, path.c_str(), "wb");
+    // _SH_DENYWR, not fopen_s: fopen_s opens exclusively, and a log that cannot be read while
+    // the game is running is no use for watching a test session.
+    g_log = _fsopen(path.c_str(), "wb", _SH_DENYWR);
     if (g_log) {
         SYSTEMTIME st{};
         GetLocalTime(&st);
