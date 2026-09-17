@@ -791,24 +791,88 @@ static bool EnsureOverlaySurfaces() {
     return ok;
 }
 
-static bool BlitBgrToSurface(void* surface, const std::vector<unsigned char>& px, int w, int h) {
-    if (px.empty()) return false;
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = w;
-    info.bmiHeader.biHeight = -h;                 // RenderImageToBgr hands back top-down
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 24;
-    info.bmiHeader.biCompression = BI_RGB;
-    info.bmiHeader.biSizeImage = (DWORD)px.size();
+
+// ---- pixel upload without GDI ------------------------------------------------------------------
+//
+// Every frame we used to push into a DirectDraw surface went through GetDC + StretchDIBits. Under
+// dgVoodoo a GetDC on a texture surface is a GPU readback, a stall, and an upload on ReleaseDC --
+// measured at ~7 ms per call, i.e. a third of the frame budget for the BGA video alone and the
+// bulk of the stutter. Lock/Unlock hands us the pixels directly; the conversion to the surface's
+// own format is ours. Nearest-neighbour when the source rectangle and the surface differ in size.
+//
+// IDirectDrawSurface7 vtable: 25 = Lock(rect, desc, flags, event), 32 = Unlock(rect).
+// DDSURFACEDESC2 (0x7c bytes): lPitch @16, lpSurface @36, ddpfPixelFormat.dwRGBBitCount @84,
+// dwRBitMask @88, dwGBitMask @92, dwBBitMask @96.
+typedef HRESULT (__stdcall* DirectSurfaceLock_t)(void*, void*, void*, DWORD, HANDLE);
+typedef HRESULT (__stdcall* DirectSurfaceUnlock_t)(void*, void*);
+
+static void MaskShift(uint32_t mask, int& shift, int& bits) {
+    shift = 0; bits = 0;
+    if (!mask) return;
+    while (!(mask & 1)) { mask >>= 1; ++shift; }
+    while (mask & 1) { mask >>= 1; ++bits; }
+}
+
+// src: rows of `srcBits` (24 = BGR, 32 = BGRA) pixels, `srcStride` bytes apart; `topDown` says row 0
+// is the top. The rectangle (cropX, cropY, cropW, cropH) of the source is scaled onto the whole
+// surface (w x h).
+static bool UploadPixelsToSurface(void* surface, const unsigned char* src, int srcW, int srcH,
+                                  int srcBits, int srcStride, bool topDown,
+                                  int cropX, int cropY, int cropW, int cropH, int w, int h) {
+    if (!surface || !src || srcW <= 0 || srcH <= 0 || w <= 0 || h <= 0 || cropW <= 0 || cropH <= 0) return false;
+    if (srcBits != 24 && srcBits != 32) return false;
     void** vt = *reinterpret_cast<void***>(surface);
-    HDC dc = nullptr;
-    if (FAILED(reinterpret_cast<DirectSurfaceGetDC_t>(vt[17])(surface, &dc)) || !dc) return false;
-    SetStretchBltMode(dc, COLORONCOLOR);
-    const int copied = StretchDIBits(dc, 0, 0, w, h, 0, 0, w, h, px.data(), &info,
-                                     DIB_RGB_COLORS, SRCCOPY);
-    reinterpret_cast<DirectSurfaceReleaseDC_t>(vt[26])(surface, dc);
-    return copied != 0 && (DWORD)copied != GDI_ERROR;
+    auto lock   = reinterpret_cast<DirectSurfaceLock_t>(vt[25]);
+    auto unlock = reinterpret_cast<DirectSurfaceUnlock_t>(vt[32]);
+    unsigned char desc[0x7c] = {};
+    *reinterpret_cast<uint32_t*>(desc) = 0x7c;
+    // DDLOCK_WAIT | DDLOCK_WRITEONLY: we overwrite everything, so no readback is needed.
+    if (FAILED(lock(surface, nullptr, desc, 0x1 | 0x20, nullptr))) return false;
+    const int pitch = *reinterpret_cast<int32_t*>(desc + 16);
+    unsigned char* dst = *reinterpret_cast<unsigned char**>(desc + 36);
+    const uint32_t dstBits = *reinterpret_cast<uint32_t*>(desc + 84);
+    const uint32_t rMask = *reinterpret_cast<uint32_t*>(desc + 88);
+    const uint32_t gMask = *reinterpret_cast<uint32_t*>(desc + 92);
+    const uint32_t bMask = *reinterpret_cast<uint32_t*>(desc + 96);
+    bool ok = dst != nullptr && pitch > 0 && (dstBits == 32 || dstBits == 24 || dstBits == 16);
+    if (ok) {
+        int rs, rb, gs, gb, bs, bb;
+        MaskShift(rMask, rs, rb); MaskShift(gMask, gs, gb); MaskShift(bMask, bs, bb);
+        const bool plain32 = dstBits == 32 && rMask == 0xff0000 && gMask == 0xff00 && bMask == 0xff;
+        const int sbpp = srcBits / 8;
+        for (int y = 0; y < h; ++y) {
+            const int sy = cropY + (int)((long long)y * cropH / h);
+            const int row = topDown ? sy : (srcH - 1 - sy);
+            const unsigned char* s = src + (size_t)row * srcStride;
+            unsigned char* d = dst + (size_t)y * pitch;
+            if (plain32 && cropW == w) {
+                for (int x = 0; x < w; ++x) {
+                    const unsigned char* p = s + (size_t)(cropX + x) * sbpp;
+                    reinterpret_cast<uint32_t*>(d)[x] = 0xff000000u | (p[2] << 16) | (p[1] << 8) | p[0];
+                }
+                continue;
+            }
+            for (int x = 0; x < w; ++x) {
+                const int sx = cropX + (int)((long long)x * cropW / w);
+                const unsigned char* p = s + (size_t)sx * sbpp;
+                const uint32_t b = p[0], g = p[1], r = p[2];
+                if (dstBits == 32) {
+                    reinterpret_cast<uint32_t*>(d)[x] = 0xff000000u | ((r >> (8 - rb)) << rs) | ((g >> (8 - gb)) << gs) | ((b >> (8 - bb)) << bs);
+                } else if (dstBits == 24) {
+                    d[x * 3 + 0] = (unsigned char)b; d[x * 3 + 1] = (unsigned char)g; d[x * 3 + 2] = (unsigned char)r;
+                } else {
+                    reinterpret_cast<uint16_t*>(d)[x] = (uint16_t)(((r >> (8 - rb)) << rs) | ((g >> (8 - gb)) << gs) | ((b >> (8 - bb)) << bs));
+                }
+            }
+        }
+    }
+    unlock(surface, nullptr);
+    return ok;
+}
+
+static bool BlitBgrToSurface(void* surface, const std::vector<unsigned char>& px, int w, int h) {
+    if (px.empty() || px.size() < (size_t)w * h * 3) return false;
+    return UploadPixelsToSurface(surface, px.data(), w, h, 24, w * 3, true, 0, 0, w, h, w, h);
 }
 
 static bool BlitImageToSurface(void* surface, const std::string& png, int w, int h) {
@@ -1374,25 +1438,8 @@ static void PreviewBlitFrame() {
     if (g_previewIndex >= g_previewFrameCount) g_previewIndex = 0;
     const unsigned char* px = g_previewFrames.data() + (size_t)g_previewIndex * frameBytes;
 
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = kPreviewSize;
-    info.bmiHeader.biHeight = -kPreviewSize;      // ffmpeg gives us top-down rows
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 24;
-    info.bmiHeader.biCompression = BI_RGB;
-    info.bmiHeader.biSizeImage = (DWORD)frameBytes;
-
-    void** vt = *reinterpret_cast<void***>(g_previewSurface);
-    auto getDC     = reinterpret_cast<DirectSurfaceGetDC_t>(vt[17]);
-    auto releaseDC = reinterpret_cast<DirectSurfaceReleaseDC_t>(vt[26]);
-    HDC dc = nullptr;
-    if (SUCCEEDED(getDC(g_previewSurface, &dc)) && dc) {
-        SetStretchBltMode(dc, COLORONCOLOR);
-        StretchDIBits(dc, 0, 0, kPreviewSize, kPreviewSize, 0, 0, kPreviewSize, kPreviewSize,
-                      px, &info, DIB_RGB_COLORS, SRCCOPY);
-        releaseDC(g_previewSurface, dc);
-    }
+    UploadPixelsToSurface(g_previewSurface, px, kPreviewSize, kPreviewSize, 24, kPreviewSize * 3, true,
+                          0, 0, kPreviewSize, kPreviewSize, kPreviewSize, kPreviewSize);
     ++g_previewIndex;
 }
 
@@ -1657,23 +1704,8 @@ static bool UploadFfmpegVideoFrame(void* videoObject) {
     void* texture = *reinterpret_cast<void**>(static_cast<unsigned char*>(videoObject) + 1232);
     void* surface = texture ? *reinterpret_cast<void**>(texture) : nullptr;
     if (!surface) return false;
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = width;
-    info.bmiHeader.biHeight = -(LONG)height; // ffmpeg rawvideo is top-down
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 24;
-    info.bmiHeader.biCompression = BI_RGB;
-    info.bmiHeader.biSizeImage = bytes;
-    void** vtable = *reinterpret_cast<void***>(surface);
-    auto getDC = reinterpret_cast<DirectSurfaceGetDC_t>(vtable[17]);
-    auto releaseDC = reinterpret_cast<DirectSurfaceReleaseDC_t>(vtable[26]);
-    HDC dc = nullptr;
-    if (FAILED(getDC(surface, &dc)) || !dc) return false;
-    int copied = StretchDIBits(dc, 0, 0, width, height, 0, 0, width, height,
-                               g_directVideoFrameBuffer, &info, DIB_RGB_COLORS, SRCCOPY);
-    releaseDC(surface, dc);
-    if (!copied || (DWORD)copied == GDI_ERROR) return false;
+    if (!UploadPixelsToSurface(surface, g_directVideoFrameBuffer, (int)width, (int)height, 24, (int)width * 3, true,
+                               0, 0, (int)width, (int)height, (int)width, (int)height)) return false;
     ++g_directVideoValidFrames;
     if (!g_directVideoFirstFrameLogged) {
         LogLine("[bga-direct] first frame backend=ffmpeg source=640x480 bits=24 target=640x480");
@@ -1831,30 +1863,17 @@ static void RenderDirectVideoFrame(void* self) {
                     uint64_t expected64 = stride64 * sourceH;
                     if (sourceW && sourceH && (bits == 24 || bits == 32) &&
                         source->biCompression == BI_RGB && expected64 <= 0xffffffffu && actual >= expected64) {
-                        BITMAPINFO info{};
-                        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                        info.bmiHeader.biWidth = (LONG)sourceW;
-                        info.bmiHeader.biHeight = rawH < 0 ? -(LONG)sourceH : (LONG)sourceH;
-                        info.bmiHeader.biPlanes = 1;
-                        info.bmiHeader.biBitCount = bits;
-                        info.bmiHeader.biCompression = BI_RGB;
-                        info.bmiHeader.biSizeImage = (DWORD)expected64;
-                        void** surfaceVtable = *reinterpret_cast<void***>(surface);
-                        auto getDC = reinterpret_cast<DirectSurfaceGetDC_t>(surfaceVtable[17]);
-                        auto releaseDC = reinterpret_cast<DirectSurfaceReleaseDC_t>(surfaceVtable[26]);
-                        HDC dc = nullptr;
-                        if (SUCCEEDED(getDC(surface, &dc)) && dc) {
-                            SetStretchBltMode(dc, COLORONCOLOR);
+                        {
                             DWORD cropX = g_directVideoCropX, cropY = g_directVideoCropY;
                             DWORD cropW = g_directVideoCropW ? g_directVideoCropW : sourceW;
                             DWORD cropH = g_directVideoCropH ? g_directVideoCropH : sourceH;
                             if (cropX + cropW > sourceW) { cropX = 0; cropW = sourceW; }
                             if (cropY + cropH > sourceH) { cropY = 0; cropH = sourceH; }
-                            int copied = StretchDIBits(dc, 0, 0, (int)g_directVideoTargetW, (int)g_directVideoTargetH,
-                                (int)cropX, (int)cropY, (int)cropW, (int)cropH, g_directVideoFrameBuffer,
-                                &info, DIB_RGB_COLORS, SRCCOPY);
-                            releaseDC(surface, dc);
-                            if (copied != 0 && (DWORD)copied != GDI_ERROR) {
+                            // DIB rows: a positive height is bottom-up.
+                            const bool copied = UploadPixelsToSurface(surface, g_directVideoFrameBuffer, (int)sourceW, (int)sourceH,
+                                (int)bits, (int)stride64, rawH < 0, (int)cropX, (int)cropY, (int)cropW, (int)cropH,
+                                (int)g_directVideoTargetW, (int)g_directVideoTargetH);
+                            if (copied) {
                                 ++g_directVideoValidFrames;
                                 if (!g_directVideoFirstFrameLogged) {
                                     LogLine("[bga-direct] first frame source=%lux%lu bits=%u bytes=%lu target=640x480 crop=%lu,%lu %lux%lu",
@@ -1864,7 +1883,7 @@ static void RenderDirectVideoFrame(void* self) {
                                     g_directVideoFirstFrameLogged = true;
                                 }
                             } else if (g_directVideoFrameFailures++ < 3) {
-                                LogLine("[bga-direct] StretchDIBits failed result=%d", copied);
+                                LogLine("[bga-direct] surface upload failed");
                             }
                         }
                     } else if (g_directVideoFrameFailures++ < 3) {
