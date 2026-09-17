@@ -64,6 +64,7 @@ ModConfig LoadConfig() {
     cfg.captureExistingWindow = readBool("Video", "CaptureExistingWindow", true, ini);
     cfg.enableBmsData = readBool("CustomSongs", "EnableBMSData", true, ini);
     cfg.bmsRoot = readString("CustomSongs", "Root", "BMSData", ini);
+    cfg.assetsInMemory = readBool("CustomSongs", "AssetsInMemory", true, ini);
     cfg.cacheRoot = readString("CustomSongs", "CacheRoot", "CustomCache", ini);
     cfg.pageSize = readInt("CustomSongs", "PageSize", 400, ini);
     cfg.enableSongSelectInject = readBool("CustomSongs", "EnableSongSelectInject", true, ini);

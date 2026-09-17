@@ -482,6 +482,10 @@ static std::string MaybeRedirectCustomDirectory(LPCSTR name) {
 // Legacy random BGA pool: DirectShow opens SPV through quartz.dll, whose IAT is redirected below.
 // This path is disabled entirely when the native direct-BGA profile is active.
 
+// Bytes an in-RAM redirect hands back through MaybeRedirectCustomPath: the marker "\x01ram" as the
+// path, the content here, turned into a virtual handle by the CreateFileA hook.
+static thread_local std::vector<unsigned char> g_pendingVirtualBytes;
+
 static std::string MaybeRedirectCustomPath(LPCSTR name) {
     if (!name) return std::string();
     std::string p = name;
@@ -542,12 +546,21 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
         }
 
         if (DirectBmsEnabled()) {
+            std::string fn = FileNameOnly(p);
+            if (Config().assetsInMemory) {
+                // Art and preview from the RAM store: the caller turns the bytes into a handle.
+                std::vector<unsigned char> bytes;
+                if (SongVisualAssetBytes(s, p, bytes) || (!s.cacheDir.empty() && fn == s.id + ".ssf" && SongPreviewBytes(s, bytes))) {
+                    g_pendingVirtualBytes.swap(bytes);
+                    return std::string("\x01ram");
+                }
+                if (!s.cacheDir.empty() && fn == s.id + ".ssf") return std::string();
+            }
             std::string visual = EnsureSongVisualAsset(s, p);
             if (!visual.empty()) {
                 LogLine("[assets] lazy visual '%s' -> '%s'", p.c_str(), visual.c_str());
                 return visual;
             }
-            std::string fn = FileNameOnly(p);
             if (!s.cacheDir.empty() && fn == s.id + ".ssf") {
                 EnsureSongPreview(s);
                 std::string preview = JoinPath(s.cacheDir, fn);
@@ -903,6 +916,7 @@ static std::string g_panelTitle, g_panelLine, g_panelSub, g_panelHint;
 static bool        g_panelDirty = false;
 static DWORD       g_panelShownAt = 0, g_panelHoldMs = 0;
 static bool        g_panelVisible = false;
+static bool        g_panelPosOverride = false;   // draw at the gameplay spot instead of the config one
 
 static std::wstring PanelWide(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -1102,8 +1116,8 @@ void HudPanelDraw() {
     if (k > 1.0f) k = 1.0f;
     const uint32_t a = (uint32_t)(k * 255.0f);
     const uint32_t grey = (a << 24) | (a << 16) | (a << 8) | a;   // fades both passes, see above
-    const float x = (float)Config().hudPanelX;
-    const float y = (float)Config().hudPanelY - (1.0f - k) * 10.0f;   // settles down as it appears
+    const float x = g_panelPosOverride ? 312.0f : (float)Config().hudPanelX;
+    const float y = (g_panelPosOverride ? 396.0f : (float)Config().hudPanelY) - (1.0f - k) * 10.0f;   // settles down as it appears
     auto draw     = reinterpret_cast<DrawSpriteFn>(Rva(0x03f80));
     auto setBlend = reinterpret_cast<SetBlendFn>(Rva(0x0a490));
     void* ctx = reinterpret_cast<void*>(kRenderCtx);
@@ -1915,6 +1929,39 @@ void ConstantSpeedNoteSelection(float bpm, const char*) {
     if (bpm > 20.0f && bpm < 1000.0f) g_selBpm = bpm;
 }
 
+// What ApplyConstantSpeed would set for a chart at `bpm`, or 0 when it would leave the speed
+// alone (first song of the session, or the feature off). Song select shows it on the card.
+int ConstantSpeedPredict(float bpm) {
+    if (!Config().constantSpeed || !(bpm > 20.0f && bpm < 1000.0f) || !(g_lastLoadBpm > 0.0f)) return 0;
+    const int* speed = reinterpret_cast<const int*>(kSpeedPercentVar);
+    if (IsBadReadPtr(speed, 4) || *speed < 50 || *speed > 999) return 0;
+    int want = (int)((float)*speed * g_lastLoadBpm / bpm + 12.5f) / 25 * 25;
+    if (want < 50) want = 50;
+    if (want > 999) want = 999;
+    return want;
+}
+
+// The card shown as a custom song starts: title, artist, BPM and the chart chosen, for a few
+// seconds at the bottom right, where 5K single leaves the screen to the BGA.
+static DWORD g_playCardUntil = 0;
+static bool  g_playCardShown = false;
+static std::string g_playCardTitle, g_playCardLine, g_playCardSub;
+
+void PlayCardDraw() {
+    if (!g_playCardUntil) return;
+    const DWORD now = GetTickCount();
+    if (now > g_playCardUntil) { g_playCardUntil = 0; return; }
+    // Shown once, on the first frame drawn outside song select, for what is left of its time.
+    if (!g_playCardShown) {
+        g_playCardShown = true;
+        HudPanelShow(g_playCardTitle.c_str(), g_playCardLine.c_str(), g_playCardSub.c_str(), "",
+                     g_playCardUntil - now > 600 ? g_playCardUntil - now - 600 : 1);
+    }
+    g_panelPosOverride = true;
+    HudPanelDraw();
+    g_panelPosOverride = false;
+}
+
 static void ApplyConstantSpeed(void* chart, bool custom) {
     if (!Config().constantSpeed || !chart) return;
     float bpm = 0.0f;
@@ -1973,6 +2020,26 @@ static int __fastcall HookSongPackage(void* self, void*, const char* request) {
     if (LoadCustomBmsDirect(self, ezChosen ? ezRequest.c_str() : request)) {
         if (ezChosen) PublishEzTextSlot(ezRequest.c_str());
         ApplyConstantSpeed(self, true);
+        if (Config().hudPanel) {
+            const std::string low = LowerAscii(ezChosen ? ezRequest : std::string(request ? request : ""));
+            const char* diff = low.find("-shd") != std::string::npos ? "SHD" : low.find("-hd") != std::string::npos ? "HD"
+                             : low.find("-ex") != std::string::npos ? "EX" : low.find("-ez") != std::string::npos ? "EZ" : "NM";
+            float bpm = 0.0f;
+            memcpy(&bpm, reinterpret_cast<const char*>(self) + 0x8c, 4);
+            const std::vector<size_t> hit = CustomSongsMentionedIn(low, GetCustomBmsSongs());
+            if (!hit.empty()) {
+                const CustomBmsSong& s = GetCustomBmsSongs()[hit[0]];
+                char sub[128];
+                snprintf(sub, sizeof(sub), "%s   %.0f BPM   %s   speed %d%%", s.artist.c_str(), bpm, diff,
+                         *reinterpret_cast<const int*>(kSpeedPercentVar));
+                g_playCardTitle = "NOW PLAYING";
+                g_playCardLine = s.title;
+                g_playCardSub = sub;
+                g_playCardUntil = GetTickCount() + 9000;   // covers the load screen and the first bars
+                g_playCardShown = false;
+                HudPanelHide();                            // start the slide fresh on the first drawn frame
+            }
+        }
         const std::string& videoPath = DirectBmsVideoPath();
         if (!videoPath.empty()) {
             lstrcpynA(g_directVideoPath, videoPath.c_str(), MAX_PATH);
@@ -2391,6 +2458,19 @@ static int VirtualAssetKind(const std::string& lowerPath, size_t catCount, int& 
     return -1;
 }
 
+static HANDLE OpenVirtualBytes(std::vector<unsigned char>&& bytes) {
+    if (bytes.empty()) return INVALID_HANDLE_VALUE;
+    HANDLE h = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!h) return INVALID_HANDLE_VALUE;
+    EnsureVirtualLock();
+    EnterCriticalSection(&g_virtualLock);
+    VirtualAsset& v = g_virtualFiles[h];
+    v.data.swap(bytes);
+    v.pos = 0;
+    LeaveCriticalSection(&g_virtualLock);
+    return h;
+}
+
 static HANDLE OpenVirtualAsset(const std::string& mode, size_t index, int kind) {
     std::vector<unsigned char> bytes;
     if (!BuildCategoryAbmInMemory(mode, index, kind, bytes) || bytes.empty())
@@ -2547,6 +2627,12 @@ static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share,
         }
     }
     std::string redirected = MaybeRedirectCustomPath(name);
+    if (redirected == "\x01ram") {
+        HANDLE vh = OpenVirtualBytes(std::move(g_pendingVirtualBytes));
+        g_pendingVirtualBytes.clear();
+        if (vh != INVALID_HANDLE_VALUE) return vh;
+        redirected.clear();
+    }
     LPCSTR finalName = redirected.empty() ? name : redirected.c_str();
     if (Config().traceFileApi && finalName) LogLine("[file] CreateFileA '%s' access=0x%08lx creation=%lu", finalName, access, creation);
     return RealCreateFileA ? RealCreateFileA(finalName, access, share, sa, creation, flags, templ)

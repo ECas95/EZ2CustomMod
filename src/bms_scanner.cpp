@@ -5583,6 +5583,8 @@ static void GenerateVisualAssetCache(const CustomBmsSong& song, const char* only
 }
 
 // ---- art prefetch ------------------------------------------------------------------------------
+static bool RamAssetHas(const std::string& key);
+static bool AbsorbFileToRam(const std::string& key, const std::string& path, std::vector<unsigned char>* out);
 static std::vector<std::string> g_artQueue;          // ids still to render, front first
 static CRITICAL_SECTION g_artQueueLock;
 static bool g_artQueueLockReady = false;
@@ -5601,15 +5603,19 @@ static DWORD WINAPI artPrefetchProc(void*) {
         const CustomBmsSong* song = FindCustomSongById(id.c_str());
         if (!song || song->cacheDir.empty()) continue;
         ++seen;
-        // Cheap when the files exist: each role checks for its .abm before rendering anything.
+        // Cheap when the art exists: each role checks the store / its .abm before rendering.
         for (const char* role : {"songname", "discsmall", "disc"}) {
             const std::string abm = JoinPath(JoinPath(song->cacheDir, role), song->id + ".abm");
-            if (fileExistsLocal(abm)) continue;
-            ensureDir(JoinPath(GetExeDirectory(), Config().cacheRoot));
-            ensureDir(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), song->mode));
-            ensureDir(song->cacheDir);
-            GenerateVisualAssetCache(*song, role);
-            ++rendered;
+            if (Config().assetsInMemory && RamAssetHas(song->id + std::string("|") + role)) continue;
+            if (!fileExistsLocal(abm)) {
+                ensureDir(JoinPath(GetExeDirectory(), Config().cacheRoot));
+                ensureDir(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), song->mode));
+                ensureDir(song->cacheDir);
+                GenerateVisualAssetCache(*song, role);
+                ++rendered;
+            }
+            if (Config().assetsInMemory && fileExistsLocal(abm))
+                AbsorbFileToRam(song->id + std::string("|") + role, abm, nullptr);
         }
     }
     if (rendered)
@@ -5769,6 +5775,98 @@ static void GenerateVisualAssetCacheLocked(const CustomBmsSong& song, const char
             song.id.c_str(), all ? "all" : role.c_str(), artworkPath.c_str(), artworkW, artworkH,
             created, rescued);
     artwork.reset();   // GDI+ itself stays up: see the startup note above
+}
+
+// ---- RAM asset store ---------------------------------------------------------------------------
+// Generated art and previews, keyed "id|role", with an LRU byte budget. With AssetsInMemory the
+// renderer still goes through a file (it is a GDI file pipeline), but the file is read into here
+// and deleted straight away, so CustomCache holds nothing between sessions but the tiny .ini.
+static CRITICAL_SECTION g_ramLock;
+static bool g_ramLockReady = false;
+struct RamAsset { std::vector<unsigned char> bytes; uint64_t stamp; };
+static std::map<std::string, RamAsset> g_ramAssets;
+static size_t g_ramBytes = 0;
+static uint64_t g_ramStamp = 0;
+static const size_t kRamAssetBudget = 256u << 20;
+
+static void RamLock()   { if (!g_ramLockReady) { InitializeCriticalSection(&g_ramLock); g_ramLockReady = true; } EnterCriticalSection(&g_ramLock); }
+static void RamUnlock() { LeaveCriticalSection(&g_ramLock); }
+
+static bool RamAssetGet(const std::string& key, std::vector<unsigned char>& out) {
+    RamLock();
+    auto it = g_ramAssets.find(key);
+    const bool hit = it != g_ramAssets.end();
+    if (hit) { out = it->second.bytes; it->second.stamp = ++g_ramStamp; }
+    RamUnlock();
+    return hit;
+}
+
+static bool RamAssetHas(const std::string& key) {
+    RamLock();
+    const bool hit = g_ramAssets.find(key) != g_ramAssets.end();
+    RamUnlock();
+    return hit;
+}
+
+static void RamAssetPut(const std::string& key, std::vector<unsigned char>&& bytes) {
+    RamLock();
+    auto old = g_ramAssets.find(key);
+    if (old != g_ramAssets.end()) { g_ramBytes -= old->second.bytes.size(); g_ramAssets.erase(old); }
+    while (g_ramBytes + bytes.size() > kRamAssetBudget && !g_ramAssets.empty()) {
+        auto victim = g_ramAssets.begin();
+        for (auto it = g_ramAssets.begin(); it != g_ramAssets.end(); ++it)
+            if (it->second.stamp < victim->second.stamp) victim = it;
+        g_ramBytes -= victim->second.bytes.size();
+        g_ramAssets.erase(victim);
+    }
+    g_ramBytes += bytes.size();
+    RamAsset& a = g_ramAssets[key];
+    a.bytes = std::move(bytes);
+    a.stamp = ++g_ramStamp;
+    RamUnlock();
+}
+
+// Read a just-rendered file into the store and remove it from disk.
+static bool AbsorbFileToRam(const std::string& key, const std::string& path, std::vector<unsigned char>* out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::vector<unsigned char> bytes;
+    unsigned char chunk[65536];
+    size_t got;
+    while ((got = fread(chunk, 1, sizeof(chunk), f)) > 0) bytes.insert(bytes.end(), chunk, chunk + got);
+    fclose(f);
+    if (bytes.empty()) return false;
+    DeleteFileA(path.c_str());
+    if (out) *out = bytes;
+    RamAssetPut(key, std::move(bytes));
+    return true;
+}
+
+static const char* VisualRoleFor(const std::string& request) {
+    std::string low = lowerPathLocal(request);
+    return low.find("resultdisc") != std::string::npos ? "resultdisc"
+         : low.find("discsmall") != std::string::npos ? "discsmall"
+         : low.find("eyecatch") != std::string::npos ? "eyecatch"
+         : low.find("songname") != std::string::npos ? "songname"
+         : low.find("disc") != std::string::npos ? "disc" : nullptr;
+}
+
+bool SongVisualAssetBytes(const CustomBmsSong& song, const std::string& request, std::vector<unsigned char>& out) {
+    const char* role = VisualRoleFor(request);
+    if (!role || song.cacheDir.empty()) return false;
+    const std::string key = song.id + "|" + role;
+    if (RamAssetGet(key, out)) return true;
+    const std::string path = EnsureSongVisualAsset(song, request);   // renders when missing
+    if (path.empty()) return false;
+    return AbsorbFileToRam(key, path, &out);
+}
+
+bool SongPreviewBytes(const CustomBmsSong& song, std::vector<unsigned char>& out) {
+    if (song.cacheDir.empty()) return false;
+    const std::string key = song.id + "|ssf";
+    if (RamAssetGet(key, out)) return true;
+    EnsureSongPreview(song);
+    return AbsorbFileToRam(key, JoinPath(song.cacheDir, song.id + ".ssf"), &out);
 }
 
 std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& request) {

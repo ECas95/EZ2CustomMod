@@ -35,6 +35,8 @@ void EzColumnDraw(uint32_t obj);
 // Constant scroll speed: the row the cursor rests on tells its BPM, the chart-load hook applies
 // the speed. Defined in mod_main.
 void ConstantSpeedNoteSelection(float bpm, const char* id);
+int  ConstantSpeedPredict(float bpm);          // 0 = no change would be made
+void PlayCardDraw();                            // the "now playing" card, any screen but song select
 
 // Frame-time meter. Every hook of ours adds the QPC ticks it spent to one of these buckets; the
 // frame-end hook reports frame pacing and the buckets every few seconds, so a stutter can be

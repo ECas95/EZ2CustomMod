@@ -136,6 +136,10 @@ void StopDirectBmsFfmpegVideo();
 // deliberately keep the game's safe fallback; global renderer hooks were unstable.
 std::string ResolveDirectBmsVisual(const CustomBmsSong& song, const std::string& request);
 std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& request);
+// AssetsInMemory: the same art as bytes, from the RAM store or rendered now (through the disk as
+// scratch, removed once absorbed). The preview .ssf likewise.
+bool SongVisualAssetBytes(const CustomBmsSong& song, const std::string& request, std::vector<unsigned char>& out);
+bool SongPreviewBytes(const CustomBmsSong& song, std::vector<unsigned char>& out);
 
 // Song-select BGA preview: decode a few seconds of a song's video into raw BGR24 frames.
 bool DecodeBgaPreview(const std::string& videoPath, int size, int fps, int seconds,

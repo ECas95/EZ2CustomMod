@@ -1461,6 +1461,25 @@ static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visib
         if (Config().categorySort && g_customCategoryCount)
             HudPanelShow("EZ2CustomMod", "SORT CATEGORY", "PEDAL + E2 / E3 : JUMP 10 CATEGORIES", "PEDAL+E4", 3500);
     }
+    // Entering the difficulty pick: say what the constant-speed rule will set for this song.
+    {
+        static uint32_t s_lastState = 0;
+        const uint32_t state = SafeRead32(obj + kObjSelState);
+        if (state == 5 && s_lastState != 5 && Config().constantSpeed && selected < visible) {
+            const uint32_t column = SafeRead32(obj + kObjDiffColumn);
+            const uint32_t slot = column == 1 ? 1 : column == 3 ? 2 : column == 4 ? 3 : 0;
+            float bpm = 0.0f;
+            memcpy(&bpm, reinterpret_cast<const void*>(obj + kVisibleBase + selected * kEntryBytes + kEntryBpmOff[slot]), 4);
+            const int want = ConstantSpeedPredict(bpm);
+            if (want > 0) {
+                char line[64], sub[96];
+                snprintf(line, sizeof(line), "SPEED %d%%", want);
+                snprintf(sub, sizeof(sub), "%d%% x %.0f BPM = %.0f BPM-equivalent, as tuned", want, bpm, (float)want * bpm / 100.0f);
+                HudPanelShow("CONSTANT SPEED", line, sub, "", 2500);
+            }
+        }
+        s_lastState = state;
+    }
     if (!Config().categorySort || !g_customCategoryCount) return;
     if (SafeRead32(obj + kObjOptionPanel) != 0) return;          // the option panel owns EFX now
     if (SafeRead32(obj + kObjSelState) != 4) return;             // browsing, not the difficulty stepper
@@ -1788,6 +1807,7 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
             const uint32_t arg = *reinterpret_cast<uint32_t*>(regs->originalEsp + 4 + 4);
             if (arg == 1) {
                 if (GetTickCount() - g_ssFrameStamp < 250) { EzColumnDraw(g_ssFrameObj); HudPanelDraw(); }
+                else PlayCardDraw();
                 FpsLimitTick();
                 FrameTimeTick();
             }

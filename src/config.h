@@ -37,6 +37,9 @@ struct ModConfig {
     bool captureExistingWindow = true;
     std::string bmsRoot = "BMSData";
     std::string cacheRoot = "CustomCache";
+    // Generated art and previews live in RAM (an LRU, regenerated when evicted) and the disk is
+    // only scratch while one is rendered. 0 keeps them as files under cacheRoot across sessions.
+    bool assetsInMemory = true;
     int pageSize = 400;
     bool enableSongSelectInject = true;
     bool bridgeMode = true;
