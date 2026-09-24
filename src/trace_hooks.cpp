@@ -1896,7 +1896,6 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
             const uint32_t arg = *reinterpret_cast<uint32_t*>(regs->originalEsp + 4 + 4);
             if (arg == 1) {
                 if (GetTickCount() - g_ssFrameStamp < 250) { EzColumnDraw(g_ssFrameObj); HudPanelDraw(); }
-                else PlayCardDraw();
                 FpsLimitTick();
                 FrameTimeTick();
             }

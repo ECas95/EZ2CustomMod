@@ -26,6 +26,12 @@ struct ModConfig {
     int  hudPanelX = 296, hudPanelY = 86;    // where the 320x72 notice lands on the 640x480 screen
     int  fpsLimit = 0;             // hold frames to 1/N s at the frame end; 0 = the display paces
     int  judgeOffsetMs = 0;        // +N: presses count N ms earlier (for a late-feeling setup)
+    // The two caches that dominate our share of the address space. They were fixed at these sizes,
+    // and a session that browsed a lot reached 1470 MB committed across 10896 regions -- fine while
+    // the EXE is large-address aware on a 64-bit host, but XP 32-bit stops at 2 GB without /3GB,
+    // and one disc render had already failed for want of a contiguous block.
+    int  keysoundCacheMB = 384;    // decoded keysound PCM held for the song under the cursor
+    int  assetCacheMB = 256;       // generated art and previews, LRU
     bool artPrefetch = true;       // render a category's wheel art on a background thread
     // Reuse the previous run's BMS parse for folders that have not changed.
     bool scanCache = true;

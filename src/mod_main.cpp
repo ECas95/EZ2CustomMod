@@ -1804,6 +1804,7 @@ static void RenderFfmpegVideoFrame(void* videoObject) {
         }
         if (GetTickCount() - g_directVideoDelayClock < g_directVideoStartMs) return;
         g_directVideoStarted = true;
+        ReleaseDirectBmsFfmpegVideo();     // from here the reader paces itself in real time
         LogLine("[bga-direct] ffmpeg video started %lu ms after the stage began",
                 (unsigned long)(GetTickCount() - g_directVideoDelayClock));
     }
@@ -1985,19 +1986,14 @@ static void __fastcall HookDirectVideoFrame(void* self, void*) {
     if (!g_directVideoDisabled && g_directVideoFfmpeg && self == g_directVideoObject) {
         RenderFfmpegVideoFrame(self);
         ModTimeAdd(kModTimeVideo, ModTimeNow() - t0);
-        PlayCardDraw();
         return;
     }
     if (!g_directVideoDisabled && g_directVideoTargetReady && self == g_directVideoObject) {
         RenderDirectVideoFrame(self);
         ModTimeAdd(kModTimeVideo, ModTimeNow() - t0);
-        PlayCardDraw();
         return;
     }
     if (RealVideoFrame) RealVideoFrame(self);
-    // Gameplay's one per-frame call we own: doOp7(1) runs about once a second there, so the
-    // "now playing" card is drawn from here, after the BGA and before the notes.
-    PlayCardDraw();
 }
 
 // ---- constant scroll speed ---------------------------------------------------------------------
@@ -2026,27 +2022,6 @@ int ConstantSpeedPredict(float bpm) {
     if (want < 50) want = 50;
     if (want > 999) want = 999;
     return want;
-}
-
-// The card shown as a custom song starts: title, artist, BPM and the chart chosen, for a few
-// seconds at the bottom right, where 5K single leaves the screen to the BGA.
-static DWORD g_playCardUntil = 0;
-static bool  g_playCardShown = false;
-static std::string g_playCardTitle, g_playCardLine, g_playCardSub;
-
-void PlayCardDraw() {
-    if (!g_playCardUntil) return;
-    const DWORD now = GetTickCount();
-    if (now > g_playCardUntil) { g_playCardUntil = 0; return; }
-    // Shown once, on the first frame drawn outside song select, for what is left of its time.
-    if (!g_playCardShown) {
-        g_playCardShown = true;
-        HudPanelShow(g_playCardTitle.c_str(), g_playCardLine.c_str(), g_playCardSub.c_str(), "",
-                     g_playCardUntil - now > 600 ? g_playCardUntil - now - 600 : 1);
-    }
-    g_panelPosOverride = true;
-    HudPanelDraw();
-    g_panelPosOverride = false;
 }
 
 // ---- judge offset ------------------------------------------------------------------------------
@@ -2162,31 +2137,6 @@ static int __fastcall HookSongPackage(void* self, void*, const char* request) {
         if (ezChosen) PublishEzTextSlot(ezRequest.c_str());
         ApplyConstantSpeed(self, true);
         UpdateJudgeOffsetForChart(self);
-        if (Config().hudPanel) {
-            const std::string low = LowerAscii(ezChosen ? ezRequest : std::string(request ? request : ""));
-            const char* diff = low.find("-shd") != std::string::npos ? "SHD" : low.find("-hd") != std::string::npos ? "HD"
-                             : low.find("-ex") != std::string::npos ? "EX" : low.find("-ez") != std::string::npos ? "EZ" : "NM";
-            float bpm = 0.0f;
-            memcpy(&bpm, reinterpret_cast<const char*>(self) + 0x8c, 4);
-            const std::vector<size_t> hit = CustomSongsMentionedIn(low, GetCustomBmsSongs());
-            if (!hit.empty()) {
-                const CustomBmsSong& s = GetCustomBmsSongs()[hit[0]];
-                char sub[128];
-                snprintf(sub, sizeof(sub), "%s   %.0f BPM   %s   speed %d%%", s.artist.c_str(), bpm, diff,
-                         *reinterpret_cast<const int*>(kSpeedPercentVar));
-                if (Config().judgeOffsetMs != 0) {
-                    char off[32];
-                    snprintf(off, sizeof(off), "   judge %+d ms", Config().judgeOffsetMs);
-                    strncat(sub, off, sizeof(sub) - strlen(sub) - 1);
-                }
-                g_playCardTitle = "NOW PLAYING";
-                g_playCardLine = s.title;
-                g_playCardSub = sub;
-                g_playCardUntil = GetTickCount() + 9000;   // covers the load screen and the first bars
-                g_playCardShown = false;
-                HudPanelHide();                            // start the slide fresh on the first drawn frame
-            }
-        }
         const std::string& videoPath = DirectBmsVideoPath();
         if (!videoPath.empty()) {
             lstrcpynA(g_directVideoPath, videoPath.c_str(), MAX_PATH);

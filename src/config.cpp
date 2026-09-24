@@ -55,6 +55,10 @@ ModConfig LoadConfig() {
     cfg.hudPanelY = readInt("Gameplay", "HudPanelY", 86, ini);
     cfg.fpsLimit = readInt("Gameplay", "FpsLimit", 0, ini);
     cfg.judgeOffsetMs = readInt("Gameplay", "JudgeOffsetMs", 0, ini);
+    cfg.keysoundCacheMB = readInt("CustomSongs", "KeysoundCacheMB", 384, ini);
+    cfg.assetCacheMB = readInt("CustomSongs", "AssetCacheMB", 256, ini);
+    if (cfg.keysoundCacheMB < 16) cfg.keysoundCacheMB = 16;
+    if (cfg.assetCacheMB < 16) cfg.assetCacheMB = 16;
     cfg.artPrefetch = readBool("Gameplay", "ArtPrefetch", true, ini);
     cfg.scanCache = readBool("BMSData", "ScanCache", true, ini);
     cfg.enableFunctionTrace = readBool("Debug", "EnableFunctionTrace", true, ini);

@@ -3045,11 +3045,28 @@ static bool g_ffmpegVideoLockReady = false;
 static unsigned char* g_ffmpegVideoLatest = nullptr;
 static bool g_ffmpegVideoFrameReady = false;
 static const uint32_t kFfmpegVideoFrameBytes = 640u * 480u * 3u;
+// The rate startFfmpegPipe forces on the output (-r 30), so the raw stream really is 30 frames per
+// second of content whatever the source file runs at, and pacing against it is exact.
+static const DWORD kFfmpegVideoFps = 30;
+static volatile LONG g_ffmpegVideoGate = 0;    // 1 = the first frame is on screen, keep going
 
+// THE VIDEO NEEDS ITS OWN CLOCK.
+//
+// This thread used to publish every frame the moment it was decoded, and the game's renderer took
+// whatever was in the slot -- so the BGA ran at ffmpeg's DECODE speed, several times real time, and
+// a song was over on screen long before it was over in the speakers. DirectShow clocks itself,
+// which is why DJMax (.wmv) and the native .spv clips looked right and PIU (.mpg, which DirectShow
+// here cannot open, so it falls to ffmpeg) did not.
+//
+// Each frame is now held back until its presentation time. A decode slower than real time finds
+// the due time already past and publishes at once, so it catches up instead of drifting. The pipe
+// fills while we wait and ffmpeg blocks on the write, which costs nothing.
 static DWORD WINAPI ffmpegVideoReader(void*) {
     unsigned char* frame = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, kFfmpegVideoFrameBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!frame) return 1;
+    DWORD clock = 0;            // when frame 0 went up
+    uint64_t index = 0;         // which frame this is
     while (!g_ffmpegVideoStop) {
         uint32_t total = 0;
         while (total < kFfmpegVideoFrameBytes && !g_ffmpegVideoStop) {
@@ -3059,14 +3076,36 @@ static DWORD WINAPI ffmpegVideoReader(void*) {
             total += got;
         }
         if (total != kFfmpegVideoFrameBytes) break;
+        if (!clock) {
+            // Frame 0 waits for the chart to ask for the video: the stream is opened early so that
+            // ffmpeg's start-up does not eat into the BGA's own start time.
+            while (!g_ffmpegVideoStop && InterlockedCompareExchange(&g_ffmpegVideoGate, 0, 0) == 0)
+                Sleep(4);
+            if (g_ffmpegVideoStop) break;
+            clock = GetTickCount();
+            if (!clock) clock = 1;                  // 0 is the "not started" marker
+        } else {
+            const DWORD due = clock + (DWORD)(index * 1000u / kFfmpegVideoFps);
+            while (!g_ffmpegVideoStop) {
+                const DWORD now = GetTickCount();
+                if ((LONG)(now - due) >= 0) break;   // wraps correctly as a signed difference
+                const DWORD left = due - now;
+                Sleep(left > 4 ? 4 : 1);
+            }
+            if (g_ffmpegVideoStop) break;
+        }
         EnterCriticalSection(&g_ffmpegVideoLock);
         memcpy(g_ffmpegVideoLatest, frame, kFfmpegVideoFrameBytes);
         g_ffmpegVideoFrameReady = true;
         LeaveCriticalSection(&g_ffmpegVideoLock);
+        ++index;
     }
     VirtualFree(frame, 0, MEM_RELEASE);
     return 0;
 }
+
+// The chart's BGA start time has arrived: let the paced reader run.
+void ReleaseDirectBmsFfmpegVideo() { InterlockedExchange(&g_ffmpegVideoGate, 1); }
 
 void StopDirectBmsFfmpegVideo() {
     InterlockedExchange(&g_ffmpegVideoStop, 1);
@@ -3112,9 +3151,11 @@ bool StartDirectBmsFfmpegVideo(const std::string& path) {
     g_ffmpegVideoProcess = process.hProcess;
     g_ffmpegVideoPipe = pipe;
     InterlockedExchange(&g_ffmpegVideoStop, 0);
+    InterlockedExchange(&g_ffmpegVideoGate, 0);
     g_ffmpegVideoThread = CreateThread(nullptr, 0, ffmpegVideoReader, nullptr, 0, nullptr);
     if (!g_ffmpegVideoThread) { StopDirectBmsFfmpegVideo(); return false; }
-    LogLine("[bga-direct] ffmpeg stream started source='%s' format=BGR24/640x480/30fps", path.c_str());
+    LogLine("[bga-direct] ffmpeg stream started source='%s' format=BGR24/640x480/%lufps, paced",
+            path.c_str(), (unsigned long)kFfmpegVideoFps);
     return true;
 }
 
@@ -4311,7 +4352,7 @@ static bool g_pcmCacheLockReady = false;
 static std::string g_pcmCacheSongId;
 static std::map<std::string, DecodedPcm> g_pcmCache;    // by source path, lowercased
 static size_t g_pcmCacheBytes = 0;
-static const size_t kPcmCacheBudget = 384u << 20;
+static size_t PcmCacheBudget() { return (size_t)Config().keysoundCacheMB << 20; }
 static HANDLE g_prefetchThread = nullptr;
 static volatile LONG g_prefetchGeneration = 0;          // bumped to stop the running thread
 static volatile LONG g_prefetchCancel = 0;              // polled inside the decoders, per chunk
@@ -4364,7 +4405,7 @@ static DWORD WINAPI keysoundPrefetchProc(void* arg) {
         }
         EnterCriticalSection(&g_pcmCacheLock);
         if (g_pcmCacheSongId == job->id) {
-            if (g_pcmCacheBytes + d.pcm.size() <= kPcmCacheBudget) {
+            if (g_pcmCacheBytes + d.pcm.size() <= PcmCacheBudget()) {
                 g_pcmCacheBytes += d.pcm.size();
                 bytes += d.pcm.size();
                 ++files;
@@ -6035,7 +6076,7 @@ struct RamAsset { std::vector<unsigned char> bytes; uint64_t stamp; };
 static std::map<std::string, RamAsset> g_ramAssets;
 static size_t g_ramBytes = 0;
 static uint64_t g_ramStamp = 0;
-static const size_t kRamAssetBudget = 256u << 20;
+static size_t RamAssetBudget() { return (size_t)Config().assetCacheMB << 20; }
 
 static void RamLock()   { if (!g_ramLockReady) { InitializeCriticalSection(&g_ramLock); g_ramLockReady = true; } EnterCriticalSection(&g_ramLock); }
 static void RamUnlock() { LeaveCriticalSection(&g_ramLock); }
@@ -6060,7 +6101,7 @@ static void RamAssetPut(const std::string& key, std::vector<unsigned char>&& byt
     RamLock();
     auto old = g_ramAssets.find(key);
     if (old != g_ramAssets.end()) { g_ramBytes -= old->second.bytes.size(); g_ramAssets.erase(old); }
-    while (g_ramBytes + bytes.size() > kRamAssetBudget && !g_ramAssets.empty()) {
+    while (g_ramBytes + bytes.size() > RamAssetBudget() && !g_ramAssets.empty()) {
         auto victim = g_ramAssets.begin();
         for (auto it = g_ramAssets.begin(); it != g_ramAssets.end(); ++it)
             if (it->second.stamp < victim->second.stamp) victim = it;

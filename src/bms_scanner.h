@@ -134,6 +134,9 @@ void ReportProcessFootprint(const char* why);
 void ReportAllocHistogram(const char* why);
 bool StartDirectBmsFfmpegVideo(const std::string& path);
 bool ReadDirectBmsFfmpegFrame(void* buffer, uint32_t bytes);
+// Let the stream's paced reader past its first frame: called when the chart's BGA start time comes
+// up, so ffmpeg's start-up latency does not push the video late.
+void ReleaseDirectBmsFfmpegVideo();
 void StopDirectBmsFfmpegVideo();
 
 // Native BMP/ABM assets can be served straight from BMSData. Other image formats
