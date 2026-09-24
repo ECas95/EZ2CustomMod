@@ -214,7 +214,7 @@ enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3,
        // The song-select detail panels: the stats block above the disc and the density graph
        // along the bottom. Sizes are the on-screen rectangles in game coordinates.
        kCatAbmStats = 10, kCatAbmGraph = 11 };
-static const int kStatsPanelW = 88,  kStatsPanelH = 80;
+static const int kStatsPanelW = 88,  kStatsPanelH = 76;
 static const int kGraphPanelW = 176, kGraphPanelH = 56;
 bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int kind,
                               std::vector<unsigned char>& out);

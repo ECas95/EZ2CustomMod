@@ -1191,7 +1191,11 @@ static bool RenderPanelBgr(std::vector<unsigned char>& art, std::vector<unsigned
 // wheel without a rectangle of background around them.
 //
 // Positions are game coordinates (the game renders 640x480 and the window scales it).
-static const int kStatsX = 300, kStatsY = 79;
+// The band between the category tabs and the disc, and it really is only that: the tab row sits
+// at about y 60..75 and the disc's top edge at about y 160, so the plate starts below the tabs
+// and its 76 rows stop clear of both. Growing it upward for more room put it straight through
+// the tabs. The content is sized to this, not the other way round.
+static const int kStatsX = 300, kStatsY = 80;
 static const int kGraphX = 385, kGraphY = 410;
 
 static void* g_statsTex = nullptr;  static void* g_statsSurf = nullptr;
@@ -1227,23 +1231,41 @@ static bool EnsureDetailSurfaces() {
     return ok;
 }
 
-// A rounded plate, drawn into both buffers: black where the art is (so the mask darkens the
-// wheel under it) and the rim on top. The same shape the notice card uses, at these sizes.
+// A rounded plate in the notice card's own convention, which is NOT symmetric: the ART is black
+// outside the shape and the card's colour inside, the MASK is WHITE outside and dark inside.
+// The mask is drawn with the destination-colour blend, so white leaves the wheel untouched around
+// the plate and the dark inside multiplies it down to near black; the art is then added on top.
+//
+// Getting those two the wrong way round is what let the custom background show straight through
+// these panels while blacking out a rectangle around them.
 static void DetailPlate(HDC art, HDC mask, int w, int h) {
     RECT all = {0, 0, w, h};
-    HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(art, &all, black);
-    FillRect(mask, &all, black);
-    DeleteObject(black);
-    for (int pass = 0; pass < 2; ++pass) {
-        HDC hdc = pass == 0 ? mask : art;
-        HBRUSH fill = CreateSolidBrush(pass == 0 ? RGB(255, 255, 255) : RGB(14, 18, 26));
-        HPEN pen = CreatePen(PS_SOLID, 1, pass == 0 ? RGB(255, 255, 255) : RGB(60, 78, 96));
-        HGDIOBJ ob = SelectObject(hdc, fill), op = SelectObject(hdc, pen);
-        RoundRect(hdc, 0, 0, w, h, 10, 10);
-        SelectObject(hdc, ob); SelectObject(hdc, op);
-        DeleteObject(fill); DeleteObject(pen);
-    }
+    HBRUSH artGround = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(art, &all, artGround);
+    DeleteObject(artGround);
+    HBRUSH maskGround = CreateSolidBrush(RGB(255, 255, 255));
+    FillRect(mask, &all, maskGround);
+    DeleteObject(maskGround);
+
+    HPEN none = (HPEN)GetStockObject(NULL_PEN);
+    HGDIOBJ oldMaskPen = SelectObject(mask, none);
+    HBRUSH inside = CreateSolidBrush(kMaskInside);
+    HGDIOBJ om = SelectObject(mask, inside);
+    RoundRect(mask, 0, 0, w + 1, h + 1, kPanelRadius * 2, kPanelRadius * 2);
+    SelectObject(mask, om);
+    SelectObject(mask, oldMaskPen);
+    DeleteObject(inside);
+
+    HGDIOBJ oldArtPen = SelectObject(art, none);
+    HBRUSH rim = CreateSolidBrush(kPanelBorder);
+    HGDIOBJ oa = SelectObject(art, rim);
+    RoundRect(art, 0, 0, w + 1, h + 1, kPanelRadius * 2, kPanelRadius * 2);
+    HBRUSH fill = CreateSolidBrush(kPanelFill);
+    SelectObject(art, fill);
+    RoundRect(art, 2, 2, w - 1, h - 1, kPanelRadius * 2 - 3, kPanelRadius * 2 - 3);
+    SelectObject(art, oa);
+    SelectObject(art, oldArtPen);
+    DeleteObject(rim); DeleteObject(fill);
 }
 
 static bool RenderDetailBgr(const ChartStats& st, bool graph,
@@ -1271,26 +1293,33 @@ static bool RenderDetailBgr(const ChartStats& st, bool graph,
         DetailPlate(dcA, dcM, w, h);
 
         if (!graph) {
+            // Laid out against the plate's 70 usable rows, with the label and the value column
+            // kept apart. They used to share a band -- the big note count was drawn over the rect
+            // "NOTES" had just been written into, which is what bit the corner off the label --
+            // and the four rows ran past the bottom rim, so JACK fell off the panel entirely.
+            // No heading: at this size it cost a row and said nothing the figures do not.
+            const int pad = 8, right = w - pad, split = w / 2 + 2;
             char buf[32];
-            int y = 6;
-            PanelText(dcA, "CHART", 10, FW_BOLD, kPanelTitle, RECT{8, y, w - 6, y + 12}, DT_LEFT, true);
-            y += 13;
-            struct Row { const char* label; const char* fmt; double value; };
+
+            // The note count keeps the headline size but shares its band with its label instead of
+            // taking a row of its own -- the two sit in different columns, so the height costs once.
             snprintf(buf, sizeof(buf), "%lu", (unsigned long)st.notes);
-            PanelText(dcA, "NOTES", 9, FW_NORMAL, kPanelSub, RECT{8, y, w - 6, y + 11}, DT_LEFT, true);
-            PanelText(dcA, buf, 14, FW_BOLD, kPanelText, RECT{6, y + 9, w - 8, y + 25}, DT_RIGHT, true);
-            y += 27;
+            PanelText(dcA, "NOTES", 9, FW_BOLD, kPanelTitle, RECT{pad, 8, split, 20}, DT_LEFT, true);
+            PanelText(dcA, buf, 15, FW_BOLD, kPanelText, RECT{split, 5, right, 24}, DT_RIGHT, true);
+
+            struct Row { const char* label; const char* fmt; double value; };
             const Row rows[] = {
-                {"NPS",   "%.1f",  st.nps},
-                {"PEAK",  "%.1f",  st.peakNps},
+                {"NPS",   "%.1f",   st.nps},
+                {"PEAK",  "%.1f",   st.peakNps},
                 {"CHORD", "%.0f%%", st.chordPct},
                 {"JACK",  "%.0f%%", st.jackPct},
             };
+            int y = 26;                          // 26 + 4 rows of 11 ends at 70, inside the 76 plate
             for (const Row& r : rows) {
                 snprintf(buf, sizeof(buf), r.fmt, r.value);
-                PanelText(dcA, r.label, 9, FW_NORMAL, kPanelSub, RECT{8, y, w / 2 + 6, y + 11}, DT_LEFT, true);
-                PanelText(dcA, buf, 10, FW_BOLD, kPanelText, RECT{w / 2 - 6, y, w - 8, y + 11}, DT_RIGHT, true);
-                y += 12;
+                PanelText(dcA, r.label, 9, FW_NORMAL, kPanelSub, RECT{pad, y, split, y + 11}, DT_LEFT, true);
+                PanelText(dcA, buf, 10, FW_BOLD, kPanelText, RECT{split, y, right, y + 11}, DT_RIGHT, true);
+                y += 11;
             }
         } else {
             // The bars. Height is the slice's share of the busiest one, the colour goes from the
@@ -1311,12 +1340,11 @@ static bool RenderDetailBgr(const ChartStats& st, bool graph,
                 const int x = left + i * 2;
                 RECT bar = {x, base - bh, x + 2, base};
                 const int heat = v;
+                // Art only: the plate's mask has already darkened everything under it, and painting
+                // the bars into the mask too would punch the background back through them.
                 HBRUSH b = CreateSolidBrush(RGB(50 + heat * 205 / 255, 214 - heat * 80 / 255, 255 - heat * 200 / 255));
                 FillRect(dcA, &bar, b);
                 DeleteObject(b);
-                HBRUSH m = CreateSolidBrush(RGB(255, 255, 255));
-                FillRect(dcM, &bar, m);
-                DeleteObject(m);
             }
             HBRUSH line = CreateSolidBrush(RGB(60, 78, 96));
             RECT axis = {left, base, left + kDensityBuckets * 2, base + 1};
