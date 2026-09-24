@@ -209,27 +209,43 @@ static const float kPeakForLevel[] = {
     24.00f, 30.00f, 38.00f
 };   // index = level, so kPeakForLevel[20] = 38.0
 
+// How much of the score is the hardest burst and how much is the chart's sustained density.
+//
+// Peak alone ranks the LIBRARY well but cannot tell one song's four charts apart: they usually
+// share the same climax, so Easy and Expert measure the same busiest two seconds and land on the
+// same level -- the 15/15/15/15 that looked like the old #PLAYLEVEL problem all over again.
+// Average NPS separates them, because the easier chart is thinner everywhere else.
+//
+// Swept over 400 songs of this library. Peak alone put 139 songs on four distinct levels and left
+// 45 collapsed onto two; at 0.8 that reads 152 and 23, and the worst cross-song bucket moves only
+// from 14.0% to 15.8%. Across the library nps*2.6 sits on the same scale as peak (the ratio holds
+// at 2.58..2.62 from level 5 to level 18), so blending them does not shift the curve's meaning.
+static const float kBurstWeight = 0.8f;
+
+static float chartScore(const ChartStats& st) {
+    return kBurstWeight * st.peakNps + (1.0f - kBurstWeight) * st.nps * 2.6f;
+}
+
 // Rate a chart 1..20 from what it plays like.
 //
-// Peak density carries the rating: it is the one measurement that rises cleanly across the whole
-// declared range and keeps rising through the charts the packs all call 18. Jacks are the one
-// independent signal on top -- the same notes repeating in a lane are harder than the same density
-// spread across lanes, and the measured jack rate climbs from 0% at level 2 to 15.5% at 18 -- so a
-// heavily jacked chart is worth one more level.
+// Jacks are the one signal independent of density: the same notes repeating in a lane are harder
+// than the same density spread across lanes, and the measured jack rate climbs from 0% at level 2
+// to 15.5% at 18, so a heavily jacked chart is worth one more level.
 static int rateChartFromStats(const ChartStats& st) {
     if (!st.measured()) return 0;
+    const float score = chartScore(st);
     const int top = (int)(sizeof(kPeakForLevel) / sizeof(kPeakForLevel[0])) - 1;   // 20
     float level;
-    if (st.peakNps <= kPeakForLevel[1]) {
+    if (score <= kPeakForLevel[1]) {
         level = 1.0f;
-    } else if (st.peakNps >= kPeakForLevel[top]) {
+    } else if (score >= kPeakForLevel[top]) {
         level = (float)top;              // 20 is the top of the scale; nothing above it to say
     } else {
         level = 1.0f;
         for (int i = 1; i < top; ++i) {
-            if (st.peakNps >= kPeakForLevel[i] && st.peakNps < kPeakForLevel[i + 1]) {
+            if (score >= kPeakForLevel[i] && score < kPeakForLevel[i + 1]) {
                 const float span = kPeakForLevel[i + 1] - kPeakForLevel[i];
-                level = (float)i + (span > 0.01f ? (st.peakNps - kPeakForLevel[i]) / span : 0.0f);
+                level = (float)i + (span > 0.01f ? (score - kPeakForLevel[i]) / span : 0.0f);
                 break;
             }
         }
@@ -3957,9 +3973,22 @@ static int clampPlayLevelForSongBin(const std::string& raw) {
 // What the wheel shows for a chart. The measured rating when there is one, else the declared
 // level. EZ2AC's own scale runs to 20 and the fit is built to use that headroom, so this is NOT
 // clamped to the 18 the BMS packs stop at.
+// Counted so the log can answer "was every chart actually measured, or is this still #PLAYLEVEL?".
+static unsigned long g_levelFromNotes = 0, g_levelFromDeclared = 0, g_songsOneLevel = 0, g_songsMulti = 0;
+
 static int chartDisplayLevel(const CustomBmsChart& chart) {
-    if (Config().levelFromNotes && chart.stats.rated > 0) return chart.stats.rated;
+    if (Config().levelFromNotes && chart.stats.rated > 0) { ++g_levelFromNotes; return chart.stats.rated; }
+    ++g_levelFromDeclared;
     return clampPlayLevelForSongBin(chart.playLevel);
+}
+
+void LogChartRatingSummary() {
+    const unsigned long total = g_levelFromNotes + g_levelFromDeclared;
+    if (!total) return;
+    LogLine("[rating] %lu of %lu charts rated from their notes, %lu fell back to #PLAYLEVEL "
+            "(unmeasurable); of %lu songs with 2+ charts, %lu still show one level for all of them",
+            g_levelFromNotes, total, g_levelFromDeclared,
+            g_songsMulti + g_songsOneLevel, g_songsOneLevel);
 }
 
 static float parseBpmForSongBin(const std::string& raw) {
@@ -4002,6 +4031,15 @@ static void AssignSongBinDifficultyFields(CustomBmsSong& song) {
             size_t pos = rest <= 4 ? slot : (slot * (rest - 1) + 1) / 3;
             song.chartMeta.mut()[ordered[1 + pos]].slot = (int)slot;
         }
+    }
+
+    if (song.chartMeta.size() >= 2) {
+        int first = -1; bool same = true;
+        for (const auto& chart : song.chartMeta) {
+            const int lv = parseIntSafe(chart.playLevel, 0);
+            if (first < 0) first = lv; else if (lv != first) { same = false; break; }
+        }
+        if (same) ++g_songsOneLevel; else ++g_songsMulti;
     }
 
     int* levels[kChartSlots] = {&song.levelNM, &song.levelHD, &song.levelSHD, &song.levelEX, &song.levelEZ};
@@ -6759,7 +6797,10 @@ static void ExpandAutoGeneratedModes() {
 // corrupts a song's metadata instead of failing loudly.
 // Bumped from ...2 when the cached BPM stopped being the declared one and became the tempo the
 // chart actually runs at: an old cache would keep showing the header's value. Costs one full rescan.
-static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','5' };
+// Bumped whenever the MEANING of something cached changes, because the entries carry finished
+// values, not raw input: ...4 added the note measurements, ...5 the density profile, ...6 the
+// blended score (a cache from ...5 would keep serving levels rated on peak density alone).
+static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','6' };
 
 struct ScanCacheEntry {
     uint64_t mtime = 0;
@@ -6933,6 +6974,7 @@ static void SaveScanCache() {
         DeleteFileA(finalPath.c_str());
         if (!MoveFileA(tmpPath.c_str(), finalPath.c_str())) DeleteFileA(tmpPath.c_str());
     }
+    LogChartRatingSummary();
     LogLine("[scancache] saved %lu songs (%.1f MB), %lu reused / %lu parsed this run",
             (unsigned long)count, b.size() / 1048576.0, g_scanCacheHits, g_scanCacheMisses);
 }
