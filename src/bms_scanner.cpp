@@ -4016,6 +4016,12 @@ static bool selectRandomBgaPoolVideo(std::string& selected) {
     return true;
 }
 
+// Ticks per BEAT on the grid these events live on. It was a hardcoded 48 -- the native
+// 192-per-measure figure -- long after our charts moved to kEzTicksPerMeasure, so every BGA
+// start time came out exactly twice as long as it should and the video ran that far behind
+// the music ("startTick=365 startMs=2493" for a 183 BPM chart: the real answer is 1247).
+static const double kDirectTicksPerBeat = (double)kEzTicksPerMeasure / 4.0;
+
 static uint32_t directTickToMilliseconds(uint32_t targetTick, float baseBpm,
                                          const std::vector<DirectRawEvent>& timing) {
     if (!targetTick) return 0;
@@ -4025,7 +4031,7 @@ static uint32_t directTickToMilliseconds(uint32_t targetTick, float baseBpm,
     for (const auto& event : timing) {
         if (event.tick > targetTick) break;
         if (event.tick > lastTick) {
-            ms += (double)(event.tick - lastTick) * 60000.0 / (bpm * 48.0);
+            ms += (double)(event.tick - lastTick) * 60000.0 / (bpm * kDirectTicksPerBeat);
             lastTick = event.tick;
         }
         if (event.type == 3) {
@@ -4034,7 +4040,7 @@ static uint32_t directTickToMilliseconds(uint32_t targetTick, float baseBpm,
         }
     }
     if (targetTick > lastTick)
-        ms += (double)(targetTick - lastTick) * 60000.0 / (bpm * 48.0);
+        ms += (double)(targetTick - lastTick) * 60000.0 / (bpm * kDirectTicksPerBeat);
     return ms >= 4294967295.0 ? 0xffffffffu : (uint32_t)(ms + 0.5);
 }
 
@@ -5875,6 +5881,18 @@ static const char* VisualRoleFor(const std::string& request) {
          : low.find("disc") != std::string::npos ? "disc" : nullptr;
 }
 
+// The song whose big disc is currently a placeholder, and whether its real art has arrived.
+static std::string g_placeholderDiscId;
+
+bool PlaceholderDiscReady() {
+    if (g_placeholderDiscId.empty()) return false;
+    const CustomBmsSong* song = FindCustomSongById(g_placeholderDiscId.c_str());
+    if (!song) { g_placeholderDiscId.clear(); return false; }
+    if (!SongVisualAssetReady(*song, "disc")) return false;
+    g_placeholderDiscId.clear();
+    return true;
+}
+
 bool SongVisualAssetReady(const CustomBmsSong& song, const char* role) {
     if (!role || song.cacheDir.empty()) return false;
     if (Config().assetsInMemory && RamAssetHas(song.id + "|" + role)) return true;
@@ -5896,6 +5914,7 @@ bool SongVisualAssetBytes(const CustomBmsSong& song, const std::string& request,
         VisualGenLockInit();
         if (!TryEnterCriticalSection(&g_visualGenLock)) {
             ArtPrefetchPrioritize(std::vector<std::string>(1, song.id));
+            g_placeholderDiscId = song.id;
             return RenderSplashBytes(out, std::string(), std::string(), 256, 256, true, false) && AbmFromBmpBytes(out);
         }
         LeaveCriticalSection(&g_visualGenLock);
@@ -5907,26 +5926,29 @@ bool SongVisualAssetBytes(const CustomBmsSong& song, const std::string& request,
 
 bool SongPreviewBytes(const CustomBmsSong& song, std::vector<unsigned char>& out) {
     if (song.cacheDir.empty()) return false;
-    const std::string key = song.id + "|ssf";
-    if (RamAssetGet(key, out)) return true;
     EnsureSongPreview(song);
-    return AbsorbFileToRam(key, JoinPath(song.cacheDir, song.id + ".ssf"), &out);
+    // Read, never absorb: AbsorbFileToRam deletes what it reads, and the preview has to stay on
+    // disk for the CRT open that actually plays it.
+    return readWholeFileForModel(JoinPath(song.cacheDir, song.id + ".ssf"), out);
 }
 
 // The preview is opened by the game's CRT fopen (openSample), which cannot take a memory
 // handle, so in the RAM mode it is written back to disk for that one open -- the previous one
 // deleted first, so at most one .ssf sits in the cache at a time.
 std::string SongPreviewFileForCrt(const CustomBmsSong& song) {
-    static std::string s_last;
+    static std::vector<std::string> s_recent;     // newest last; the oldest are deleted
     if (song.cacheDir.empty()) return std::string();
     const std::string path = JoinPath(song.cacheDir, song.id + ".ssf");
-    if (fileExistsLocal(path)) return path;
-    std::vector<unsigned char> bytes;
-    if (!SongPreviewBytes(song, bytes)) return std::string();
-    if (!s_last.empty() && s_last != path) DeleteFileA(s_last.c_str());
-    ensureDir(song.cacheDir);
-    if (!writeBinaryFile(path, bytes)) return std::string();
-    s_last = path;
+    if (!fileExistsLocal(path)) {
+        EnsureSongPreview(song);                  // writes the .ssf; no RAM round trip
+        if (!fileExistsLocal(path)) return std::string();
+    }
+    auto at = std::find(s_recent.begin(), s_recent.end(), path);
+    if (at != s_recent.end()) s_recent.erase(at);
+    s_recent.push_back(path);
+    // Deep enough that nothing still being played is ever the one deleted, shallow enough that
+    // the cache does not grow without bound at ~2 MB a song.
+    while (s_recent.size() > 64) { DeleteFileA(s_recent.front().c_str()); s_recent.erase(s_recent.begin()); }
     return path;
 }
 

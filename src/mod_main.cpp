@@ -199,9 +199,14 @@ static bool LooksLikeFormatString(const char* fmt) {
     return printable >= 2;
 }
 
+static bool IsSoundErrorFormat(const char* fmt) {
+    return fmt && (strstr(fmt, "LoadSample") || strstr(fmt, "OpenSample") ||
+                   strstr(fmt, "CreateSample") || strstr(fmt, "LockSample"));
+}
+
 static void __cdecl GameLogHook(const char* fmt, ...) {
-    if (!Config().traceGameLog) return;
     if (!LooksLikeFormatString(fmt)) return; // many destructor/unwind calls use FUN_00402880 without a valid format arg
+    if (!Config().traceGameLog && !IsSoundErrorFormat(fmt)) return;
     va_list ap;
     va_start(ap, fmt);
     LogV("[game] ", fmt, ap);
@@ -487,6 +492,17 @@ static std::string MaybeRedirectCustomDirectory(LPCSTR name) {
 static thread_local std::vector<unsigned char> g_pendingVirtualBytes;
 static thread_local bool g_redirectForCrt = false;   // the caller is fopen: no memory handles
 
+// The shipped one-second silent preview, and the reason a custom preview request must never come
+// back empty. On a failed load the game replaces m_sndPreview with a sample created FROM 0Blank
+// (songselectinput.cpp), and createSample sizes the pool buffer from the file it is given -- so
+// the preview player is left with a one-second buffer that no real preview fits into, and every
+// song from then on, custom or native, plays silence. Handing back the blank keeps the load
+// successful: that one song is quiet, the next one is not.
+static const std::string& BlankPreviewFile() {
+    static const std::string path = JoinPath(GetExeDirectory(), "System\\Preview\\0Blank.ssf");
+    return path;
+}
+
 static std::string MaybeRedirectCustomPath(LPCSTR name) {
     if (!name) return std::string();
     std::string p = name;
@@ -551,8 +567,9 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
             if (Config().assetsInMemory) {
                 // The preview is opened through the CRT (openSample -> fopen), which needs a file.
                 if (g_redirectForCrt && !s.cacheDir.empty() && fn == s.id + ".ssf") {
-                    const std::string file = SongPreviewFileForCrt(s);
-                    LogLine("[custom] preview for fopen '%s' -> '%s'", p.c_str(), file.empty() ? "<none>" : file.c_str());
+                    std::string file = SongPreviewFileForCrt(s);
+                    if (file.empty()) file = BlankPreviewFile();
+                    LogLine("[custom] preview for fopen '%s' -> '%s'", p.c_str(), file.c_str());
                     return file;
                 }
                 // Art and preview from the RAM store: the caller turns the bytes into a handle.
@@ -562,7 +579,7 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
                     g_pendingVirtualBytes.swap(bytes);
                     return std::string("\x01ram");
                 }
-                if (!s.cacheDir.empty() && fn == s.id + ".ssf") return std::string();
+                if (!s.cacheDir.empty() && fn == s.id + ".ssf") return BlankPreviewFile();
             }
             std::string visual = EnsureSongVisualAsset(s, p);
             if (!visual.empty()) {
@@ -1740,17 +1757,18 @@ static void RenderFfmpegVideoFrame(void* videoObject) {
         if (!g_directVideoDelayArmed) {
             g_directVideoDelayClock = GetTickCount();
             g_directVideoDelayArmed = true;
-            if (g_directVideoStartMs)
-                LogLine("[bga-direct] ffmpeg sync delay armed %lu ms", (unsigned long)g_directVideoStartMs);
+            if (!StartDirectBmsFfmpegVideo(g_directVideoPath)) {
+                LogLine("[bga-direct] ffmpeg fallback failed source='%s'", g_directVideoPath);
+                g_directVideoDisabled = true;
+                return;
+            }
+            LogLine("[bga-direct] ffmpeg stream opened, holding frame 1 for %lu ms",
+                    (unsigned long)g_directVideoStartMs);
         }
         if (GetTickCount() - g_directVideoDelayClock < g_directVideoStartMs) return;
-        if (!StartDirectBmsFfmpegVideo(g_directVideoPath)) {
-            LogLine("[bga-direct] ffmpeg fallback failed source='%s'", g_directVideoPath);
-            g_directVideoDisabled = true;
-            return;
-        }
         g_directVideoStarted = true;
-        LogLine("[bga-direct] ffmpeg video started");
+        LogLine("[bga-direct] ffmpeg video started %lu ms after the stage began",
+                (unsigned long)(GetTickCount() - g_directVideoDelayClock));
     }
     UploadFfmpegVideoFrame(videoObject);
     DrawFfmpegVideoNative(videoObject);

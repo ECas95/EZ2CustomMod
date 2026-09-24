@@ -144,6 +144,9 @@ std::string SongPreviewFileForCrt(const CustomBmsSong& song);   // the .ssf as a
 // Is this role's art already there (RAM store or .abm) without a render? The wheel window asks
 // before it hands the game a request, so the game thread never renders wheel art itself.
 bool SongVisualAssetReady(const CustomBmsSong& song, const char* role);
+// True once (and only once) after a placeholder disc's real art has finished rendering: the
+// song-select tick uses it to ask the renderer for a reload.
+bool PlaceholderDiscReady();
 // Move these ids to the front of the art queue (the rows on screen right now).
 void ArtPrefetchPrioritize(const std::vector<std::string>& ids);
 
