@@ -3667,14 +3667,18 @@ static std::string BuildSongIni(const CustomBmsSong& song, const CustomBmsChart&
     // The windows are in CHART TICKS: the loader sets m_nTPB = resolution x 4 (decomp
     // ez2djload.cpp), so a native chart's tick is 1/192 beat and ours, at kEzTicksPerMeasure,
     // is 1/384. The native numbers therefore have to be scaled by the grid ratio, or every
-    // window on a custom chart is half as many milliseconds as on a native one.
+    // window on a custom chart is half as many milliseconds as on a native one. The engine then
+    // widens every window by 3 ticks (decomp judge-timing.md, the caller of Judge::setWindows)
+    // whatever the grid, so that part is pre-scaled too: (v + 3) * k - 3 lands on exactly the
+    // native width in milliseconds.
     const int k = (int)kModelTickScale;
+    const int widen = 3 * (k - 1);
     int kool = 6, cool = 24, good = 50, miss = 70;
     if (m == "ez2Catch")       { kool = 5;  cool = 18; good = 40; miss = 56; }
     else if (m == "turnTable") { kool = 10; cool = 21; good = 45; miss = 60; }
     char judge[96];
     snprintf(judge, sizeof(judge), "Kool = %d\r\nCool = %d\r\nGood = %d\r\nMiss = %d\r\n",
-             kool * k, cool * k, good * k, miss * k);
+             kool * k + widen, cool * k + widen, good * k + widen, miss * k + widen);
     const char* gauge = m == "ez2Catch"  ? "Cool = 0.2\r\nGood = 0.0\r\nMiss = 0.0\r\nFail = -4.0\r\n"
                       : m == "turnTable" ? "Cool = 0.2\r\nGood = 0.1\r\nMiss = -1.5\r\nFail = -4.0\r\n"
                       : m == "clubMix"   ? "Cool = 0.4\r\nGood = 0.3\r\nMiss = -1.5\r\nFail = -4.0\r\n"
@@ -3707,12 +3711,14 @@ std::string EnsureSongIni(const CustomBmsSong& song, const std::string& requeste
     if (!chart) return std::string();
     std::string dst = JoinPath(song.cacheDir, requestedName);
     const std::string ini = BuildSongIni(song, *chart);
-    // Fresh AND the size the current text would have: the cipher keeps the length, so an ini
-    // written by an older version of BuildSongIni (other window values) is replaced, not served.
+    // Fresh AND byte-for-byte what the current BuildSongIni would write: the cipher is
+    // deterministic, so an ini from an older version (other window values, even of the same
+    // length) is replaced, not served. A few hundred bytes compared per chart load.
     if (cacheIsFresh(dst, JoinPath(song.songDir, chart->file))) {
-        WIN32_FILE_ATTRIBUTE_DATA ad{};
-        if (GetFileAttributesExA(dst.c_str(), GetFileExInfoStandard, &ad) &&
-            ad.nFileSizeHigh == 0 && ad.nFileSizeLow == ini.size()) return dst;
+        std::vector<unsigned char> have;
+        if (readWholeFileForModel(dst, have) &&
+            have == encryptFnexRuntimeKey(reinterpret_cast<const unsigned char*>(ini.data()), ini.size(), 0x0a8568))
+            return dst;
     }
     ensureDir(JoinPath(GetExeDirectory(), Config().cacheRoot));
     ensureDir(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), song.mode));
@@ -5625,6 +5631,24 @@ static DWORD WINAPI artPrefetchProc(void*) {
     return 0;
 }
 
+void ArtPrefetchPrioritize(const std::vector<std::string>& ids) {
+    if (!Config().artPrefetch || ids.empty()) return;
+    if (!g_artQueueLockReady) { InitializeCriticalSection(&g_artQueueLock); g_artQueueLockReady = true; }
+    EnterCriticalSection(&g_artQueueLock);
+    for (auto it = ids.rbegin(); it != ids.rend(); ++it) {
+        auto at = std::find(g_artQueue.begin(), g_artQueue.end(), *it);
+        if (at != g_artQueue.end()) g_artQueue.erase(at);
+        g_artQueue.insert(g_artQueue.begin(), *it);
+    }
+    LeaveCriticalSection(&g_artQueueLock);
+    if (InterlockedCompareExchange(&g_artBusy, 1, 0) != 0) return;   // the running thread picks them up
+    if (g_artThread) { CloseHandle(g_artThread); g_artThread = nullptr; }
+    g_artThread = CreateThread(nullptr, 0, artPrefetchProc, nullptr, CREATE_SUSPENDED, nullptr);
+    if (!g_artThread) { InterlockedExchange(&g_artBusy, 0); return; }
+    SetThreadPriority(g_artThread, THREAD_PRIORITY_BELOW_NORMAL);
+    ResumeThread(g_artThread);
+}
+
 void ArtPrefetchRequest(const std::vector<std::string>& ids) {
     if (!Config().artPrefetch) return;
     if (!g_artQueueLockReady) { InitializeCriticalSection(&g_artQueueLock); g_artQueueLockReady = true; }
@@ -5851,11 +5875,31 @@ static const char* VisualRoleFor(const std::string& request) {
          : low.find("disc") != std::string::npos ? "disc" : nullptr;
 }
 
+bool SongVisualAssetReady(const CustomBmsSong& song, const char* role) {
+    if (!role || song.cacheDir.empty()) return false;
+    if (Config().assetsInMemory && RamAssetHas(song.id + "|" + role)) return true;
+    return fileExistsLocal(JoinPath(JoinPath(song.cacheDir, role), song.id + ".abm"));
+}
+
 bool SongVisualAssetBytes(const CustomBmsSong& song, const std::string& request, std::vector<unsigned char>& out) {
     const char* role = VisualRoleFor(request);
     if (!role || song.cacheDir.empty()) return false;
     const std::string key = song.id + "|" + role;
     if (RamAssetGet(key, out)) return true;
+    const std::string file = JoinPath(JoinPath(song.cacheDir, role), song.id + ".abm");
+    if (fileExistsLocal(file)) return AbsorbFileToRam(key, file, &out);
+    // Not rendered yet. The big disc the game reloads at every cursor stop must not wait for
+    // the art thread (that wait was a hitch of up to a whole category's render): while the
+    // renderer is busy the game gets a blank 256x256 tile now and the real one on the next
+    // focus, and the song goes to the front of the queue. Any other role renders here.
+    if (strcmp(role, "disc") == 0 && Config().artPrefetch) {
+        VisualGenLockInit();
+        if (!TryEnterCriticalSection(&g_visualGenLock)) {
+            ArtPrefetchPrioritize(std::vector<std::string>(1, song.id));
+            return RenderSplashBytes(out, std::string(), std::string(), 256, 256, true, false) && AbmFromBmpBytes(out);
+        }
+        LeaveCriticalSection(&g_visualGenLock);
+    }
     const std::string path = EnsureSongVisualAsset(song, request);   // renders when missing
     if (path.empty()) return false;
     return AbsorbFileToRam(key, path, &out);
@@ -5867,6 +5911,23 @@ bool SongPreviewBytes(const CustomBmsSong& song, std::vector<unsigned char>& out
     if (RamAssetGet(key, out)) return true;
     EnsureSongPreview(song);
     return AbsorbFileToRam(key, JoinPath(song.cacheDir, song.id + ".ssf"), &out);
+}
+
+// The preview is opened by the game's CRT fopen (openSample), which cannot take a memory
+// handle, so in the RAM mode it is written back to disk for that one open -- the previous one
+// deleted first, so at most one .ssf sits in the cache at a time.
+std::string SongPreviewFileForCrt(const CustomBmsSong& song) {
+    static std::string s_last;
+    if (song.cacheDir.empty()) return std::string();
+    const std::string path = JoinPath(song.cacheDir, song.id + ".ssf");
+    if (fileExistsLocal(path)) return path;
+    std::vector<unsigned char> bytes;
+    if (!SongPreviewBytes(song, bytes)) return std::string();
+    if (!s_last.empty() && s_last != path) DeleteFileA(s_last.c_str());
+    ensureDir(song.cacheDir);
+    if (!writeBinaryFile(path, bytes)) return std::string();
+    s_last = path;
+    return path;
 }
 
 std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& request) {

@@ -485,6 +485,7 @@ static std::string MaybeRedirectCustomDirectory(LPCSTR name) {
 // Bytes an in-RAM redirect hands back through MaybeRedirectCustomPath: the marker "\x01ram" as the
 // path, the content here, turned into a virtual handle by the CreateFileA hook.
 static thread_local std::vector<unsigned char> g_pendingVirtualBytes;
+static thread_local bool g_redirectForCrt = false;   // the caller is fopen: no memory handles
 
 static std::string MaybeRedirectCustomPath(LPCSTR name) {
     if (!name) return std::string();
@@ -548,9 +549,16 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
         if (DirectBmsEnabled()) {
             std::string fn = FileNameOnly(p);
             if (Config().assetsInMemory) {
+                // The preview is opened through the CRT (openSample -> fopen), which needs a file.
+                if (g_redirectForCrt && !s.cacheDir.empty() && fn == s.id + ".ssf") {
+                    const std::string file = SongPreviewFileForCrt(s);
+                    LogLine("[custom] preview for fopen '%s' -> '%s'", p.c_str(), file.empty() ? "<none>" : file.c_str());
+                    return file;
+                }
                 // Art and preview from the RAM store: the caller turns the bytes into a handle.
                 std::vector<unsigned char> bytes;
-                if (SongVisualAssetBytes(s, p, bytes) || (!s.cacheDir.empty() && fn == s.id + ".ssf" && SongPreviewBytes(s, bytes))) {
+                if (!g_redirectForCrt &&
+                    (SongVisualAssetBytes(s, p, bytes) || (!s.cacheDir.empty() && fn == s.id + ".ssf" && SongPreviewBytes(s, bytes)))) {
                     g_pendingVirtualBytes.swap(bytes);
                     return std::string("\x01ram");
                 }
@@ -1922,14 +1930,19 @@ static void __fastcall HookDirectVideoFrame(void* self, void*) {
     if (!g_directVideoDisabled && g_directVideoFfmpeg && self == g_directVideoObject) {
         RenderFfmpegVideoFrame(self);
         ModTimeAdd(kModTimeVideo, ModTimeNow() - t0);
+        PlayCardDraw();
         return;
     }
     if (!g_directVideoDisabled && g_directVideoTargetReady && self == g_directVideoObject) {
         RenderDirectVideoFrame(self);
         ModTimeAdd(kModTimeVideo, ModTimeNow() - t0);
+        PlayCardDraw();
         return;
     }
     if (RealVideoFrame) RealVideoFrame(self);
+    // Gameplay's one per-frame call we own: doOp7(1) runs about once a second there, so the
+    // "now playing" card is drawn from here, after the BGA and before the notes.
+    PlayCardDraw();
 }
 
 // ---- constant scroll speed ---------------------------------------------------------------------
@@ -1979,6 +1992,54 @@ void PlayCardDraw() {
     g_panelPosOverride = true;
     HudPanelDraw();
     g_panelPosOverride = false;
+}
+
+// ---- judge offset ------------------------------------------------------------------------------
+//
+// The press time the judge compares is KEZPlayer vtable slot 22 (@0x40f450): `max(clock - 5, 1)`,
+// the 5 being the developers' fixed input-latency compensation in chart ticks. [Gameplay]
+// JudgeOffsetMs shifts it: positive means "my presses arrive late, count them earlier". It is
+// turned into ticks at every chart load from that chart's BPM and ticks per beat, because a tick
+// is 1/192 of a beat on a native chart and 1/384 on ours.
+static const uint32_t kPressTimeVtableSlot = 0x887d0 + 22 * 4;
+static volatile int g_judgeOffsetTicks = 0;
+static float g_judgeTickMs = 0.0f;   // one engine tick of the chart now loaded, in ms
+
+float JudgeTickMs() { return g_judgeTickMs; }
+int   JudgeOffsetTicks() { return g_judgeOffsetTicks; }
+
+static int __fastcall PressTimeWithOffset(void* player, void*) {
+    const int t = *reinterpret_cast<int*>(static_cast<char*>(player) + 0x7258) - 5 - g_judgeOffsetTicks;
+    return t >= 0 ? t : 1;
+}
+
+static void InstallJudgeOffset() {
+    if (Config().judgeOffsetMs == 0) return;
+    const uint32_t original = *reinterpret_cast<uint32_t*>(Rva(kPressTimeVtableSlot));
+    if (original != reinterpret_cast<uint32_t>(Rva(0x0f450))) {
+        LogLine("[judge] offset NOT installed: vtable slot 22 points elsewhere (%08lx), another patch owns it",
+                (unsigned long)original);
+        return;
+    }
+    void* fn = reinterpret_cast<void*>(&PressTimeWithOffset);
+    if (WriteMemory(Rva(kPressTimeVtableSlot), &fn, 4))
+        LogLine("[judge] offset hook installed: %d ms", Config().judgeOffsetMs);
+}
+
+static void UpdateJudgeOffsetForChart(void* chart) {
+    if (!chart) return;
+    float bpm = 0.0f; uint32_t res = 0;
+    memcpy(&bpm, static_cast<const char*>(chart) + 0x8c, 4);
+    memcpy(&res, static_cast<const char*>(chart) + 0x88, 4);
+    if (!(bpm > 20.0f && bpm < 1000.0f) || res == 0 || res > 4096) return;
+    // +0x88 on disk is ticks per measure; the loader's x4 makes that the ticks per beat the
+    // engine runs at (192 native, 384 ours), so one tick lasts 60000 / (res * bpm) ms.
+    g_judgeTickMs = 60000.0f / ((float)res * bpm);
+    if (Config().judgeOffsetMs == 0) { g_judgeOffsetTicks = 0; return; }
+    const int ticks = (int)((double)Config().judgeOffsetMs / g_judgeTickMs + (Config().judgeOffsetMs > 0 ? 0.5 : -0.5));
+    g_judgeOffsetTicks = ticks;
+    LogLine("[judge] offset %d ms = %d ticks at %.1f BPM, %lu ticks/beat (%.3f ms/tick)",
+            Config().judgeOffsetMs, ticks, bpm, (unsigned long)res, g_judgeTickMs);
 }
 
 static void ApplyConstantSpeed(void* chart, bool custom) {
@@ -2039,6 +2100,7 @@ static int __fastcall HookSongPackage(void* self, void*, const char* request) {
     if (LoadCustomBmsDirect(self, ezChosen ? ezRequest.c_str() : request)) {
         if (ezChosen) PublishEzTextSlot(ezRequest.c_str());
         ApplyConstantSpeed(self, true);
+        UpdateJudgeOffsetForChart(self);
         if (Config().hudPanel) {
             const std::string low = LowerAscii(ezChosen ? ezRequest : std::string(request ? request : ""));
             const char* diff = low.find("-shd") != std::string::npos ? "SHD" : low.find("-hd") != std::string::npos ? "HD"
@@ -2051,6 +2113,11 @@ static int __fastcall HookSongPackage(void* self, void*, const char* request) {
                 char sub[128];
                 snprintf(sub, sizeof(sub), "%s   %.0f BPM   %s   speed %d%%", s.artist.c_str(), bpm, diff,
                          *reinterpret_cast<const int*>(kSpeedPercentVar));
+                if (Config().judgeOffsetMs != 0) {
+                    char off[32];
+                    snprintf(off, sizeof(off), "   judge %+d ms", Config().judgeOffsetMs);
+                    strncat(sub, off, sizeof(sub) - strlen(sub) - 1);
+                }
                 g_playCardTitle = "NOW PLAYING";
                 g_playCardLine = s.title;
                 g_playCardSub = sub;
@@ -2072,7 +2139,7 @@ static int __fastcall HookSongPackage(void* self, void*, const char* request) {
     ResetDirectBmsVideo();
     ResetDirectBmsVideoRuntime();
     const int r = RealSongPackage ? RealSongPackage(self, request) : 0;
-    if (r) ApplyConstantSpeed(self, false);
+    if (r) { ApplyConstantSpeed(self, false); UpdateJudgeOffsetForChart(self); }
     return r;
 }
 
@@ -2148,7 +2215,10 @@ static bool InstallDirectBmsHook() {
 }
 
 static void* __cdecl HookGameFsOpen(const char* name, const char* mode) {
+    g_redirectForCrt = true;
     std::string redirected = MaybeRedirectCustomPath(name);
+    g_redirectForCrt = false;
+    if (redirected == "\x01ram") { g_pendingVirtualBytes.clear(); redirected.clear(); }
 
     // v10.6 hybrid mode: support both native encrypted .ezi and already-plaintext .ezz.
     // If the cache .ezz is plaintext EZI-map text, protect it from FNEX's encrypted-.ezi
@@ -3038,6 +3108,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     // dangling every texture handle (lost native discs). The songname budget caps loads to fit it.
     bool directBms = InstallDirectBmsHook();
     SetDirectBmsEnabled(directBms);
+    InstallJudgeOffset();
     if (Config().showProgressPopup) ShowStartupPopup();
     ScanBMSData();
     InstallTraceHooks();

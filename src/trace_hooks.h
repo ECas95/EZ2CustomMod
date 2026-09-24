@@ -36,7 +36,9 @@ void EzColumnDraw(uint32_t obj);
 // the speed. Defined in mod_main.
 void ConstantSpeedNoteSelection(float bpm, const char* id);
 int  ConstantSpeedPredict(float bpm);          // 0 = no change would be made
-void PlayCardDraw();                            // the "now playing" card, any screen but song select
+void PlayCardDraw();
+float JudgeTickMs();                            // ms per engine tick of the chart loaded now
+int   JudgeOffsetTicks();                       // the [Gameplay] JudgeOffsetMs, in those ticks                            // the "now playing" card, any screen but song select
 
 // Frame-time meter. Every hook of ours adds the QPC ticks it spent to one of these buckets; the
 // frame-end hook reports frame pacing and the buckets every few seconds, so a stutter can be

@@ -140,6 +140,12 @@ std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& 
 // scratch, removed once absorbed). The preview .ssf likewise.
 bool SongVisualAssetBytes(const CustomBmsSong& song, const std::string& request, std::vector<unsigned char>& out);
 bool SongPreviewBytes(const CustomBmsSong& song, std::vector<unsigned char>& out);
+std::string SongPreviewFileForCrt(const CustomBmsSong& song);   // the .ssf as a file, for fopen
+// Is this role's art already there (RAM store or .abm) without a render? The wheel window asks
+// before it hands the game a request, so the game thread never renders wheel art itself.
+bool SongVisualAssetReady(const CustomBmsSong& song, const char* role);
+// Move these ids to the front of the art queue (the rows on screen right now).
+void ArtPrefetchPrioritize(const std::vector<std::string>& ids);
 
 // Song-select BGA preview: decode a few seconds of a song's video into raw BGR24 frames.
 bool DecodeBgaPreview(const std::string& videoPath, int size, int fps, int seconds,

@@ -1134,6 +1134,7 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
     LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
     unsigned long loaded = 0, discs = 0, blocked = 0;
     g_snWindowPending = false;
+    std::vector<std::string> notReady;
     // Outward from the cursor -- 0, -1, +1, -2, +2 ... -- so the rows on screen fill first and the
     // margin last; with the per-frame budget that order is what the player sees.
     for (int32_t step = 0; step <= half * 2; ++step) {
@@ -1156,18 +1157,28 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
         const char* id = reinterpret_cast<const char*>(entry + kEntryIdOff);
         if (id[0] != 'b' || id[1] != 'm' || id[2] != 's') continue;     // native songs: not ours
         if (!GdiHeadroomAvailable(2)) { ++blocked; break; }
+        // Art not rendered yet is left to the art thread (this row goes to the front of its
+        // queue) and the row is retried next frame: the game thread never renders wheel art.
+        const CustomBmsSong* song = Config().artPrefetch ? FindCustomSongById(std::string(id, strnlen(id, 31)).c_str()) : nullptr;
         char request[MAX_PATH] = {};
         if (!*nameSlot) {
-            snprintf(request, sizeof(request), "system\\songname\\%.31s.bmp", id);
-            loadTex(gfxCtx, request, nameSlot, nullptr);
-            if (*nameSlot) ++loaded;
+            if (song && !SongVisualAssetReady(*song, "songname")) { notReady.push_back(song->id); g_snWindowPending = true; }
+            else {
+                snprintf(request, sizeof(request), "system\\songname\\%.31s.bmp", id);
+                loadTex(gfxCtx, request, nameSlot, nullptr);
+                if (*nameSlot) ++loaded;
+            }
         }
         if (wantDisc && !*discSlot) {
-            snprintf(request, sizeof(request), "system\\discsmall\\%.31s.bmp", id);
-            loadTex(gfxCtx, request, discSlot, nullptr);
-            if (*discSlot) ++discs;
+            if (song && !SongVisualAssetReady(*song, "discsmall")) { notReady.push_back(song->id); g_snWindowPending = true; }
+            else {
+                snprintf(request, sizeof(request), "system\\discsmall\\%.31s.bmp", id);
+                loadTex(gfxCtx, request, discSlot, nullptr);
+                if (*discSlot) ++discs;
+            }
         }
     }
+    if (!notReady.empty()) ArtPrefetchPrioritize(notReady);
     if (loaded || discs || blocked) {
         static unsigned long s_total = 0;
         s_total += loaded + discs;
@@ -1529,46 +1540,64 @@ static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visib
     }
 }
 
+// Wheel category icons: the texture arrays are relocated to the grown object tail
+// (kCatTexSmallReloc/kCatTexBigReloc), so slots 47.. are safe free memory. The native
+// loader fills [0..46]; we load OUR category_NN.bmp into [47..] of both arrays via the
+// game's loader (thiscall, ecx=gfx ctx [0x1b2f054]) -- same call as songname. Redirect
+// serves category_48/49.bmp from our _categories cache. Only when relocated.
+//
+// Called from the pre-filter and again on the first song-select frame after it: the ctor
+// seeds its page (which runs the pre-filter) and THEN runs its own icon loop (decomp
+// songselectctor.cpp:1040), category_(i+1) into every slot up to the count, which put native
+// tiles into the custom slots until the first category change. The loader is keyed by file
+// name (loadtexture.cpp), so a repeat pass is a lookup per slot, not a load.
+static bool g_wheelIconsPending = false;
+
+static void RefreshWheelIcons(uint32_t obj) {
+    if (!(g_customCategoryCount > 0 && g_capacityPatched && g_catTexSmallBase)) return;
+    typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
+    LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
+    uint32_t gfxCtx = SafeRead32(0x1b2f054);
+    if (!gfxCtx) return;
+    // The game's own loader filled slots 0..46 from category_01..47, so after the
+    // compaction slot N holds the tile of a category that is no longer there. Re-point the
+    // kept natives at the files they actually belong to: slot N <- category_(N + 4).
+    for (uint32_t n = 0; n < kCustomCatBase; ++n) {
+        char nf[96];
+        snprintf(nf, sizeof(nf), "System\\SongSelect\\Sortimage\\category_%02lu.bmp",
+                 (unsigned long)(n + kNativeSrcFirst + 1));
+        loadTex(gfxCtx, nf, reinterpret_cast<void*>(obj + g_catTexSmallBase + n * 4), nullptr);
+        // No categorybig_ here. That name appears nowhere in the executable -- it is
+        // ours, invented for the custom categories and served from RAM at base 48.
+        // Asking for categorybig_04 found neither a file nor a redirect, so the loader
+        // fell back to drawing the filename itself: that is the "categorybig_04" tile
+        // that appeared in the wheel. The big slot keeps whatever the game put there.
+    }
+    for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
+        int catNum = 48 + (int)c;             // FILENAME: native files are 01..47 on disk
+        char fn[80];
+        snprintf(fn, sizeof(fn), "System\\SongSelect\\Sortimage\\category_%02d.bmp", catNum);
+        uint32_t slot = kCustomCatBase + c;   // SLOT: we now start at 19, not 47
+        // Small array = the tab row (short folder name). Big array = the large centre
+        // label, which gets its own asset with the full details.txt name.
+        loadTex(gfxCtx, fn, reinterpret_cast<void*>(obj + g_catTexSmallBase + slot * 4), nullptr);
+        char bigFn[96] = {};
+        snprintf(bigFn, sizeof(bigFn), "System\\SongSelect\\Sortimage\\categorybig_%02d.bmp", catNum);
+        loadTex(gfxCtx, bigFn, reinterpret_cast<void*>(obj + g_catTexBigBase + slot * 4), nullptr);
+    }
+}
+
 static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
     DumpSongSelectStructure(obj, cat);
     InjectCustomSongsIntoSongSelect(obj, "pre-filter", cat);
     LoadCustomCategorySongnames(obj, cat);
-    // Wheel category icons: the texture arrays are relocated to the grown object tail
-    // (kCatTexSmallReloc/kCatTexBigReloc), so slots 47.. are safe free memory. The native
-    // loader fills [0..46]; we load OUR category_NN.bmp into [47..] of both arrays via the
-    // game's loader (thiscall, ecx=gfx ctx [0x1b2f054]) — same call as songname. Redirect
-    // serves category_48/49.bmp from our _categories cache. Only when relocated.
+    RefreshWheelIcons(obj);
+    g_wheelIconsPending = true;   // once more on the next frame, after the ctor's own icon loop
     if (g_customCategoryCount > 0 && g_capacityPatched && g_catTexSmallBase) {
         typedef int(__thiscall* LoadTexFn)(uint32_t ctx, const char* file, void* dest, const char* alt);
         LoadTexFn loadTex = (LoadTexFn)Rva(0x8d00);
         uint32_t gfxCtx = SafeRead32(0x1b2f054);
         if (gfxCtx) {
-            // The game's own loader filled slots 0..46 from category_01..47, so after the
-            // compaction slot N holds the tile of a category that is no longer there. Re-point the
-            // kept natives at the files they actually belong to: slot N <- category_(N + 4).
-            for (uint32_t n = 0; n < kCustomCatBase; ++n) {
-                char nf[96];
-                snprintf(nf, sizeof(nf), "System\\SongSelect\\Sortimage\\category_%02lu.bmp",
-                         (unsigned long)(n + kNativeSrcFirst + 1));
-                loadTex(gfxCtx, nf, reinterpret_cast<void*>(obj + g_catTexSmallBase + n * 4), nullptr);
-                // No categorybig_ here. That name appears nowhere in the executable -- it is
-                // ours, invented for the custom categories and served from RAM at base 48.
-                // Asking for categorybig_04 found neither a file nor a redirect, so the loader
-                // fell back to drawing the filename itself: that is the "categorybig_04" tile
-                // that appeared in the wheel. The big slot keeps whatever the game put there.
-            }
-            for (uint32_t c = 0; c < g_customCategoryCount; ++c) {
-                int catNum = 48 + (int)c;             // FILENAME: native files are 01..47 on disk
-                char fn[80];
-                snprintf(fn, sizeof(fn), "System\\SongSelect\\Sortimage\\category_%02d.bmp", catNum);
-                uint32_t slot = kCustomCatBase + c;   // SLOT: we now start at 19, not 47
-                // Small array = the tab row (short folder name). Big array = the large centre
-                // label, which gets its own asset with the full details.txt name.
-                loadTex(gfxCtx, fn, reinterpret_cast<void*>(obj + g_catTexSmallBase + slot * 4), nullptr);
-                char bigFn[96] = {};
-                snprintf(bigFn, sizeof(bigFn), "System\\SongSelect\\Sortimage\\categorybig_%02d.bmp", catNum);
-                loadTex(gfxCtx, bigFn, reinterpret_cast<void*>(obj + g_catTexBigBase + slot * 4), nullptr);
-            }
             // Version labels. The natives are copied rather than reloaded: the game's own loader
             // already filled them at the original base, and this array is only read, never
             // written, by the renderer. Done here and not at patch time because those textures
@@ -1679,6 +1708,66 @@ static void SongSelectPreFilter(uint32_t obj, uint32_t cat) {
                     (unsigned long)SafeRead32(obj + g_catTexBigBase + kCustomCatBase * 4));
         }
     }
+}
+
+// ---- judge statistics -------------------------------------------------------------------------
+//
+// Every judgement passes through the grading core @0x426500 as (lane, now, target); the press
+// verdict targets the note's start, the tail verdict (return address inside @0x4268c0) its end.
+// With TraceJudge on, the signed dt of every call is folded into one summary per song, so a
+// systematic early/late bias -- what [Gameplay] JudgeOffsetMs is for -- can be read off the log
+// instead of guessed: the "suggest" figure is the offset that would centre the presses.
+struct JudgeStats {
+    uint32_t obj = 0;
+    long pressN = 0, pressSum = 0, early = 0, late = 0;
+    long band[5] = {};            // kool, cool, good, fail, stray -- from the windows in the object
+    long tailN = 0, tailSum = 0, tailEarlyFail = 0;
+    long win[4] = {};             // kool, cool, good, miss thresholds (late table)
+    float tickMs = 0.0f;
+    int offsetTicks = 0;
+};
+static JudgeStats g_judgeStats;
+
+static void JudgeStatsFlush() {
+    JudgeStats& s = g_judgeStats;
+    if (!s.obj || (!s.pressN && !s.tailN)) { s = JudgeStats(); return; }
+    const double meanP = s.pressN ? (double)s.pressSum / s.pressN : 0.0;
+    const double meanT = s.tailN ? (double)s.tailSum / s.tailN : 0.0;
+    const double ms = s.tickMs > 0.0f ? s.tickMs : 0.0;
+    LogLine("[judge] song stats: presses=%ld mean dt=%+.1f ticks (%+.0f ms; -early/+late) early=%ld late=%ld "
+            "kool=%ld cool=%ld good=%ld fail=%ld stray=%ld | hold tails=%ld mean dt=%+.1f ticks, released too early=%ld "
+            "| offset now %d ticks, suggest JudgeOffsetMs=%d",
+            s.pressN, meanP, meanP * ms, s.early, s.late,
+            s.band[0], s.band[1], s.band[2], s.band[3], s.band[4],
+            s.tailN, meanT, s.tailEarlyFail,
+            s.offsetTicks, (int)((meanP + s.offsetTicks) * ms + ((meanP + s.offsetTicks) >= 0 ? 0.5 : -0.5)));
+    s = JudgeStats();
+}
+
+static void JudgeStatsAdd(uint32_t obj, uint32_t retAddr, int now, int target) {
+    JudgeStats& s = g_judgeStats;
+    if (s.obj != obj) {
+        JudgeStatsFlush();
+        s.obj = obj;
+        s.tickMs = JudgeTickMs();
+        s.offsetTicks = JudgeOffsetTicks();
+        for (int i = 0; i < 4; ++i) s.win[i] = (long)SafeRead32(obj + 164 - i * 4);   // 164 kool .. 152 miss
+    }
+    const int dt = now - target;
+    const bool tail = retAddr >= (uint32_t)Rva(0x268c0) && retAddr < (uint32_t)Rva(0x26ab0);
+    if (tail) {
+        ++s.tailN; s.tailSum += dt;
+        if (dt < -s.win[3]) ++s.tailEarlyFail;
+        return;
+    }
+    ++s.pressN; s.pressSum += dt;
+    if (dt < 0) ++s.early; else ++s.late;
+    const long a = dt < 0 ? -dt : dt;
+    const int band = a <= s.win[0] ? 0 : a <= s.win[1] ? 1 : a <= s.win[2] ? 2 : a <= s.win[3] ? 3 : 4;
+    ++s.band[band];
+    if ((s.pressN % 200) == 0)
+        LogLine("[judge] running: presses=%ld mean dt=%+.1f ticks (%+.0f ms) early=%ld late=%ld", s.pressN,
+                (double)s.pressSum / s.pressN, (double)s.pressSum / s.pressN * s.tickMs, s.early, s.late);
 }
 
 static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit) {
@@ -1818,6 +1907,8 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
     if (h->rva == 0x33D50 && regs) {
         g_ssFrameStamp = GetTickCount();
         g_ssFrameObj = regs->ecx;
+        if (g_wheelIconsPending) { g_wheelIconsPending = false; RefreshWheelIcons(regs->ecx); }
+        if (g_judgeStats.obj) JudgeStatsFlush();
         // BuildStub does pushfd before pushad, so PUSHAD's saved ESP is function-entry ESP - 4.
         uint32_t functionEsp = regs->originalEsp + 4;
         uint32_t selected = *reinterpret_cast<uint32_t*>(functionEsp + 12);
@@ -1911,6 +2002,10 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
             }
         }
         n = ++h->judgeHits;
+        if (h->rva == 0x26500) {
+            const uint32_t esp = regs->originalEsp;
+            JudgeStatsAdd(regs->ecx, SafeRead32(esp + 4), (int)SafeRead32(esp + 12), (int)SafeRead32(esp + 16));
+        }
     }
     if (n <= 20 || (n % 1000) == 0 || !isJudge) {
         LogKnownFunctionArgs(h, regs, n);
