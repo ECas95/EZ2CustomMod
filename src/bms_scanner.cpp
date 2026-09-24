@@ -36,6 +36,7 @@ static int g_scanTotal = 0;   // song folders to process this scan — drives th
 static bool g_directBmsEnabled = false;
 static std::string g_directBmsVideoPath;
 static uint32_t g_directBmsVideoStartMs = 0;
+static float g_directBmsDominantBpm = 0.0f;
 // True when the clip came from the generic Video\_spv pool rather than the song's own BGA.
 // Those are shorter than most songs, so they are the ones worth looping.
 static bool g_directBmsVideoFallback = false;
@@ -43,9 +44,11 @@ static bool g_directBmsVideoFallback = false;
 void SetDirectBmsEnabled(bool enabled) { g_directBmsEnabled = enabled; }
 bool DirectBmsEnabled() { return g_directBmsEnabled; }
 void ResetDirectBmsVideo() { StopDirectBmsFfmpegVideo(); g_directBmsVideoPath.clear();
-                             g_directBmsVideoStartMs = 0; g_directBmsVideoFallback = false; }
+                             g_directBmsVideoStartMs = 0; g_directBmsVideoFallback = false;
+                             g_directBmsDominantBpm = 0.0f; }
 const std::string& DirectBmsVideoPath() { return g_directBmsVideoPath; }
 uint32_t DirectBmsVideoStartMs() { return g_directBmsVideoStartMs; }
+float DirectBmsDominantBpm() { return g_directBmsDominantBpm; }
 bool DirectBmsVideoIsFallback() { return g_directBmsVideoFallback; }
 
 // Forward declarations for helpers used by the audio cache block.
@@ -243,6 +246,10 @@ struct ParsedBmsEvent {
     int wavId = 0;
 };
 
+struct ParsedBmsForEz;
+// Defined next to the tick converter it needs; the parser, which is above both, calls it last.
+static void BuildStopShift(ParsedBmsForEz& bms);
+
 struct ParsedBmsTempoEvent {
     int measure = 0;
     int index = 0;
@@ -263,6 +270,12 @@ struct ParsedBmsForEz {
     std::string directVideo;
     std::set<int> bgmWavIds; // sample ids referenced from BMS #xxx01 BGM channel
     std::map<int, double> bpmMap;
+    // #STOPxx values, in 1/192 of a whole note (the format's unit), and the channel-09 sequence
+    // that plays them. Resolved into StopShift below once the whole file has been read, because
+    // a stop's tick position depends on #xxx02 measure scaling that may appear after it.
+    std::map<int, double> stopMap;
+    std::vector<ParsedBmsTempoEvent> stopEvents;   // bpm field reused for the stop VALUE
+    std::vector<std::pair<uint32_t, uint32_t>> stopShift;   // {tick, ticks inserted there}
     int lnObjId = 0;
 };
 
@@ -323,6 +336,14 @@ static bool parseBmsForEz(const std::string& path, ParsedBmsForEz& out) {
                 if (id > 0 && bpm > 0.0) out.bpmMap[id] = bpm;
             }
         }
+        else if (u.rfind("#STOP", 0) == 0 && s.size() >= 7) {
+            size_t sp = s.find_first_of(" \t", 5);
+            if (sp != std::string::npos) {
+                int id = parseBase36_2(s, 5);
+                double value = parseDoubleSafe(trim(s.substr(sp + 1)), 0.0);
+                if (id > 0 && value > 0.0) out.stopMap[id] = value;
+            }
+        }
         else if (u.rfind("#LNOBJ", 0) == 0) out.lnObjId = parseBase36_2(trim(s.substr(6)), 0);
         else if (u.rfind("#PLAYLEVEL", 0) == 0) out.playLevel = parseIntSafe(trim(s.substr(10)), out.playLevel);
         else if (u.rfind("#WAV", 0) == 0 && s.size() >= 6) {
@@ -372,6 +393,12 @@ static bool parseBmsForEz(const std::string& path, ParsedBmsForEz& out) {
             for (int i = 0; i < div; ++i) {
                 int wav = parseBase36_2(data, (size_t)i * 2);
                 if (wav == 0) continue;
+                if (channel == 9) {
+                    auto it = out.stopMap.find(wav);
+                    if (it != out.stopMap.end() && it->second > 0.0)
+                        out.stopEvents.push_back({measure, i, div, it->second});
+                    continue;
+                }
                 if (channel == 3 || channel == 8) {
                     double bpm = 0.0;
                     if (channel == 3) {
@@ -399,6 +426,7 @@ static bool parseBmsForEz(const std::string& path, ParsedBmsForEz& out) {
     if (out.title.empty()) out.title = "BMSData";
     if (out.artist.empty()) out.artist = "BMSData";
     if (out.bpm <= 0.0) out.bpm = 120.0;
+    BuildStopShift(out);
     return true;
 }
 
@@ -475,7 +503,7 @@ static const uint32_t kModelTickScale = kEzTicksPerMeasure / kNativeTicksPerMeas
 // scaling it to 12 "for the 384 grid" turned every custom tap into a hold.
 static const int kMinNoteLenTicks = 6;
 
-static uint32_t bmsTickToEzTick(const ParsedBmsForEz& bms, int measure, int index, int div) {
+static uint32_t bmsTickRaw(const ParsedBmsForEz& bms, int measure, int index, int div) {
     double pos = 0.0;
     for (int m = 0; m < measure; ++m) {
         double scale = 1.0;
@@ -487,6 +515,66 @@ static uint32_t bmsTickToEzTick(const ParsedBmsForEz& bms, int measure, int inde
     pos += ((double)index / (double)div) * (double)kEzTicksPerMeasure * scale;
     if (pos < 0.0) pos = 0.0;
     return (uint32_t)(pos + 0.5);
+}
+
+// How many ticks a #STOP of `value` is worth.
+//
+// The format measures a stop in 1/192 of a WHOLE NOTE, and a whole note is one 4/4 measure, so
+// the conversion is a plain scale onto our grid and does not involve the tempo at all.
+static uint32_t stopValueToTicks(double value) {
+    if (!(value > 0.0)) return 0;
+    const double ticks = value * (double)kEzTicksPerMeasure / 192.0;
+    return ticks >= 4294967295.0 ? 0xffffffffu : (uint32_t)(ticks + 0.5);
+}
+
+// Resolve the channel-09 sequence into {tick, inserted ticks}, sorted, with stops landing on the
+// same tick merged. Called once the whole file is parsed.
+static void BuildStopShift(ParsedBmsForEz& bms) {
+    bms.stopShift.clear();
+    if (bms.stopEvents.empty()) return;
+    std::vector<std::pair<uint32_t, uint32_t>> raw;
+    raw.reserve(bms.stopEvents.size());
+    for (const auto& se : bms.stopEvents) {
+        const uint32_t ticks = stopValueToTicks(se.bpm);   // the struct's value field
+        if (ticks) raw.push_back({bmsTickRaw(bms, se.measure, se.index, se.div), ticks});
+    }
+    std::sort(raw.begin(), raw.end(),
+              [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
+                  return a.first < b.first;
+              });
+    for (const auto& r : raw) {
+        if (!bms.stopShift.empty() && bms.stopShift.back().first == r.first)
+            bms.stopShift.back().second += r.second;
+        else
+            bms.stopShift.push_back(r);
+    }
+}
+
+// A #STOP freezes the chart for a fixed fraction of a measure. The engine has no stop record --
+// its dispatcher knows notes, volume, BPM and markers and nothing else (decomp judge-timing.md,
+// "the record dispatcher") -- so the stop is baked into tick space instead: everything after it
+// moves later by the stop's own length. Inserting N ticks at the prevailing tempo takes exactly
+// the time the stop asks for, whatever that tempo is, so the notes, the keysounds and the BGA all
+// land on the beat.
+//
+// ponytail: the notes keep scrolling through the gap instead of freezing on screen, which is what
+// a real BMS player draws. Timing is identical either way; matching the visual would need a stop
+// record the engine does not have.
+// ponytail: linear scan per event. The busiest chart in the library has 315 stop lines against a
+// few thousand events, which is a few million trivial iterations per conversion -- noise next to
+// the keysound decode. A prefix sum plus upper_bound if a chart ever makes it show up.
+static uint32_t stopShiftAt(const ParsedBmsForEz& bms, uint32_t tick) {
+    uint64_t shift = 0;
+    for (const auto& s : bms.stopShift) {
+        if (s.first >= tick) break;      // a note ON the stop is played before it takes hold
+        shift += s.second;
+    }
+    const uint64_t out = (uint64_t)tick + shift;
+    return out > 0xfffffffful ? 0xfffffffful : (uint32_t)out;
+}
+
+static uint32_t bmsTickToEzTick(const ParsedBmsForEz& bms, int measure, int index, int div) {
+    return stopShiftAt(bms, bmsTickRaw(bms, measure, index, div));
 }
 
 static void putU16(std::vector<unsigned char>& b, size_t off, uint16_t v) {
@@ -4044,6 +4132,37 @@ static uint32_t directTickToMilliseconds(uint32_t targetTick, float baseBpm,
     return ms >= 4294967295.0 ? 0xffffffffu : (uint32_t)(ms + 0.5);
 }
 
+// The BPM the chart spends the most TIME at.
+//
+// The declared #BPM is not always it. "Accident - MAX" 04 Expert.bms opens with #BPM 22.875 and
+// jumps to 183 in the first measure, so the constant-speed rule divided by 22.875 and pinned the
+// scroll at 999% ("[speed] custom bpm 183.0 -> 22.9: speed 250% -> 999%"). Walking the tempo
+// records and keeping the value with the most seconds behind it gives the number a player would
+// call the song's BPM, which is what the rule wants.
+static float dominantBpm(float baseBpm, const std::vector<DirectRawEvent>& timing, uint32_t endTick) {
+    if (!(baseBpm > 0.0f) || !endTick) return baseBpm;
+    std::vector<std::pair<double, double>> weight;          // {bpm, seconds spent there}
+    auto add = [&weight](double atBpm, uint32_t ticks) {
+        if (!(atBpm > 0.0) || !ticks) return;
+        const double secs = (double)ticks * 60.0 / (atBpm * kDirectTicksPerBeat);
+        for (auto& w : weight) if (w.first == atBpm) { w.second += secs; return; }
+        weight.push_back(std::make_pair(atBpm, secs));
+    };
+    double bpm = baseBpm;
+    uint32_t last = 0;
+    for (const auto& event : timing) {                       // sorted by tick, like the ms walk
+        if (event.tick > endTick) break;
+        if (event.type != 3) continue;
+        if (event.tick > last) { add(bpm, event.tick - last); last = event.tick; }
+        const float next = directFloat(event.payload);
+        if (next > 0.0f) bpm = next;
+    }
+    if (endTick > last) add(bpm, endTick - last);
+    double best = baseBpm, bestSecs = -1.0;
+    for (const auto& w : weight) if (w.second > bestSecs) { bestSecs = w.second; best = w.first; }
+    return (float)best;
+}
+
 static void selectDirectBmsVideo(const CustomBmsSong& song, const ParsedBmsForEz& chart,
                                  const std::map<int, std::string>& bmpDefinitions,
                                  const std::string& explicitVideo, float bpm,
@@ -4353,6 +4472,14 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
     for (const auto& wav : selected.wavMap) wavDefinitions[wav.first] = wav.second;
     for (const auto& bmp : selected.bmpMap) bmpDefinitions[bmp.first] = bmp.second;
     if (!selected.directVideo.empty()) explicitVideo = selected.directVideo;
+    {
+        uint32_t endTick = 0;
+        for (int t = 0; t < 64; ++t) if (trackMax[t] > endTick) endTick = trackMax[t];
+        g_directBmsDominantBpm = dominantBpm(bpm, tracks[0], endTick);
+        if (g_directBmsDominantBpm != bpm)
+            LogLine("[speed] id='%s' declared BPM %.3f, dominant %.1f -- the scroll rule uses the dominant one",
+                    song->id.c_str(), bpm, g_directBmsDominantBpm);
+    }
     selectDirectBmsVideo(*song, selected, bmpDefinitions, explicitVideo, bpm, tracks[0]);
 
     uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));

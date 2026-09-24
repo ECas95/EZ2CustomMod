@@ -2097,6 +2097,12 @@ static void ApplyConstantSpeed(void* chart, bool custom) {
     if (!Config().constantSpeed || !chart) return;
     float bpm = 0.0f;
     memcpy(&bpm, reinterpret_cast<const char*>(chart) + 0x8c, 4);   // EzChart::f8c
+    // f8c is the chart's OPENING tempo, which some charts leave after a measure. For our own
+    // charts the loader has already worked out the one the song actually runs at.
+    if (custom) {
+        const float dominant = DirectBmsDominantBpm();
+        if (dominant > 20.0f && dominant < 1000.0f) bpm = dominant;
+    }
     if (!(bpm > 20.0f && bpm < 1000.0f)) bpm = g_selBpm;
     if (!(bpm > 20.0f && bpm < 1000.0f)) return;
     int* speed = reinterpret_cast<int*>(kSpeedPercentVar);

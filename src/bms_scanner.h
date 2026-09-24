@@ -121,6 +121,10 @@ bool DirectBmsEnabled();
 void ResetDirectBmsVideo();
 const std::string& DirectBmsVideoPath();
 uint32_t DirectBmsVideoStartMs();
+// The BPM the chart just loaded spends the most time at, or 0 when it is not a custom one. The
+// declared #BPM can be a tempo the song leaves after one measure; this is what a player would
+// call its BPM, and the constant-speed rule divides by it.
+float DirectBmsDominantBpm();
 bool DirectBmsVideoIsFallback();   // clip came from the generic pool, so it should loop
 
 // Committed memory, largest free block, GDI/USER handles, and the ten biggest regions.
