@@ -1870,52 +1870,6 @@ static void FpsLimitTick() {
     s_next += interval;
 }
 
-// ---- what the preview sample is actually doing ------------------------------------------------
-//
-// The load path is not the problem: the subsystem's fill (slot 4 of the vtable at 0x4884e8,
-// @0x40eda0) locks the whole DirectSound buffer, reads min(payload, buffer) bytes and pads the
-// rest, so a short or long .ssf is handled either way, and the log shows our file being opened
-// and read. So the question is what happens after m_sndPreview->play(): the sample's buffer is
-// the IDirectSoundBuffer at +0xb8 (that is the one @0x40eda0 calls Lock, vtable slot 11, on),
-// and its status, volume, frequency and play cursor answer it outright. Logged only when
-// something changes, so it is a handful of lines per session.
-//
-// TEMPORARY -- diagnostics, goes out with the rest of them.
-static void PreviewSoundProbe(uint32_t obj) {
-    static DWORD s_next = 0;
-    const DWORD now = GetTickCount();
-    if (now < s_next) return;
-    s_next = now + 500;
-
-    const uint32_t sample = SafeRead32(obj + kObjSndPreview);
-    if (!sample || !CanReadPtr(reinterpret_cast<void*>(sample), 0xc0)) return;
-    const uint32_t buffer = SafeRead32(sample + 0xb8);
-    if (!buffer || !CanReadPtr(reinterpret_cast<void*>(buffer), 4)) return;
-    const uint32_t vt = SafeRead32(buffer);
-    if (!vt || !CanReadPtr(reinterpret_cast<void*>(vt), 13 * 4)) return;
-
-    typedef long(__stdcall* Get1_t)(void*, DWORD*);
-    typedef long(__stdcall* Get2_t)(void*, DWORD*, DWORD*);
-    void* buf = reinterpret_cast<void*>(buffer);
-    DWORD status = 0, volume = 0, freq = 0, play = 0, write = 0;
-    reinterpret_cast<Get1_t>(SafeRead32(vt + 9 * 4))(buf, &status);    // GetStatus
-    reinterpret_cast<Get1_t>(SafeRead32(vt + 6 * 4))(buf, &volume);    // GetVolume
-    reinterpret_cast<Get1_t>(SafeRead32(vt + 8 * 4))(buf, &freq);      // GetFrequency
-    reinterpret_cast<Get2_t>(SafeRead32(vt + 4 * 4))(buf, &play, &write);
-
-    static uint32_t s_sample = 0; static DWORD s_status = 0xffffffff, s_vol = 0xffffffff, s_freq = 0;
-    static DWORD s_play = 0; static unsigned s_still = 0;
-    const bool moved = play != s_play;
-    if (sample == s_sample && status == s_status && volume == s_vol && freq == s_freq &&
-        (moved ? ++s_still % 8 : ++s_still % 32) != 1) { s_play = play; return; }
-    s_sample = sample; s_status = status; s_vol = volume; s_freq = freq; s_play = play;
-    LogLine("[previewsnd] sample=%08lx buffer=%08lx status=%lx (%s%s) volume=%ld freq=%lu cursor=%lu %s",
-            (unsigned long)sample, (unsigned long)buffer, (unsigned long)status,
-            (status & 1) ? "PLAYING" : "stopped", (status & 4) ? "+LOOPING" : "",
-            (long)(int)volume, (unsigned long)freq, (unsigned long)play,
-            moved ? "cursor moving" : "cursor still");
-}
-
 static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs);
 
 extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, PushadRegs* regs) {
@@ -1954,7 +1908,6 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
         g_ssFrameStamp = GetTickCount();
         g_ssFrameObj = regs->ecx;
         if (g_wheelIconsPending) { g_wheelIconsPending = false; RefreshWheelIcons(regs->ecx); }
-        PreviewSoundProbe(regs->ecx);
         // The disc under the cursor was a placeholder and its real art is ready now: f_f8 = 1 is
         // the renderer's own "reload the big disc" state (decomp songselectpage.cpp m431ae0).
         if (PlaceholderDiscReady()) {

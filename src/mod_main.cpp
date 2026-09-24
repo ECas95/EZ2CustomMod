@@ -596,9 +596,13 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
             if (Config().assetsInMemory) {
                 // The preview is opened through the CRT (openSample -> fopen), which needs a file.
                 if (g_redirectForCrt && !s.cacheDir.empty() && fn == s.id + ".ssf") {
-                    std::string file = SongPreviewFileForCrt(s);
-                    if (file.empty()) file = BlankPreviewFile();
-                    LogLine("[custom] preview for fopen '%s' -> '%s'", p.c_str(), file.c_str());
+                    const std::string file = SongPreviewFileForCrt(s);
+                    // Only a failure is worth a line: this runs on every hover, and a preview that
+                    // works was logging four of them per song.
+                    if (file.empty()) {
+                        LogLine("[custom] preview id='%s' has none; playing the blank", s.id.c_str());
+                        return BlankPreviewFile();
+                    }
                     return file;
                 }
                 // The preview is never served from RAM, whoever is asking: the only thing that
