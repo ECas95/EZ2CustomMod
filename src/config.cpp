@@ -58,6 +58,7 @@ ModConfig LoadConfig() {
     cfg.keysoundCacheMB = readInt("CustomSongs", "KeysoundCacheMB", 384, ini);
     cfg.assetCacheMB = readInt("CustomSongs", "AssetCacheMB", 256, ini);
     cfg.levelFromNotes = readBool("CustomSongs", "LevelFromNotes", true, ini);
+    cfg.detailPanels = readBool("Gameplay", "DetailPanels", true, ini);
     if (cfg.keysoundCacheMB < 16) cfg.keysoundCacheMB = 16;
     if (cfg.assetCacheMB < 16) cfg.assetCacheMB = 16;
     cfg.artPrefetch = readBool("Gameplay", "ArtPrefetch", true, ini);

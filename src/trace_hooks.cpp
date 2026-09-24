@@ -1870,6 +1870,30 @@ static void FpsLimitTick() {
     s_next += interval;
 }
 
+// The row under the cursor and the difficulty column it is showing, handed to the detail panels.
+//
+// The readout f_20c6d4 numbers the columns the way the native art is laid out -- 0 NM, 1 HD,
+// 3 SHD, 4 EX, with 2 unused -- while our chart slots run 0..3 in that order and keep 4 for the
+// EZ column, which the stepper reports separately through its own cursor at 0x4abd14.
+static void DetailPanelsDrawForSelection(uint32_t obj) {
+    if (!obj) return;
+    const uint32_t sel = SafeRead32(obj + 0x84);        // the row the cursor is on
+    const uint32_t visible = SafeRead32(obj + 0x7c);    // rows in the filtered list
+    if (!visible || sel >= visible || visible > g_visibleCap) return;
+    const uint32_t entry = obj + kVisibleBase + sel * kEntryBytes;
+    if (!CanReadPtr(reinterpret_cast<void*>(entry), kEntryBytes)) return;
+    const char* id = reinterpret_cast<const char*>(entry + kEntryIdOff);
+    if (id[0] != 'b' || id[1] != 'm' || id[2] != 's') return;      // native song: nothing measured
+    int slot;
+    if (SafeRead32(0x4abd14) == 0) {
+        slot = 4;                                                   // the EZ column
+    } else {
+        const uint32_t column = SafeRead32(obj + kObjDiffColumn);
+        slot = column == 1 ? 1 : column == 3 ? 2 : column == 4 ? 3 : 0;
+    }
+    DetailPanelsDraw(std::string(id, strnlen(id, 31)).c_str(), slot);
+}
+
 static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs);
 
 extern "C" __declspec(dllexport) void __cdecl EZ2TraceHitEx(TraceHook* h, PushadRegs* regs) {
@@ -1895,7 +1919,11 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
         if (regs) {
             const uint32_t arg = *reinterpret_cast<uint32_t*>(regs->originalEsp + 4 + 4);
             if (arg == 1) {
-                if (GetTickCount() - g_ssFrameStamp < 250) { EzColumnDraw(g_ssFrameObj); HudPanelDraw(); }
+                if (GetTickCount() - g_ssFrameStamp < 250) {
+                    EzColumnDraw(g_ssFrameObj);
+                    DetailPanelsDrawForSelection(g_ssFrameObj);
+                    HudPanelDraw();
+                }
                 FpsLimitTick();
                 FrameTimeTick();
             }

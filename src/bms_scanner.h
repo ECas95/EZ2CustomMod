@@ -43,6 +43,8 @@ private:
 // the note data well up to 17 and then collapses -- 46% of songs declare 18 for their hardest
 // chart, and inside level 18 the peak density runs from 13 to 83 notes a second. These are the
 // numbers that do separate them, and they are what the rating below is built from.
+static const int kDensityBuckets = 64;   // one bar of the song-select graph each
+
 struct ChartStats {
     uint32_t notes = 0;         // playable notes (long notes count once)
     float    seconds = 0.0f;    // first note to last
@@ -51,6 +53,10 @@ struct ChartStats {
     float    chordPct = 0.0f;   // notes sharing a timestamp with another
     float    jackPct = 0.0f;    // notes repeating a lane within 150 ms
     int      rated = 0;         // 1..20 derived from the above; 0 = not measured
+    // The chart's shape over time: the span split into equal slices, each scaled 0..255 against
+    // the busiest one. What the song-select graph draws, and the reason it is stored rather than
+    // recomputed -- the notes are only in hand while the file is being read at scan time.
+    unsigned char density[kDensityBuckets] = {};
     bool measured() const { return notes > 0 && seconds > 0.0f; }
 };
 
@@ -169,6 +175,7 @@ std::string SongPreviewFileForCrt(const CustomBmsSong& song);   // the .ssf as a
 // Is this role's art already there (RAM store or .abm) without a render? The wheel window asks
 // before it hands the game a request, so the game thread never renders wheel art itself.
 bool SongVisualAssetReady(const CustomBmsSong& song, const char* role);
+const ChartStats* ChartStatsFor(const char* id, int slot);
 // True once (and only once) after a placeholder disc's real art has finished rendering: the
 // song-select tick uses it to ask the renderer for a reload.
 bool PlaceholderDiscReady();
@@ -203,7 +210,12 @@ enum { kCatAbmTab = 0, kCatAbmOverlay = 1, kCatAbmLabel = 2, kCatAbmSort = 3,
        // Blank ground for the HUD panel (mod_main HudPanel*), at the size it is drawn.
        kCatAbmPanel = 8,
        // The "EZ" column label the game's banner does not have.
-       kCatAbmLabelEz = 9 };
+       kCatAbmLabelEz = 9,
+       // The song-select detail panels: the stats block above the disc and the density graph
+       // along the bottom. Sizes are the on-screen rectangles in game coordinates.
+       kCatAbmStats = 10, kCatAbmGraph = 11 };
+static const int kStatsPanelW = 88,  kStatsPanelH = 80;
+static const int kGraphPanelW = 176, kGraphPanelH = 56;
 bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int kind,
                               std::vector<unsigned char>& out);
 

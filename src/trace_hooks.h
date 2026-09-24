@@ -36,6 +36,8 @@ void EzColumnDraw(uint32_t obj);
 // the speed. Defined in mod_main.
 void ConstantSpeedNoteSelection(float bpm, const char* id);
 int  ConstantSpeedPredict(float bpm);          // 0 = no change would be made
+void DetailPanelsDraw(const char* id, int slot);   // song-select stats + density graph
+void DetailPanelsReset();
 float JudgeTickMs();                            // ms per engine tick of the chart loaded now
 int   JudgeOffsetTicks();                       // the [Gameplay] JudgeOffsetMs, in those ticks                            // the "now playing" card, any screen but song select
 

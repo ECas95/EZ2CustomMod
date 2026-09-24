@@ -1004,6 +1004,7 @@ void CategoryOverlayReset() {
     g_ovCategory.clear();
     g_ovHaveBg = g_ovHaveIco = false;
     HudPanelReset();
+    DetailPanelsReset();
 }
 
 // ---- HUD panel ---------------------------------------------------------------------------------
@@ -1178,6 +1179,205 @@ static bool RenderPanelBgr(std::vector<unsigned char>& art, std::vector<unsigned
     }
     DeleteDC(hdc);
     return ok;
+}
+
+
+// ---- song-select detail panels ------------------------------------------------------------------
+//
+// Two read-outs for the chart under the cursor, in the two places the layout leaves free: the
+// figures go above the disc and the density graph along the bottom, between FREE PLAY and the
+// logo. Both are built the way the notice card is -- a GDI render into an art buffer and a mask
+// buffer, uploaded to a pair of pooled surfaces and drawn in two passes, so they sit over the
+// wheel without a rectangle of background around them.
+//
+// Positions are game coordinates (the game renders 640x480 and the window scales it).
+static const int kStatsX = 300, kStatsY = 79;
+static const int kGraphX = 385, kGraphY = 410;
+
+static void* g_statsTex = nullptr;  static void* g_statsSurf = nullptr;
+static void* g_statsMaskTex = nullptr;  static void* g_statsMaskSurf = nullptr;
+static void* g_graphTex = nullptr;  static void* g_graphSurf = nullptr;
+static void* g_graphMaskTex = nullptr;  static void* g_graphMaskSurf = nullptr;
+static bool  g_detailInitTried = false;
+static std::string g_detailKey;          // id + slot currently rendered into the surfaces
+
+void DetailPanelsReset() {
+    g_statsTex = g_statsSurf = g_statsMaskTex = g_statsMaskSurf = nullptr;
+    g_graphTex = g_graphSurf = g_graphMaskTex = g_graphMaskSurf = nullptr;
+    g_detailInitTried = false;
+    g_detailKey.clear();
+}
+
+static bool EnsureDetailSurfaces() {
+    if (g_statsTex && g_graphTex) return true;
+    if (g_detailInitTried) return false;
+    void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
+    if (!renderer) return false;
+    g_detailInitTried = true;
+    const bool ok =
+        MakeOverlaySurface(renderer, "system\\disc\\bmsstats.bmp", "bms-stats",
+                           kStatsPanelW, kStatsPanelH, &g_statsTex, &g_statsSurf) &&
+        MakeOverlaySurface(renderer, "system\\disc\\bmsstatsmask.bmp", "bms-stats-mask",
+                           kStatsPanelW, kStatsPanelH, &g_statsMaskTex, &g_statsMaskSurf) &&
+        MakeOverlaySurface(renderer, "system\\disc\\bmsgraph.bmp", "bms-graph",
+                           kGraphPanelW, kGraphPanelH, &g_graphTex, &g_graphSurf) &&
+        MakeOverlaySurface(renderer, "system\\disc\\bmsgraphmask.bmp", "bms-graph-mask",
+                           kGraphPanelW, kGraphPanelH, &g_graphMaskTex, &g_graphMaskSurf);
+    LogLine("[detail] surfaces %s", ok ? "ready" : "FAILED");
+    return ok;
+}
+
+// A rounded plate, drawn into both buffers: black where the art is (so the mask darkens the
+// wheel under it) and the rim on top. The same shape the notice card uses, at these sizes.
+static void DetailPlate(HDC art, HDC mask, int w, int h) {
+    RECT all = {0, 0, w, h};
+    HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(art, &all, black);
+    FillRect(mask, &all, black);
+    DeleteObject(black);
+    for (int pass = 0; pass < 2; ++pass) {
+        HDC hdc = pass == 0 ? mask : art;
+        HBRUSH fill = CreateSolidBrush(pass == 0 ? RGB(255, 255, 255) : RGB(14, 18, 26));
+        HPEN pen = CreatePen(PS_SOLID, 1, pass == 0 ? RGB(255, 255, 255) : RGB(60, 78, 96));
+        HGDIOBJ ob = SelectObject(hdc, fill), op = SelectObject(hdc, pen);
+        RoundRect(hdc, 0, 0, w, h, 10, 10);
+        SelectObject(hdc, ob); SelectObject(hdc, op);
+        DeleteObject(fill); DeleteObject(pen);
+    }
+}
+
+static bool RenderDetailBgr(const ChartStats& st, bool graph,
+                            std::vector<unsigned char>& artOut, std::vector<unsigned char>& maskOut) {
+    const int w = graph ? kGraphPanelW : kStatsPanelW;
+    const int h = graph ? kGraphPanelH : kStatsPanelH;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -h;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 24;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    HDC screen = GetDC(nullptr);
+    if (!screen) return false;
+    bool ok = false;
+    HDC dcA = CreateCompatibleDC(screen), dcM = CreateCompatibleDC(screen);
+    void* bitsA = nullptr; void* bitsM = nullptr;
+    HBITMAP bmA = dcA ? CreateDIBSection(dcA, &info, DIB_RGB_COLORS, &bitsA, nullptr, 0) : nullptr;
+    HBITMAP bmM = dcM ? CreateDIBSection(dcM, &info, DIB_RGB_COLORS, &bitsM, nullptr, 0) : nullptr;
+    if (dcA && dcM && bmA && bmM && bitsA && bitsM) {
+        HGDIOBJ oldA = SelectObject(dcA, bmA), oldM = SelectObject(dcM, bmM);
+        SetBkMode(dcA, TRANSPARENT);
+        DetailPlate(dcA, dcM, w, h);
+
+        if (!graph) {
+            char buf[32];
+            int y = 6;
+            PanelText(dcA, "CHART", 10, FW_BOLD, kPanelTitle, RECT{8, y, w - 6, y + 12}, DT_LEFT, true);
+            y += 13;
+            struct Row { const char* label; const char* fmt; double value; };
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)st.notes);
+            PanelText(dcA, "NOTES", 9, FW_NORMAL, kPanelSub, RECT{8, y, w - 6, y + 11}, DT_LEFT, true);
+            PanelText(dcA, buf, 14, FW_BOLD, kPanelText, RECT{6, y + 9, w - 8, y + 25}, DT_RIGHT, true);
+            y += 27;
+            const Row rows[] = {
+                {"NPS",   "%.1f",  st.nps},
+                {"PEAK",  "%.1f",  st.peakNps},
+                {"CHORD", "%.0f%%", st.chordPct},
+                {"JACK",  "%.0f%%", st.jackPct},
+            };
+            for (const Row& r : rows) {
+                snprintf(buf, sizeof(buf), r.fmt, r.value);
+                PanelText(dcA, r.label, 9, FW_NORMAL, kPanelSub, RECT{8, y, w / 2 + 6, y + 11}, DT_LEFT, true);
+                PanelText(dcA, buf, 10, FW_BOLD, kPanelText, RECT{w / 2 - 6, y, w - 8, y + 11}, DT_RIGHT, true);
+                y += 12;
+            }
+        } else {
+            // The bars. Height is the slice's share of the busiest one, the colour goes from the
+            // panel's cyan up to a hot orange so a burst reads at a glance, and the mask is painted
+            // to match so the bars are the only thing that lands on screen.
+            const int left = (w - kDensityBuckets * 2) / 2;
+            const int base = h - 8, top = 16;
+            const int tall = base - top;
+            PanelText(dcA, "DENSITY", 9, FW_BOLD, kPanelTitle, RECT{8, 3, w - 8, 15}, DT_LEFT, true);
+            char len[24];
+            snprintf(len, sizeof(len), "%d:%02d", (int)st.seconds / 60, (int)st.seconds % 60);
+            PanelText(dcA, len, 9, FW_NORMAL, kPanelSub, RECT{8, 3, w - 8, 15}, DT_RIGHT, true);
+            for (int i = 0; i < kDensityBuckets; ++i) {
+                const int v = st.density[i];
+                int bh = (v * tall + 127) / 255;
+                if (v && bh < 1) bh = 1;
+                if (!bh) continue;
+                const int x = left + i * 2;
+                RECT bar = {x, base - bh, x + 2, base};
+                const int heat = v;
+                HBRUSH b = CreateSolidBrush(RGB(50 + heat * 205 / 255, 214 - heat * 80 / 255, 255 - heat * 200 / 255));
+                FillRect(dcA, &bar, b);
+                DeleteObject(b);
+                HBRUSH m = CreateSolidBrush(RGB(255, 255, 255));
+                FillRect(dcM, &bar, m);
+                DeleteObject(m);
+            }
+            HBRUSH line = CreateSolidBrush(RGB(60, 78, 96));
+            RECT axis = {left, base, left + kDensityBuckets * 2, base + 1};
+            FillRect(dcA, &axis, line);
+            DeleteObject(line);
+        }
+
+        GdiFlush();
+        artOut.assign(static_cast<unsigned char*>(bitsA), static_cast<unsigned char*>(bitsA) + (size_t)w * h * 3);
+        maskOut.assign(static_cast<unsigned char*>(bitsM), static_cast<unsigned char*>(bitsM) + (size_t)w * h * 3);
+        SelectObject(dcA, oldA); SelectObject(dcM, oldM);
+        ok = true;
+    }
+    if (bmA) DeleteObject(bmA);
+    if (bmM) DeleteObject(bmM);
+    if (dcA) DeleteDC(dcA);
+    if (dcM) DeleteDC(dcM);
+    ReleaseDC(nullptr, screen);
+    return ok;
+}
+
+static void DrawDetailPair(void* maskTex, void* tex, int x, int y, int w, int h) {
+    auto draw     = reinterpret_cast<DrawSpriteFn>(Rva(0x03f80));
+    auto setBlend = reinterpret_cast<SetBlendFn>(Rva(0x0a490));
+    void* ctx = reinterpret_cast<void*>(kRenderCtx);
+    const uint32_t white = 0xffffffffu;
+    setBlend(ctx, kBlendDestColor, kBlendInvSrcAlpha);
+    draw(ctx, reinterpret_cast<uint32_t>(maskTex), FloatBits((float)x), FloatBits((float)y), (float)w, (float)h, white);
+    setBlend(ctx, kBlendOne, kBlendOne);
+    draw(ctx, reinterpret_cast<uint32_t>(tex), FloatBits((float)x), FloatBits((float)y), (float)w, (float)h, white);
+    setBlend(ctx, kBlendOne, kBlendZero);
+}
+
+// Called from the song-select frame end with the row under the cursor and the difficulty column
+// it is showing. Nothing is drawn for a native song or a chart that was never measured.
+void DetailPanelsDraw(const char* id, int slot) {
+    if (!Config().detailPanels) return;
+    const ChartStats* st = ChartStatsFor(id, slot);
+    if (!st) { g_detailKey.clear(); return; }
+    if (!EnsureDetailSurfaces()) return;
+    if (!OverlayTexUsable(g_statsTex, g_statsSurf) || !OverlayTexUsable(g_statsMaskTex, g_statsMaskSurf) ||
+        !OverlayTexUsable(g_graphTex, g_graphSurf) || !OverlayTexUsable(g_graphMaskTex, g_graphMaskSurf)) {
+        DetailPanelsReset();                      // the pool was rebuilt; make them again
+        if (!EnsureDetailSurfaces()) return;
+    }
+    char key[64];
+    snprintf(key, sizeof(key), "%.31s|%d", id ? id : "", slot);
+    if (g_detailKey != key) {
+        std::vector<unsigned char> art, mask;
+        if (RenderDetailBgr(*st, false, art, mask)) {
+            BlitBgrToSurface(g_statsSurf, art, kStatsPanelW, kStatsPanelH);
+            BlitBgrToSurface(g_statsMaskSurf, mask, kStatsPanelW, kStatsPanelH);
+        }
+        if (RenderDetailBgr(*st, true, art, mask)) {
+            BlitBgrToSurface(g_graphSurf, art, kGraphPanelW, kGraphPanelH);
+            BlitBgrToSurface(g_graphMaskSurf, mask, kGraphPanelW, kGraphPanelH);
+        }
+        g_detailKey = key;
+    }
+    DrawDetailPair(g_statsMaskTex, g_statsTex, kStatsX, kStatsY, kStatsPanelW, kStatsPanelH);
+    DrawDetailPair(g_graphMaskTex, g_graphTex, kGraphX, kGraphY, kGraphPanelW, kGraphPanelH);
 }
 
 static bool EnsurePanelSurface() {
@@ -2695,6 +2895,14 @@ static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share,
         }
         if (lower.find("bmspanel") != std::string::npos) {
             HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmPanel);
+            if (vh != INVALID_HANDLE_VALUE) return vh;
+        }
+        if (lower.find("bmsstats") != std::string::npos) {
+            HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmStats);
+            if (vh != INVALID_HANDLE_VALUE) return vh;
+        }
+        if (lower.find("bmsgraph") != std::string::npos) {
+            HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmGraph);
             if (vh != INVALID_HANDLE_VALUE) return vh;
         }
         if (lower.find("bmslabelez") != std::string::npos) {

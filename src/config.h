@@ -36,6 +36,7 @@ struct ModConfig {
     // stops discriminating at the top: 46% of songs call their hardest chart 18, and inside that
     // one level the peak density runs from 13 to 83 notes a second.
     bool levelFromNotes = true;
+    bool detailPanels = true;      // the song-select stats block and density graph
     bool artPrefetch = true;       // render a category's wheel art on a background thread
     // Reuse the previous run's BMS parse for folders that have not changed.
     bool scanCache = true;
