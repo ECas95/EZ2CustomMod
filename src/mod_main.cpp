@@ -503,9 +503,38 @@ static const std::string& BlankPreviewFile() {
     return path;
 }
 
+// Is `path` a file inside `dir`? Case-folded, and the character after the prefix has to be a
+// separator so that a sibling directory with a longer name ("CustomCacheOld") is not swallowed.
+// `dir` is expected already lower-cased.
+static bool PathIsUnderDirectory(const std::string& path, const std::string& dir) {
+    if (dir.empty() || path.size() <= dir.size() + 1) return false;
+    if (LowerAscii(path).compare(0, dir.size(), dir) != 0) return false;
+    const char sep = path[dir.size()];
+    return sep == '\\' || sep == '/';
+}
+
 static std::string MaybeRedirectCustomPath(LPCSTR name) {
     if (!name) return std::string();
     std::string p = name;
+
+    // A path already inside our cache is already resolved -- hand it straight through.
+    //
+    // This is what silenced every custom preview. The game opens a preview with the CRT
+    // (openSample -> fopen -> the _fsopen wrapper we hook), we answer with the real
+    // CustomCache path, and then the CRT opens THAT path with CreateFileA -- which lands back
+    // in our own CreateFileA hook. Second time round the in-RAM branch matched the same .ssf
+    // and answered with a virtual handle, and a virtual handle is a CreateEventA handle that
+    // only this DLL knows how to read: the CRT cannot build a FILE* out of it, so _fsopen
+    // returned NULL, the game logged "Open Error : OpenSample" and fell back to the silent
+    // System\Preview\0Blank. 656 of those in one session, one per hover, and the fallback also
+    // leaks a pool sample each time.
+    //
+    // The guard is at the top because re-resolving an already-resolved path is never right for
+    // any asset, not just the preview.
+    {
+        static const std::string cacheRoot = LowerAscii(JoinPath(GetExeDirectory(), Config().cacheRoot));
+        if (PathIsUnderDirectory(p, cacheRoot)) return std::string();
+    }
 
     // v24 crash fix: DO NOT redirect system\<mode>\Stage.ini to a synthetic file.
     // The v23/v23.1 file-level Stage.ini redirect made the game enter SongSelect with
@@ -572,14 +601,18 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
                     LogLine("[custom] preview for fopen '%s' -> '%s'", p.c_str(), file.c_str());
                     return file;
                 }
-                // Art and preview from the RAM store: the caller turns the bytes into a handle.
+                // The preview is never served from RAM, whoever is asking: the only thing that
+                // ever reads it is the CRT-based sample loader, which needs a real file.
+                if (!s.cacheDir.empty() && fn == s.id + ".ssf") {
+                    const std::string file = SongPreviewFileForCrt(s);
+                    return file.empty() ? BlankPreviewFile() : file;
+                }
+                // Art from the RAM store: the caller turns the bytes into a handle.
                 std::vector<unsigned char> bytes;
-                if (!g_redirectForCrt &&
-                    (SongVisualAssetBytes(s, p, bytes) || (!s.cacheDir.empty() && fn == s.id + ".ssf" && SongPreviewBytes(s, bytes)))) {
+                if (!g_redirectForCrt && SongVisualAssetBytes(s, p, bytes)) {
                     g_pendingVirtualBytes.swap(bytes);
                     return std::string("\x01ram");
                 }
-                if (!s.cacheDir.empty() && fn == s.id + ".ssf") return BlankPreviewFile();
             }
             std::string visual = EnsureSongVisualAsset(s, p);
             if (!visual.empty()) {
