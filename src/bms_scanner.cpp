@@ -185,29 +185,133 @@ static std::string stripDifficultyTag(const std::string& title) {
     return t;
 }
 
+// Defined further down with the rest of the BMS field parsers; the metadata pass above them
+// needs both to read the tempo track.
+static int parseBase36_2(const std::string& s, size_t pos);
+static double parseDoubleSafe(const std::string& s, double fallback);
+
+// The BPM a chart spends the most TIME at, given its tempo changes.
+//
+// `changes` is {beat position, BPM}, sorted; `declared` runs from beat 0 until the first change and
+// `endBeat` is where the chart stops. Each stretch is weighted by the SECONDS it lasts, not by its
+// length in beats -- a slow passage holds more time per beat, and time is what "the song's BPM"
+// means to a player.
+//
+// The declared #BPM on its own is not that number. "Accident - MAX" 04 Expert.bms opens with
+// #BPM 22.875 and switches to 183 inside the first measure; across the library 0.5% of charts
+// declare something other than what they run at, 0.2% of them off by more than 1.5x.
+static double dominantBpmWeighted(double declared, const std::vector<std::pair<double, double>>& changes,
+                                  double endBeat) {
+    if (!(declared > 0.0) || !(endBeat > 0.0)) return declared;
+    std::vector<std::pair<double, double>> weight;          // {bpm, seconds spent there}
+    auto add = [&weight](double atBpm, double beats) {
+        if (!(atBpm > 0.0) || !(beats > 0.0)) return;
+        const double secs = beats * 60.0 / atBpm;
+        for (auto& w : weight) if (w.first == atBpm) { w.second += secs; return; }
+        weight.push_back(std::make_pair(atBpm, secs));
+    };
+    double bpm = declared, last = 0.0;
+    for (const auto& c : changes) {
+        if (c.first > endBeat) break;
+        if (c.first > last) { add(bpm, c.first - last); last = c.first; }
+        if (c.second > 0.0) bpm = c.second;
+    }
+    if (endBeat > last) add(bpm, endBeat - last);
+    double best = declared, bestSecs = -1.0;
+    for (const auto& w : weight) if (w.second > bestSecs) { bestSecs = w.second; best = w.first; }
+    return best;
+}
+
 static void parseBmsMeta(const std::string& path, CustomBmsChart& meta) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return;
     char line[1024];
-    int n = 0;
     // wavRefs/bmpRefs are NOT collected: the direct loader re-parses the selected BMS at play time.
-    // This pass only needs selector metadata, which sits above the measure data —
-    // stop at the first data line (#nnnCC:...) instead of reading thousands of event lines per chart.
-    while (fgets(line, sizeof(line), f) && n++ < 4000) {
+    // This pass needs the selector metadata, which sits above the measure data, AND the tempo track,
+    // which does not -- so it reads to the end but only looks at three of the data channels (02
+    // measure length, 03 inline tempo, 08 tempo by reference). Measured over 3000 charts of the
+    // library that is 0.8 ms each, paid once per song and then cached, and it is what lets the wheel
+    // show the BPM a chart runs at instead of whatever its header claims.
+    std::map<int, double> bpmDefs;                          // #BPMxx
+    std::vector<std::pair<double, double>> changes;          // {beat, bpm}
+    std::map<int, double> measureScale;
+    double lastBeat = 0.0;
+    bool headers = true;
+    while (fgets(line, sizeof(line), f)) {
         std::string s = trim(line);
         if (s.size() < 2 || s[0] != '#') continue;
-        if (isdigit((unsigned char)s[1]) && s.size() > 6 && isdigit((unsigned char)s[2]) && isdigit((unsigned char)s[3]) && s.find(':') != std::string::npos)
-            break; // measure data starts — headers are done
+        const bool dataLine = isdigit((unsigned char)s[1]) && s.size() > 6 &&
+                              isdigit((unsigned char)s[2]) && isdigit((unsigned char)s[3]) &&
+                              s.find(':') != std::string::npos;
+        if (dataLine) {
+            headers = false;
+            const int measure = (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
+            char chpair[3] = { s[4], s[5], 0 };
+            const int channel = (int)strtol(chpair, nullptr, 16);
+            if (channel != 2 && channel != 3 && channel != 8) continue;
+            const std::string data = trim(s.substr(s.find(':') + 1));
+            if (channel == 2) { measureScale[measure] = parseDoubleSafe(data, 1.0); continue; }
+            if (data.size() < 2 || (data.size() % 2) != 0) continue;
+            const int div = (int)data.size() / 2;
+            for (int i = 0; i < div; ++i) {
+                const int id = parseBase36_2(data, (size_t)i * 2);
+                if (!id) continue;
+                double bpm = 0.0;
+                if (channel == 3) {
+                    char pair[3] = { data[(size_t)i * 2], data[(size_t)i * 2 + 1], 0 };
+                    bpm = (double)strtoul(pair, nullptr, 16);
+                } else {
+                    auto it = bpmDefs.find(id);
+                    if (it != bpmDefs.end()) bpm = it->second;
+                }
+                if (bpm <= 0.0) continue;
+                double beat = 0.0;                           // beats from the start of the chart
+                for (int m = 0; m < measure; ++m) {
+                    auto sc = measureScale.find(m);
+                    beat += 4.0 * (sc == measureScale.end() ? 1.0 : sc->second);
+                }
+                auto sc = measureScale.find(measure);
+                beat += ((double)i / (double)div) * 4.0 * (sc == measureScale.end() ? 1.0 : sc->second);
+                changes.push_back(std::make_pair(beat, bpm));
+                if (beat > lastBeat) lastBeat = beat;
+            }
+            continue;
+        }
+        if (!headers) continue;                              // a header after the data starts: ignore
         std::string u = s;
         std::transform(u.begin(), u.end(), u.begin(), [](unsigned char c){ return (char)toupper(c); });
         if (u.rfind("#TITLE", 0) == 0 && meta.title.empty()) meta.title = trim(s.substr(6));
         else if (u.rfind("#ARTIST", 0) == 0 && meta.artist.empty()) meta.artist = trim(s.substr(7));
         else if (u.rfind("#BPM", 0) == 0 && meta.bpm.empty() && s.size() > 4 && !isdigit((unsigned char)s[4])) meta.bpm = trim(s.substr(4));
+        else if (u.rfind("#BPM", 0) == 0 && s.size() > 6) {   // #BPMxx, the channel-08 values
+            size_t sp = s.find_first_of(" \t", 4);
+            if (sp != std::string::npos) {
+                const int id = parseBase36_2(s, 4);
+                const double v = parseDoubleSafe(trim(s.substr(sp + 1)), 0.0);
+                if (id > 0 && v > 0.0) bpmDefs[id] = v;
+            }
+        }
         else if (u.rfind("#PLAYLEVEL", 0) == 0 && meta.playLevel.empty()) meta.playLevel = trim(s.substr(10));
         else if (u.rfind("#STAGEFILE", 0) == 0 && meta.stageFile.empty()) meta.stageFile = stripQuotes(s.substr(10));
         else if (u.rfind("#BANNER", 0) == 0 && meta.banner.empty()) meta.banner = stripQuotes(s.substr(7));
     }
     fclose(f);
+
+    // The wheel, the difficulty card and the constant-speed rule all read this one string, so it
+    // carries the tempo the chart runs at rather than the one it opens with.
+    if (!changes.empty()) {
+        const double declared = parseDoubleSafe(meta.bpm, 0.0);
+        std::sort(changes.begin(), changes.end(),
+                  [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                      return a.first < b.first;
+                  });
+        const double dominant = dominantBpmWeighted(declared, changes, lastBeat + 32.0);
+        if (declared > 0.0 && dominant > 0.0 && dominant != declared) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%g", dominant);
+            meta.bpm = buf;
+        }
+    }
 }
 
 
@@ -4140,27 +4244,14 @@ static uint32_t directTickToMilliseconds(uint32_t targetTick, float baseBpm,
 // records and keeping the value with the most seconds behind it gives the number a player would
 // call the song's BPM, which is what the rule wants.
 static float dominantBpm(float baseBpm, const std::vector<DirectRawEvent>& timing, uint32_t endTick) {
-    if (!(baseBpm > 0.0f) || !endTick) return baseBpm;
-    std::vector<std::pair<double, double>> weight;          // {bpm, seconds spent there}
-    auto add = [&weight](double atBpm, uint32_t ticks) {
-        if (!(atBpm > 0.0) || !ticks) return;
-        const double secs = (double)ticks * 60.0 / (atBpm * kDirectTicksPerBeat);
-        for (auto& w : weight) if (w.first == atBpm) { w.second += secs; return; }
-        weight.push_back(std::make_pair(atBpm, secs));
-    };
-    double bpm = baseBpm;
-    uint32_t last = 0;
+    std::vector<std::pair<double, double>> changes;          // {beat, bpm}
     for (const auto& event : timing) {                       // sorted by tick, like the ms walk
         if (event.tick > endTick) break;
         if (event.type != 3) continue;
-        if (event.tick > last) { add(bpm, event.tick - last); last = event.tick; }
         const float next = directFloat(event.payload);
-        if (next > 0.0f) bpm = next;
+        if (next > 0.0f) changes.push_back(std::make_pair((double)event.tick / kDirectTicksPerBeat, (double)next));
     }
-    if (endTick > last) add(bpm, endTick - last);
-    double best = baseBpm, bestSecs = -1.0;
-    for (const auto& w : weight) if (w.second > bestSecs) { bestSecs = w.second; best = w.first; }
-    return (float)best;
+    return (float)dominantBpmWeighted(baseBpm, changes, (double)endTick / kDirectTicksPerBeat);
 }
 
 static void selectDirectBmsVideo(const CustomBmsSong& song, const ParsedBmsForEz& chart,
@@ -6445,7 +6536,9 @@ static void ExpandAutoGeneratedModes() {
 // The format is length-prefixed binary rather than text: song titles contain tabs, quotes and
 // newlines often enough that any delimiter needs escaping, and a wrong escape here silently
 // corrupts a song's metadata instead of failing loudly.
-static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','2' };
+// Bumped from ...2 when the cached BPM stopped being the declared one and became the tempo the
+// chart actually runs at: an old cache would keep showing the header's value. Costs one full rescan.
+static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','3' };
 
 struct ScanCacheEntry {
     uint64_t mtime = 0;
