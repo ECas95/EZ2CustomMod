@@ -190,6 +190,115 @@ static std::string stripDifficultyTag(const std::string& title) {
 static int parseBase36_2(const std::string& s, size_t pos);
 static double parseDoubleSafe(const std::string& s, double fallback);
 
+// Peak density -> level, read off the note data of 1379 charts of this library.
+//
+// Each entry is the mean busiest-2-seconds of every chart that DECLARED that level, for the levels
+// where the declaration still means something (2..17). Level 18 is left out of the fit on purpose:
+// it is where the packs dump everything they consider hard, so its own mean says nothing -- and
+// feeding an 18's measurements through this fit is exactly what spreads that wall back out over
+// 16..20, which is the range EZ2AC's own scale has room for.
+// The raw means are not usable as they stand: 13 and 14 came out 0.12 NPS apart, so almost no
+// chart could land between them. These are those means smoothed to a monotone curve with a real
+// step per level, and then continued past 17 -- 24 / 30 / 38 -- over the range the declared 18s
+// actually occupy (their own peaks run 13 / 16 / 19 / 28 / 83 at min / p25 / median / p75 / max).
+// Checked over 400 songs: the level of a song's hardest chart used to pile 45.8% of the library
+// onto 18, and reads 14.0% at its worst bucket now, across 14 levels instead of 11.
+static const float kPeakForLevel[] = {
+    0.0f,  1.0f,  2.00f, 2.80f, 3.60f, 4.50f, 6.40f, 7.50f, 9.10f, 10.10f,
+    11.00f, 11.90f, 12.80f, 13.90f, 14.80f, 15.70f, 16.60f, 19.50f,
+    24.00f, 30.00f, 38.00f
+};   // index = level, so kPeakForLevel[20] = 38.0
+
+// Rate a chart 1..20 from what it plays like.
+//
+// Peak density carries the rating: it is the one measurement that rises cleanly across the whole
+// declared range and keeps rising through the charts the packs all call 18. Jacks are the one
+// independent signal on top -- the same notes repeating in a lane are harder than the same density
+// spread across lanes, and the measured jack rate climbs from 0% at level 2 to 15.5% at 18 -- so a
+// heavily jacked chart is worth one more level.
+static int rateChartFromStats(const ChartStats& st) {
+    if (!st.measured()) return 0;
+    const int top = (int)(sizeof(kPeakForLevel) / sizeof(kPeakForLevel[0])) - 1;   // 20
+    float level;
+    if (st.peakNps <= kPeakForLevel[1]) {
+        level = 1.0f;
+    } else if (st.peakNps >= kPeakForLevel[top]) {
+        level = (float)top;              // 20 is the top of the scale; nothing above it to say
+    } else {
+        level = 1.0f;
+        for (int i = 1; i < top; ++i) {
+            if (st.peakNps >= kPeakForLevel[i] && st.peakNps < kPeakForLevel[i + 1]) {
+                const float span = kPeakForLevel[i + 1] - kPeakForLevel[i];
+                level = (float)i + (span > 0.01f ? (st.peakNps - kPeakForLevel[i]) / span : 0.0f);
+                break;
+            }
+        }
+    }
+    if (st.jackPct >= 12.0f) level += 1.0f;        // the top decile of the measured jack rates
+    int out = (int)(level + 0.5f);
+    if (out < 1) out = 1;
+    if (out > 20) out = 20;
+    return out;
+}
+
+// Turn the playable notes into the numbers above. `beats` is sorted {beat, lane}; `changes` is the
+// tempo track, also sorted, as the dominant-BPM walk uses it.
+static void measureChart(const std::vector<std::pair<double, int>>& beats, double baseBpm,
+                         const std::vector<std::pair<double, double>>& changes, ChartStats& out) {
+    out = ChartStats();
+    if (beats.size() < 2 || !(baseBpm > 0.0)) return;
+
+    // Beat -> second, walking the tempo track once for the whole chart.
+    std::vector<double> times;
+    times.reserve(beats.size());
+    {
+        double bpm = baseBpm, lastBeat = 0.0, lastSecs = 0.0;
+        size_t next = 0;
+        for (const auto& n : beats) {
+            while (next < changes.size() && changes[next].first <= n.first) {
+                lastSecs += (changes[next].first - lastBeat) * 60.0 / bpm;
+                lastBeat = changes[next].first;
+                if (changes[next].second > 0.0) bpm = changes[next].second;
+                ++next;
+            }
+            times.push_back(lastSecs + (n.first - lastBeat) * 60.0 / bpm);
+        }
+    }
+
+    const double span = times.back() - times.front();
+    if (!(span > 0.5)) return;
+    out.notes = (uint32_t)beats.size();
+    out.seconds = (float)span;
+    out.nps = (float)(beats.size() / span);
+
+    // Busiest two seconds, as a sliding window over the sorted times.
+    size_t lo = 0, peak = 0;
+    for (size_t i = 0; i < times.size(); ++i) {
+        while (times[i] - times[lo] > 2.0) ++lo;
+        const size_t width = i - lo + 1;
+        if (width > peak) peak = width;
+    }
+    out.peakNps = (float)(peak / 2.0);
+
+    // Chords share a timestamp; jacks repeat a lane inside 150 ms.
+    size_t chorded = 0, jacks = 0;
+    double laneLast[0x60];
+    for (double& v : laneLast) v = -1e9;
+    for (size_t i = 0; i < times.size(); ++i) {
+        const bool withPrev = i > 0 && times[i] - times[i - 1] < 0.001;
+        const bool withNext = i + 1 < times.size() && times[i + 1] - times[i] < 0.001;
+        if (withPrev || withNext) ++chorded;
+        const int lane = beats[i].second;
+        if (lane >= 0 && lane < 0x60) {
+            if (times[i] - laneLast[lane] <= 0.15) ++jacks;
+            laneLast[lane] = times[i];
+        }
+    }
+    out.chordPct = (float)(100.0 * chorded / beats.size());
+    out.jackPct = (float)(100.0 * jacks / beats.size());
+    out.rated = rateChartFromStats(out);
+}
+
 // The BPM a chart spends the most TIME at, given its tempo changes.
 //
 // `changes` is {beat position, BPM}, sorted; `declared` runs from beat 0 until the first change and
@@ -234,6 +343,7 @@ static void parseBmsMeta(const std::string& path, CustomBmsChart& meta) {
     // show the BPM a chart runs at instead of whatever its header claims.
     std::map<int, double> bpmDefs;                          // #BPMxx
     std::vector<std::pair<double, double>> changes;          // {beat, bpm}
+    std::vector<std::pair<double, int>> playNotes;           // {beat, lane}
     std::map<int, double> measureScale;
     double lastBeat = 0.0;
     bool headers = true;
@@ -248,7 +358,12 @@ static void parseBmsMeta(const std::string& path, CustomBmsChart& meta) {
             const int measure = (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
             char chpair[3] = { s[4], s[5], 0 };
             const int channel = (int)strtol(chpair, nullptr, 16);
-            if (channel != 2 && channel != 3 && channel != 8) continue;
+            // P1's playable lanes, long notes folded onto the lane they belong to. A long note is
+            // one note here: its head is what has to be hit, and counting the tail would flatter
+            // every chart that uses them.
+            const bool playLane = (channel >= 0x11 && channel <= 0x19) ||
+                                  (channel >= 0x51 && channel <= 0x59);
+            if (channel != 2 && channel != 3 && channel != 8 && !playLane) continue;
             const std::string data = trim(s.substr(s.find(':') + 1));
             if (channel == 2) { measureScale[measure] = parseDoubleSafe(data, 1.0); continue; }
             if (data.size() < 2 || (data.size() % 2) != 0) continue;
@@ -256,6 +371,18 @@ static void parseBmsMeta(const std::string& path, CustomBmsChart& meta) {
             for (int i = 0; i < div; ++i) {
                 const int id = parseBase36_2(data, (size_t)i * 2);
                 if (!id) continue;
+                if (playLane) {
+                    double beat = 0.0;
+                    for (int m = 0; m < measure; ++m) {
+                        auto sc = measureScale.find(m);
+                        beat += 4.0 * (sc == measureScale.end() ? 1.0 : sc->second);
+                    }
+                    auto sc = measureScale.find(measure);
+                    beat += ((double)i / (double)div) * 4.0 * (sc == measureScale.end() ? 1.0 : sc->second);
+                    playNotes.push_back(std::make_pair(beat, channel >= 0x51 ? channel - 0x40 : channel));
+                    if (beat > lastBeat) lastBeat = beat;
+                    continue;
+                }
                 double bpm = 0.0;
                 if (channel == 3) {
                     char pair[3] = { data[(size_t)i * 2], data[(size_t)i * 2 + 1], 0 };
@@ -297,14 +424,15 @@ static void parseBmsMeta(const std::string& path, CustomBmsChart& meta) {
     }
     fclose(f);
 
+    std::sort(changes.begin(), changes.end(),
+              [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                  return a.first < b.first;
+              });
+    const double declared = parseDoubleSafe(meta.bpm, 0.0);
+
     // The wheel, the difficulty card and the constant-speed rule all read this one string, so it
     // carries the tempo the chart runs at rather than the one it opens with.
     if (!changes.empty()) {
-        const double declared = parseDoubleSafe(meta.bpm, 0.0);
-        std::sort(changes.begin(), changes.end(),
-                  [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
-                      return a.first < b.first;
-                  });
         const double dominant = dominantBpmWeighted(declared, changes, lastBeat + 32.0);
         if (declared > 0.0 && dominant > 0.0 && dominant != declared) {
             char buf[32];
@@ -312,6 +440,12 @@ static void parseBmsMeta(const std::string& path, CustomBmsChart& meta) {
             meta.bpm = buf;
         }
     }
+
+    std::sort(playNotes.begin(), playNotes.end(),
+              [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                  return a.first < b.first;
+              });
+    measureChart(playNotes, declared > 0.0 ? declared : 130.0, changes, meta.stats);
 }
 
 
@@ -3801,6 +3935,14 @@ static int clampPlayLevelForSongBin(const std::string& raw) {
     return v;
 }
 
+// What the wheel shows for a chart. The measured rating when there is one, else the declared
+// level. EZ2AC's own scale runs to 20 and the fit is built to use that headroom, so this is NOT
+// clamped to the 18 the BMS packs stop at.
+static int chartDisplayLevel(const CustomBmsChart& chart) {
+    if (Config().levelFromNotes && chart.stats.rated > 0) return chart.stats.rated;
+    return clampPlayLevelForSongBin(chart.playLevel);
+}
+
 static float parseBpmForSongBin(const std::string& raw) {
     double v = parseDoubleSafe(trim(raw), 0.0);
     if (v <= 0.0) return 0.0f;
@@ -3817,12 +3959,12 @@ static void AssignSongBinDifficultyFields(CustomBmsSong& song) {
     for (size_t i = 0; i < song.chartMeta.size(); ++i) {
         auto& chart = song.chartMeta.mut()[i];
         chart.slot = -1;
-        chart.playLevel = std::to_string(clampPlayLevelForSongBin(chart.playLevel));
+        chart.playLevel = std::to_string(chartDisplayLevel(chart));
         ordered.push_back(i);
     }
     std::stable_sort(ordered.begin(), ordered.end(), [&](size_t a, size_t b) {
-        int la = clampPlayLevelForSongBin(song.chartMeta[a].playLevel);
-        int lb = clampPlayLevelForSongBin(song.chartMeta[b].playLevel);
+        int la = parseIntSafe(song.chartMeta[a].playLevel, 1);
+        int lb = parseIntSafe(song.chartMeta[b].playLevel, 1);
         if (la != lb) return la < lb;
         int byName = _stricmp(song.chartMeta[a].file.c_str(), song.chartMeta[b].file.c_str());
         return byName != 0 ? byName < 0 : song.chartMeta[a].file < song.chartMeta[b].file;
@@ -3847,7 +3989,9 @@ static void AssignSongBinDifficultyFields(CustomBmsSong& song) {
     float* bpms[kChartSlots] = {&song.bpmNM, &song.bpmHD, &song.bpmSHD, &song.bpmEX, &song.bpmEZ};
     for (const auto& chart : song.chartMeta) {
         if (chart.slot < 0 || chart.slot >= kChartSlots) continue;
-        int level = clampPlayLevelForSongBin(chart.playLevel);
+        int level = parseIntSafe(chart.playLevel, 1);    // already the display level
+        if (level < 1) level = 1;
+        if (level > 20) level = 20;
         *levels[chart.slot] = level;
         float bpm = parseBpmForSongBin(chart.bpm);
         if (bpm > 0.0f) *bpms[chart.slot] = bpm;
@@ -6579,7 +6723,7 @@ static void ExpandAutoGeneratedModes() {
 // corrupts a song's metadata instead of failing loudly.
 // Bumped from ...2 when the cached BPM stopped being the declared one and became the tempo the
 // chart actually runs at: an old cache would keep showing the header's value. Costs one full rescan.
-static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','3' };
+static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','4' };
 
 struct ScanCacheEntry {
     uint64_t mtime = 0;
@@ -6685,6 +6829,10 @@ static void LoadScanCache() {
             c.stageFile = r.str(); c.banner = r.str(); c.bpm = r.str();
             c.playLevel = r.str(); c.difficulty = r.str();
             c.slot = (int)r.u32();
+            c.stats.notes = r.u32();
+            c.stats.seconds = r.f32(); c.stats.nps = r.f32(); c.stats.peakNps = r.f32();
+            c.stats.chordPct = r.f32(); c.stats.jackPct = r.f32();
+            c.stats.rated = (int)r.u32();
             s.chartMeta.mut().push_back(c);
         }
         s.levelNM = (int)r.u32(); s.levelHD = (int)r.u32();
@@ -6727,6 +6875,10 @@ static void SaveScanCache() {
             cachePutStr(b, c.stageFile); cachePutStr(b, c.banner); cachePutStr(b, c.bpm);
             cachePutStr(b, c.playLevel); cachePutStr(b, c.difficulty);
             cachePutU32(b, (uint32_t)c.slot);
+            cachePutU32(b, c.stats.notes);
+            cachePutF32(b, c.stats.seconds); cachePutF32(b, c.stats.nps); cachePutF32(b, c.stats.peakNps);
+            cachePutF32(b, c.stats.chordPct); cachePutF32(b, c.stats.jackPct);
+            cachePutU32(b, (uint32_t)c.stats.rated);
         }
         cachePutU32(b, (uint32_t)s.levelNM); cachePutU32(b, (uint32_t)s.levelHD);
         cachePutU32(b, (uint32_t)s.levelSHD); cachePutU32(b, (uint32_t)s.levelEX);
@@ -6819,8 +6971,11 @@ static void scanFlatSongFolder(const std::string& mode, const std::string& modeF
             // with a sample kept so the shape is still visible without TraceBMSScan.
             static unsigned long s_assigned = 0;
             if (Config().traceBmsScan || s_assigned++ < 100)
-            LogLine("[bms] assigned id='%s' chart='%s' slot=%d suffix='%s' playLevel='%s'",
-                    song.id.c_str(), chart.file.c_str(), chart.slot, suffixForSlot(chart.slot), chart.playLevel.c_str());
+            LogLine("[bms] assigned id='%s' chart='%s' slot=%d suffix='%s' level=%s"
+                    " (notes=%lu %.0fs nps=%.1f peak=%.1f chord=%.0f%% jack=%.0f%%)",
+                    song.id.c_str(), chart.file.c_str(), chart.slot, suffixForSlot(chart.slot),
+                    chart.playLevel.c_str(), (unsigned long)chart.stats.notes, chart.stats.seconds,
+                    chart.stats.nps, chart.stats.peakNps, chart.stats.chordPct, chart.stats.jackPct);
         }
         if (g_directBmsEnabled) {
             // Path only: directories/files are created lazily by the first real asset request.

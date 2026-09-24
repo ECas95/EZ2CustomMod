@@ -37,6 +37,23 @@ private:
     std::shared_ptr<std::vector<T> > p_;
 };
 
+// What the chart's own notes say about it, measured once at scan time and cached.
+//
+// #PLAYLEVEL alone does not rank a library. Measured over 1379 charts: the declared level tracks
+// the note data well up to 17 and then collapses -- 46% of songs declare 18 for their hardest
+// chart, and inside level 18 the peak density runs from 13 to 83 notes a second. These are the
+// numbers that do separate them, and they are what the rating below is built from.
+struct ChartStats {
+    uint32_t notes = 0;         // playable notes (long notes count once)
+    float    seconds = 0.0f;    // first note to last
+    float    nps = 0.0f;        // notes per second across that span
+    float    peakNps = 0.0f;    // busiest 2-second window
+    float    chordPct = 0.0f;   // notes sharing a timestamp with another
+    float    jackPct = 0.0f;    // notes repeating a lane within 150 ms
+    int      rated = 0;         // 1..20 derived from the above; 0 = not measured
+    bool measured() const { return notes > 0 && seconds > 0.0f; }
+};
+
 struct CustomBmsChart {
     std::string file;
     std::string title;
@@ -47,6 +64,7 @@ struct CustomBmsChart {
     std::string playLevel;
     std::string difficulty;
     int slot = -1;
+    ChartStats stats;
     std::vector<std::string> wavRefs;
     std::vector<std::string> bmpRefs;
 };

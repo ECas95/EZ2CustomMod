@@ -32,6 +32,10 @@ struct ModConfig {
     // and one disc render had already failed for want of a contiguous block.
     int  keysoundCacheMB = 384;    // decoded keysound PCM held for the song under the cursor
     int  assetCacheMB = 256;       // generated art and previews, LRU
+    // Rate charts from their own note data instead of trusting #PLAYLEVEL. The declared level
+    // stops discriminating at the top: 46% of songs call their hardest chart 18, and inside that
+    // one level the peak density runs from 13 to 83 notes a second.
+    bool levelFromNotes = true;
     bool artPrefetch = true;       // render a category's wheel art on a background thread
     // Reuse the previous run's BMS parse for folders that have not changed.
     bool scanCache = true;
