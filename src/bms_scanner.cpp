@@ -6587,6 +6587,10 @@ std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& 
     return fileExistsLocal(path) ? path : std::string();
 }
 
+// Bumped when the songname image would come out DIFFERENT for the same title: 2 = the text is
+// drawn wide, so UTF-8 and Shift-JIS titles stop going through the system codepage as mojibake.
+static const int kNameArtVersion = 2;
+
 static void BuildCacheManifest(CustomBmsSong& song) {
     std::string cacheRoot = JoinPath(GetExeDirectory(), Config().cacheRoot);
     ensureDir(cacheRoot);
@@ -6619,28 +6623,35 @@ static void BuildCacheManifest(CustomBmsSong& song) {
     manifest += "songbinBpmHD=" + std::to_string(song.bpmHD) + "\r\n";
     manifest += "songbinBpmSHD=" + std::to_string(song.bpmSHD) + "\r\n";
     manifest += "songbinBpmEX=" + std::to_string(song.bpmEX) + "\r\n";
+    manifest += "nameart=" + std::to_string(kNameArtVersion) + "|" + song.title + "\r\n";
     manifest += "\r\n# v10.3: virtual song.bin difficulty blocks are populated from each compatible BMS #PLAYLEVEL.\r\n";
 
-    // The songname image is rendered once and then reused, so changing the title alone would leave
-    // the wheel drawing the old one -- the whole point of dropping the "[Basic]" tag would be
-    // invisible. The manifest already records the title the cache was built for, so a title that
-    // has moved since throws away just that one song's name art and it is redrawn on next sight.
+    // The songname image is rendered once and then reused, so nothing that changes what it SHOULD
+    // look like is visible on its own: not a new title (dropping the "[Basic]" tag), and not a new
+    // renderer (drawing the text wide so a UTF-8 Japanese title stops coming out as mojibake).
+    // The manifest records both, so either moving throws away just that one song's name art and it
+    // is redrawn the next time the wheel asks for it.
     {
         const std::string manifestPath = JoinPath(song.cacheDir, "manifest.txt");
+        const std::string want = std::to_string(kNameArtVersion) + "|" + song.title;
         std::vector<unsigned char> old;
         if (readWholeFileForModel(manifestPath, old)) {
             const std::string text(old.begin(), old.end());
-            const size_t at = text.find("\r\ntitle=");
+            std::string had;
+            const size_t at = text.find("\r\nnameart=");
             if (at != std::string::npos) {
-                const size_t from = at + 8;
+                const size_t from = at + 10;
                 const size_t to = text.find("\r\n", from);
-                if (to != std::string::npos && text.substr(from, to - from) != song.title) {
-                    const std::string art = JoinPath(JoinPath(song.cacheDir, "songname"), song.id + ".abm");
-                    if (fileExistsLocal(art)) {
-                        DeleteFileA(art.c_str());
-                        LogLine("[cache] title changed for id='%s'; name art dropped so it is redrawn",
-                                song.id.c_str());
-                    }
+                if (to != std::string::npos) had = text.substr(from, to - from);
+            }
+            if (had != want) {
+                const std::string art = JoinPath(JoinPath(song.cacheDir, "songname"), song.id + ".abm");
+                if (fileExistsLocal(art)) {
+                    DeleteFileA(art.c_str());
+                    static unsigned long s_dropped = 0;
+                    if (++s_dropped <= 20)
+                        LogLine("[cache] name art of id='%s' is stale (%s -> %s); dropped so it is redrawn",
+                                song.id.c_str(), had.empty() ? "<none>" : had.c_str(), want.c_str());
                 }
             }
         }
