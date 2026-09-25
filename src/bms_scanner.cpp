@@ -5224,6 +5224,10 @@ std::string CategoryOverlayPath(const std::string& mode, const std::string& cate
 
 
 // Generate the required BMP inside the DLL using native GDI/GDI+.
+// Defined with the category splash below, which has drawn its text wide all along; the songname
+// renderer here needs the same conversion and sits above it.
+static std::wstring Utf8ToWide(const std::string& s);
+
 static bool GenerateBmpFile(const std::string& path, int w, int h,
                              COLORREF bgColor, COLORREF fgColor,
                              const std::string& line1, const std::string& line2,
@@ -5335,20 +5339,31 @@ static bool GenerateBmpFile(const std::string& path, int w, int h,
             // in-game. Categories (plain, 128-wide) stay regular.
             const bool plainBold = plain && w >= 256;
             const int plainWeight = plainBold ? FW_BOLD : FW_NORMAL;
+            // WIDE, not ANSI. A BMS #TITLE is bytes with no declared encoding: the classic packs are
+            // Shift-JIS and the Project Sekai ones are UTF-8. Drawn through DrawTextA those bytes go
+            // through the SYSTEM codepage, so a UTF-8 title turned into mojibake on a Western
+            // Windows -- "e3 81 82" (a Japanese A) came out as "ã..." in the wheel. Utf8ToWide
+            // decodes UTF-8 and falls back to the ANSI codepage when the bytes are not valid UTF-8,
+            // which is what the older Shift-JIS packs need.
+            //
+            // DEFAULT_CHARSET rather than ANSI_CHARSET so GDI may font-link to a face that has the
+            // glyphs; Arial itself carries none of them.
             auto drawLine = [&](const std::string& text, RECT r, int maxPx) {
                 if (text.empty()) return;
+                const std::wstring wide = Utf8ToWide(text);
+                if (wide.empty()) return;
                 HFONT font = nullptr;
                 HFONT oldFont = nullptr;
                 for (int px = maxPx; px >= 8; --px) {
                     // plain (songname/category): regular weight + ClearType, matches the thin
                     // ~10px native glyphs. styled: bold + plain AA.
-                    font = CreateFontA(-px, 0, 0, 0, plain ? plainWeight : FW_BOLD, FALSE, FALSE, FALSE,
-                                       ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                       plain ? ANTIALIASED_QUALITY : ANTIALIASED_QUALITY,
-                                       DEFAULT_PITCH | FF_SWISS, "Arial");
+                    font = CreateFontW(-px, 0, 0, 0, plain ? plainWeight : FW_BOLD, FALSE, FALSE, FALSE,
+                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                       ANTIALIASED_QUALITY,
+                                       DEFAULT_PITCH | FF_SWISS, L"Arial");
                     oldFont = (HFONT)SelectObject(hdc, font);
                     SIZE size{};
-                    GetTextExtentPoint32A(hdc, text.c_str(), (int)text.size(), &size);
+                    GetTextExtentPoint32W(hdc, wide.c_str(), (int)wide.size(), &size);
                     if (px <= 8 || (size.cx <= r.right - r.left && size.cy <= r.bottom - r.top)) break;
                     SelectObject(hdc, oldFont);
                     DeleteObject(font);
@@ -5361,10 +5376,10 @@ static bool GenerateBmpFile(const std::string& path, int w, int h,
                 if (!plain) {                          // drop shadow only in styled mode
                     RECT shadow = r; OffsetRect(&shadow, 1, 1);
                     SetTextColor(hdc, RGB(0, 0, 0));
-                    DrawTextA(hdc, text.c_str(), -1, &shadow, align);
+                    DrawTextW(hdc, wide.c_str(), -1, &shadow, align);
                 }
                 SetTextColor(hdc, fgColor);
-                DrawTextA(hdc, text.c_str(), -1, &r, align);
+                DrawTextW(hdc, wide.c_str(), -1, &r, align);
                 SelectObject(hdc, oldFont);
                 DeleteObject(font);
             };
@@ -5386,13 +5401,16 @@ static bool GenerateBmpFile(const std::string& path, int w, int h,
             std::string l1 = line1, l2 = line2;
             const int avail = (plain ? w - 2 : w - 3) - 3;
             if (l2.empty() && h >= 32 && !l1.empty()) {
-                HFONT probe = CreateFontA(-maxPx, 0, 0, 0, plain ? plainWeight : FW_BOLD, FALSE,
-                                          FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+                HFONT probe = CreateFontW(-maxPx, 0, 0, 0, plain ? plainWeight : FW_BOLD, FALSE,
+                                          FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                                          DEFAULT_PITCH | FF_SWISS, "Arial");
+                                          DEFAULT_PITCH | FF_SWISS, L"Arial");
                 HFONT prev = (HFONT)SelectObject(hdc, probe);
                 SIZE whole{};
-                GetTextExtentPoint32A(hdc, l1.c_str(), (int)l1.size(), &whole);
+                const std::wstring wholeWide = Utf8ToWide(l1);
+                GetTextExtentPoint32W(hdc, wholeWide.c_str(), (int)wholeWide.size(), &whole);
+                // The split point below is a byte index, and that stays safe: a 0x20 space never
+                // appears inside a UTF-8 multi-byte sequence, nor as a Shift-JIS trail byte.
                 if (whole.cx > avail) {
                     size_t best = std::string::npos;
                     size_t bestDelta = l1.size();
