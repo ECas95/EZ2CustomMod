@@ -37,6 +37,10 @@ struct ModConfig {
     // one level the peak density runs from 13 to 83 notes a second.
     bool levelFromNotes = true;
     bool detailPanels = true;      // the song-select stats block and density graph
+    // Frames a second for the BGA preview on the disc in song select. The clip is decoded whole
+    // into memory before it plays, so this is a straight trade: 256x256x3 is 192 KB a frame, and
+    // the buffer holds PreviewFps x 12 seconds of them (10 fps = 23 MB, 20 fps = 46 MB).
+    int  previewFps = 20;
     bool artPrefetch = true;       // render a category's wheel art on a background thread
     // Reuse the previous run's BMS parse for folders that have not changed.
     bool scanCache = true;

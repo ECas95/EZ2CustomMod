@@ -1569,7 +1569,9 @@ void EzColumnDraw(uint32_t obj) {
 // reused for every preview. That matters here more than usual -- browsing already costs the process
 // hundreds of megabytes in wheel textures, and this must not scale with the library on top of that.
 static const int      kPreviewSize    = 256;      // matches initdisc.abm and the disc geometry
-static const int      kPreviewFps     = 10;
+// Was a flat 10, which read as a slideshow next to the 30 fps the source clips run at. Now the
+// setting, clamped 5..30 -- past 30 there is nothing left to gain, since the clips are 30 fps.
+static int PreviewFps() { return Config().previewFps; }
 // 12s at 10fps is 120 frames, 22.5MB. Measured: the decode still takes ~420ms, the same as six
 // seconds did -- the cost is process spawn and seek, not the length -- so the whole price of the
 // longer loop is the extra 11MB, and that stays fixed no matter how big the library grows.
@@ -1652,7 +1654,7 @@ static DWORD WINAPI PreviewDecodeThread(LPVOID) {
         // A video if the song has one; otherwise its .scr background, whose frames are already
         // images on disk.
         if (!g_previewDecodePath.empty())
-            DecodeBgaPreview(g_previewDecodePath, kPreviewSize, kPreviewFps, kPreviewSeconds,
+            DecodeBgaPreview(g_previewDecodePath, kPreviewSize, PreviewFps(), kPreviewSeconds,
                              frames, count);
         // Native songs without a video animate their background with a .scr instead.
         //
@@ -1663,7 +1665,7 @@ static DWORD WINAPI PreviewDecodeThread(LPVOID) {
         // #BMP table use it to declare the video. An image-sequence preview was built for those and
         // measured at zero songs, so it was removed rather than left to cost a decode per song.
         if (!count)
-            DecodeScrPreview(g_previewDecodeId, kPreviewSize, kPreviewFps, kPreviewSeconds,
+            DecodeScrPreview(g_previewDecodeId, kPreviewSize, PreviewFps(), kPreviewSeconds,
                              frames, count);
     } catch (...) {
         frames.clear();
@@ -1855,7 +1857,7 @@ void BgaPreviewTick(uint32_t obj, const char* selectedId) {
     const DWORD now = GetTickCount();
     if (now >= g_previewNextFrameMs) {
         PreviewBlitFrame();
-        g_previewNextFrameMs = now + (DWORD)(1000 / kPreviewFps);
+        g_previewNextFrameMs = now + (DWORD)(1000 / PreviewFps());
     }
 }
 

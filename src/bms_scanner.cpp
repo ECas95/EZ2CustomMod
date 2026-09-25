@@ -175,14 +175,75 @@ static std::string stripDifficultyTag(const std::string& title) {
     std::string inner = t.substr(open + 1, t.size() - open - 2);
     std::string up;
     for (char c : inner) if (c != ' ' && c != '\t') up += (char)toupper((unsigned char)c);
+    // Several packs append the lane count to the tag ("[EASY 5K]", "[APPEND 5K]"), which is not
+    // part of the difficulty's name -- take it off before matching.
+    while (up.size() > 2 && up.back() == 'K') {
+        size_t digits = up.size() - 1;
+        while (digits > 0 && isdigit((unsigned char)up[digits - 1])) --digits;
+        if (digits == up.size() - 1 || digits == 0) break;    // no digits, or nothing else left
+        up.erase(digits);
+    }
     static const char* diffs[] = {"EASY","NORMAL","NM","HARD","HD","HYPER","ANOTHER","INSANE",
-        "BEGINNER","LIGHT","EX","EXTRA","MX","MAXIMUM","SHD","CHAOS","BLACK","WHITE","SP","DP"};
-    for (const char* d : diffs) if (up == d) {
+        "BEGINNER","LIGHT","EX","EXTRA","MX","MAXIMUM","SHD","CHAOS","BLACK","WHITE","SP","DP",
+        // Chunithm and Project Sekai rips, which is what most of the five-chart songs are.
+        "BASIC","ADVANCED","EXPERT","MASTER","ULTIMA","APPEND","PRESENT","FUTURE"};
+    bool known = false;
+    for (const char* d : diffs) if (up == d) { known = true; break; }
+    // A bracket with no letters in it at all is a chart id, not a title: the SEVENS pack tags its
+    // charts [10036_1], [5097_5]. Nobody names a song that.
+    if (!known && !inner.empty()) {
+        bool anyLetter = false, anyDigit = false;
+        for (char c : inner) {
+            if (isalpha((unsigned char)c)) anyLetter = true;
+            else if (isdigit((unsigned char)c)) anyDigit = true;
+        }
+        known = !anyLetter && anyDigit;
+    }
+    if (known) {
         std::string base = t.substr(0, open);
         while (!base.empty() && (base.back() == ' ' || base.back() == '\t')) base.pop_back();
         return base.empty() ? t : base;
     }
     return t;
+}
+
+// The same job, decided from the song's OWN charts instead of a vocabulary.
+//
+// A word list cannot keep up: Chunithm tags its charts [Basic]..[Ultima], Project Sekai
+// [EASY 5K]..[APPEND 5K], and the WJMAX pack uses streamer names -- [ANGEL 5K], [WAKGOOD 5K],
+// [MINSU 5K], [MESSI 5K], [LIE 5K]. What they all share is the shape: every chart of the song
+// carries the same title with a different trailing bracket. So the bracket is a per-chart tag
+// exactly when the part in front of it is identical across the charts and the brackets are not.
+//
+// That last condition is what protects a real bracketed title: "Song [Extended Mix]" is the same
+// on all four charts, brackets included, so nothing is stripped.
+//
+// Returns the shared title without the tag, or an empty string when the rule does not apply and
+// the caller should fall back to the word list (a song with a single chart, most often).
+static std::string stripChartTagBySiblings(const std::vector<CustomBmsChart>& charts) {
+    std::string prefix;
+    std::string firstTag;
+    bool havePrefix = false, tagsDiffer = false, seen = false;
+    for (const auto& chart : charts) {
+        std::string t = chart.title;
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+        if (t.empty()) continue;                       // untitled chart: ignore, not disqualifying
+        if (t.back() != ']') return std::string();     // one chart without a tag: not this shape
+        const size_t open = t.rfind('[');
+        if (open == std::string::npos || open == 0) return std::string();
+        std::string base = t.substr(0, open);
+        while (!base.empty() && (base.back() == ' ' || base.back() == '\t')) base.pop_back();
+        if (base.empty()) return std::string();        // the whole title is the bracket
+        const std::string tag = t.substr(open + 1, t.size() - open - 2);
+        if (!havePrefix) { prefix = base; firstTag = tag; havePrefix = true; }
+        else {
+            if (base != prefix) return std::string();  // the titles themselves differ: leave them
+            if (tag != firstTag) tagsDiffer = true;
+        }
+        seen = true;
+    }
+    if (!seen || !havePrefix || !tagsDiffer) return std::string();
+    return prefix;
 }
 
 // Defined further down with the rest of the BMS field parsers; the metadata pass above them
@@ -897,6 +958,10 @@ static bool writeBinaryFile(const std::string& path, const std::vector<unsigned 
 // Preview = a random `seconds`-long window of the BGM SSF, not the start. SSF layout:
 // 18-byte header [u16 ch][u32 rate][u32 avg][u16 align][u16 bits][u32 dataSize] + raw PCM.
 // We keep the header (adjust dataSize) and copy a frame-aligned slice from a random offset.
+// How long a hover preview runs, and how much of the song is decoded to choose that window from.
+static const uint32_t kPreviewWindowSeconds = 20;
+static const uint32_t kPreviewSourceSeconds = 40;
+
 static bool MakeRandomPreviewSsf(const std::string& src, const std::string& dst, uint32_t seconds) {
     FILE* f = fopen(src.c_str(), "rb");
     if (!f) return false;
@@ -5002,7 +5067,22 @@ void EnsureSongPreview(const CustomBmsSong& song) {
     ensureDir(JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), song.mode));
     ensureDir(song.cacheDir);
     std::string dst = JoinPath(song.cacheDir, song.id + ".ssf");
-    if (fileExistsLocal(dst)) return;
+    if (fileExistsLocal(dst)) {
+        // A preview cut to an older, shorter window is replaced once. A song whose source really
+        // is shorter than the window cannot be made longer, so each id is retried at most once a
+        // session -- otherwise every hover on a short song would decode it again.
+        static std::set<std::string> s_retried;
+        WIN32_FILE_ATTRIBUTE_DATA ad{};
+        bool stale = false;
+        if (GetFileAttributesExA(dst.c_str(), GetFileExInfoStandard, &ad) && ad.nFileSizeHigh == 0) {
+            const uint32_t payload = ad.nFileSizeLow > 18 ? ad.nFileSizeLow - 18 : 0;
+            stale = payload + 176400u / 2u < 176400u * kPreviewWindowSeconds;   // ~2ch/44100/16bit
+        }
+        if (!stale || s_retried.count(song.id)) return;
+        s_retried.insert(song.id);
+        LogLine("[cache] preview id='%s' was cut to an older window; recutting", song.id.c_str());
+        DeleteFileA(dst.c_str());
+    }
     std::string bestSrc; LONGLONG best = 0;
     auto consider = [&](const std::string& p) {
         WIN32_FILE_ATTRIBUTE_DATA ad{};
@@ -5028,9 +5108,13 @@ void EnsureSongPreview(const CustomBmsSong& song) {
         break; // first existing sound-dir wins
     }
     if (bestSrc.empty()) { LogLine("[cache] preview id='%s' no source audio", song.id.c_str()); return; }
+    // Measured over the 462 shipped previews: 20.0 s median, 19.6 s mean, 239 of them exactly 20.
+    // Ours ran 12, which is why they sounded clipped next to a native one. The decode has to reach
+    // well past the window so the cut can start somewhere other than the intro -- the shipped ones
+    // are hand-picked at the chorus -- and 40 s of source gives it the first 20 to choose from.
     std::string tmp = dst + ".tmp";
-    bool ok = mediaFoundationToSsfLocal(bestSrc, tmp, 20); // decode only ~20s — preview, not the whole BGM
-    if (ok && !MakeRandomPreviewSsf(tmp, dst, 12)) ok = copyFileSimple(tmp, dst);
+    bool ok = mediaFoundationToSsfLocal(bestSrc, tmp, kPreviewSourceSeconds);
+    if (ok && !MakeRandomPreviewSsf(tmp, dst, kPreviewWindowSeconds)) ok = copyFileSimple(tmp, dst);
     DeleteFileA(tmp.c_str());
     LogLine("[cache] preview id='%s' src='%s' ok=%d", song.id.c_str(), bestSrc.c_str(), ok ? 1 : 0);
 }
@@ -6518,6 +6602,31 @@ static void BuildCacheManifest(CustomBmsSong& song) {
     manifest += "songbinBpmSHD=" + std::to_string(song.bpmSHD) + "\r\n";
     manifest += "songbinBpmEX=" + std::to_string(song.bpmEX) + "\r\n";
     manifest += "\r\n# v10.3: virtual song.bin difficulty blocks are populated from each compatible BMS #PLAYLEVEL.\r\n";
+
+    // The songname image is rendered once and then reused, so changing the title alone would leave
+    // the wheel drawing the old one -- the whole point of dropping the "[Basic]" tag would be
+    // invisible. The manifest already records the title the cache was built for, so a title that
+    // has moved since throws away just that one song's name art and it is redrawn on next sight.
+    {
+        const std::string manifestPath = JoinPath(song.cacheDir, "manifest.txt");
+        std::vector<unsigned char> old;
+        if (readWholeFileForModel(manifestPath, old)) {
+            const std::string text(old.begin(), old.end());
+            const size_t at = text.find("\r\ntitle=");
+            if (at != std::string::npos) {
+                const size_t from = at + 8;
+                const size_t to = text.find("\r\n", from);
+                if (to != std::string::npos && text.substr(from, to - from) != song.title) {
+                    const std::string art = JoinPath(JoinPath(song.cacheDir, "songname"), song.id + ".abm");
+                    if (fileExistsLocal(art)) {
+                        DeleteFileA(art.c_str());
+                        LogLine("[cache] title changed for id='%s'; name art dropped so it is redrawn",
+                                song.id.c_str());
+                    }
+                }
+            }
+        }
+    }
     writeTextFile(JoinPath(song.cacheDir, "manifest.txt"), manifest);
 
     std::string ini;
@@ -6842,7 +6951,7 @@ static void ExpandAutoGeneratedModes() {
 // Bumped whenever the MEANING of something cached changes, because the entries carry finished
 // values, not raw input: ...4 added the note measurements, ...5 the density profile, ...6 the
 // blended score (a cache from ...5 would keep serving levels rated on peak density alone).
-static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','7' };
+static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','8' };
 
 struct ScanCacheEntry {
     uint64_t mtime = 0;
@@ -7088,7 +7197,13 @@ static void scanFlatSongFolder(const std::string& mode, const std::string& modeF
             break;
         }
         FinalizeSongBinDifficultyFields(song);
-        song.title = stripDifficultyTag(song.title); // songname is per-song: drop "[EASY]" etc.
+        // The songname image is per-song, so the per-chart difficulty tag comes off the title.
+        // The song's own charts decide what that tag is; the word list is only for the songs that
+        // have nothing to compare against.
+        {
+            const std::string shared = stripChartTagBySiblings(song.chartMeta);
+            song.title = shared.empty() ? stripDifficultyTag(song.title) : shared;
+        }
         for (const auto& chart : song.chartMeta) {
             // One line per chart: 64262 of them at this library size. Gated like its neighbours,
             // with a sample kept so the shape is still visible without TraceBMSScan.
