@@ -13,6 +13,7 @@
 #include "progress_popup.h"
 #include "texture_ring.h"
 #include "supersample.h"
+#include "text_codec.h"
 #include <string>
 #include <unordered_map>
 #include <cctype>
@@ -1047,28 +1048,22 @@ static DWORD       g_panelShownAt = 0, g_panelHoldMs = 0;
 static bool        g_panelVisible = false;
 static bool        g_panelPosOverride = false;   // draw at the gameplay spot instead of the config one
 
-static std::wstring PanelWide(const std::string& s) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    if (n <= 1) n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring w(n > 0 ? (size_t)n : 1, L'\0');
-    if (n > 0 && !MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n))
-        MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, &w[0], n);
-    while (!w.empty() && w.back() == L'\0') w.pop_back();
-    return w;
-}
+static std::wstring PanelWide(const std::string& s) { return DecodeTitleBytes(s); }   // text_codec.h
 
-static HFONT PanelFont(int px, int weight) {
-    // Slightly condensed, like the game's own sprite type.
-    return CreateFontW(-px, (int)(px * 0.42f), 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+static HFONT PanelFont(int px, int weight, const std::wstring& text) {
+    // Slightly condensed, like the game's own sprite type. CJK text: the shipped face, full width.
+    const wchar_t* face = FaceFor(text);
+    const bool cjk = face != std::wstring(L"Arial");
+    return CreateFontW(-px, cjk ? 0 : (int)(px * 0.42f), 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                       DEFAULT_PITCH | FF_SWISS, L"Arial");
+                       DEFAULT_PITCH | FF_SWISS, face);
 }
 
 static void PanelText(HDC hdc, const std::string& s, int px, int weight, COLORREF col, RECT r, UINT fmt, bool shadow) {
     if (s.empty()) return;
-    HFONT font = PanelFont(px, weight);
-    HGDIOBJ old = SelectObject(hdc, font);
     std::wstring w = PanelWide(s);
+    HFONT font = PanelFont(px, weight, w);
+    HGDIOBJ old = SelectObject(hdc, font);
     if (shadow) {
         RECT sh = r; OffsetRect(&sh, 1, 1);
         SetTextColor(hdc, RGB(0, 0, 0));

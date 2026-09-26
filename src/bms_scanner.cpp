@@ -9,6 +9,7 @@
 #include "audio_decode.h"
 #include "lane_fold.h"
 #include "path_rebase.h"
+#include "text_codec.h"
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -5443,7 +5444,7 @@ static bool GenerateBmpFile(const std::string& path, int w, int h,
                     font = CreateFontW(-px, 0, 0, 0, plain ? plainWeight : FW_BOLD, FALSE, FALSE, FALSE,
                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                        ANTIALIASED_QUALITY,
-                                       DEFAULT_PITCH | FF_SWISS, L"Arial");
+                                       DEFAULT_PITCH | FF_SWISS, FaceFor(wide));
                     oldFont = (HFONT)SelectObject(hdc, font);
                     SIZE size{};
                     GetTextExtentPoint32W(hdc, wide.c_str(), (int)wide.size(), &size);
@@ -5484,13 +5485,13 @@ static bool GenerateBmpFile(const std::string& path, int w, int h,
             std::string l1 = line1, l2 = line2;
             const int avail = (plain ? w - 2 : w - 3) - 3;
             if (l2.empty() && h >= 32 && !l1.empty()) {
+                const std::wstring wholeWide = Utf8ToWide(l1);
                 HFONT probe = CreateFontW(-maxPx, 0, 0, 0, plain ? plainWeight : FW_BOLD, FALSE,
                                           FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                                          DEFAULT_PITCH | FF_SWISS, L"Arial");
+                                          DEFAULT_PITCH | FF_SWISS, FaceFor(wholeWide));
                 HFONT prev = (HFONT)SelectObject(hdc, probe);
                 SIZE whole{};
-                const std::wstring wholeWide = Utf8ToWide(l1);
                 GetTextExtentPoint32W(hdc, wholeWide.c_str(), (int)wholeWide.size(), &whole);
                 // The split point below is a byte index, and that stays safe: a 0x20 space never
                 // appears inside a UTF-8 multi-byte sequence, nor as a Shift-JIS trail byte.
@@ -5553,20 +5554,8 @@ static bool GenerateBmpFile(const std::string& path, int w, int h,
 // Category version-splash: replicate native System\SongSelect\Version\Version_NN.abm — a 256x96 24bpp
 // image with a big top line (category, white) and a smaller yellow bottom line (subtext), on black.
 // DrawTextW so CJK / special chars render (the ANSI GenerateBmpFile can't). utf8→wide first.
-static std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), -1, nullptr, 0);
-    if (n <= 0) { // not valid UTF-8 → treat as the system ANSI codepage
-        n = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
-        std::wstring w((size_t)(n > 0 ? n : 0), 0);
-        if (n > 0) { MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, &w[0], n); w.resize((size_t)n - 1); }
-        return w;
-    }
-    std::wstring w((size_t)n, 0);
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), -1, &w[0], n);
-    w.resize((size_t)n - 1);
-    return w;
-}
+// UTF-8, else Shift-JIS / EUC-KR by what the bytes spell, else ANSI: text_codec.h.
+static std::wstring Utf8ToWide(const std::string& s) { return DecodeTitleBytes(s); }
 
 static int CompareCatalogText(const std::string& a, const std::string& b) {
     std::wstring wa = Utf8ToWide(a), wb = Utf8ToWide(b);
@@ -5642,7 +5631,7 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
             for (;;) {
                 font = CreateFontW(-maxPx, width, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                                   DEFAULT_PITCH | FF_SWISS, L"Arial");
+                                   DEFAULT_PITCH | FF_SWISS, FaceFor(txt));
                 oldFont = (HFONT)SelectObject(hdc, font);
                 RECT calc = r; DrawTextW(hdc, txt.c_str(), -1, &calc, DT_CALCRECT | DT_SINGLELINE);
                 // The floor is a real one: past about a third of the height the glyphs stop being
@@ -5655,7 +5644,7 @@ static bool RenderSplashBytes(std::vector<unsigned char>& out, const std::string
         for (int px = maxPx < 6 ? 6 : maxPx; ; --px) {
             font = CreateFontW(-px, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                               DEFAULT_PITCH | FF_SWISS, L"Arial");
+                               DEFAULT_PITCH | FF_SWISS, FaceFor(txt));
             oldFont = (HFONT)SelectObject(hdc, font);
             RECT calc = r; DrawTextW(hdc, txt.c_str(), -1, &calc, DT_CALCRECT | DT_SINGLELINE);
             if (px <= 6 || (calc.right - calc.left) <= (r.right - r.left)) break;
