@@ -8,6 +8,7 @@
 #include "progress_popup.h"
 #include "audio_decode.h"
 #include "lane_fold.h"
+#include "path_rebase.h"
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -7171,6 +7172,8 @@ static void LoadScanCache() {
 
     CacheReader r{ buf.data() + 8, buf.data() + buf.size() };
     const uint32_t count = r.u32();
+    const std::string exeDir = GetExeDirectory();
+    unsigned long rebased = 0;
     for (uint32_t i = 0; i < count && r.ok; ++i) {
         ScanCacheEntry e;
         e.mtime = r.u64();
@@ -7200,6 +7203,12 @@ static void LoadScanCache() {
         s.levelNM = (int)r.u32(); s.levelHD = (int)r.u32();
         s.levelSHD = (int)r.u32(); s.levelEX = (int)r.u32();
         s.bpmNM = r.f32(); s.bpmHD = r.f32(); s.bpmSHD = r.f32(); s.bpmEX = r.f32();
+        const std::string oldBase = CachedInstallBase(s.songDir, Config().bmsRoot, s.modeFolder);
+        if (!oldBase.empty() && LowerAscii(oldBase) != LowerAscii(exeDir)) {
+            s.songDir = RebasePath(s.songDir, oldBase, exeDir);
+            s.cacheDir = RebasePath(s.cacheDir, oldBase, exeDir);
+            ++rebased;
+        }
         if (r.ok) g_scanCache[scanCacheKey(s.songDir)] = e;
     }
     if (!r.ok) {
@@ -7210,6 +7219,8 @@ static void LoadScanCache() {
         return;
     }
     LogLine("[scancache] loaded %lu songs", (unsigned long)g_scanCache.size());
+    if (rebased) LogLine("[scancache] %lu songs were cached in another install folder; paths moved to '%s'",
+                         rebased, exeDir.c_str());
 }
 
 static void SaveScanCache() {
