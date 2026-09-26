@@ -40,6 +40,7 @@ struct ModConfig {
     bool levelFromNotes = true;
     bool detailPanels = true;      // the song-select stats block and density graph
     bool textureRing = true;       // custom art reuses a fixed set of textures instead of one per song
+    bool englishTextures = true;   // Translation\system\... replaces the Korean UI textures when present
     // Frames a second for the BGA preview on the disc in song select. The clip is decoded whole
     // into memory before it plays, so this is a straight trade: 256x256x3 is 192 KB a frame, and
     // the buffer holds PreviewFps x 12 seconds of them (10 fps = 23 MB, 20 fps = 46 MB).

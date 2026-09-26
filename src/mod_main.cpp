@@ -14,6 +14,7 @@
 #include "texture_ring.h"
 #include "supersample.h"
 #include "text_codec.h"
+#include "translation_map.h"
 #include <string>
 #include <unordered_map>
 #include <cctype>
@@ -246,6 +247,45 @@ static bool HasSampleFileExtension(const std::string& p) {
 static bool LocalFileExists(const std::string& p) {
     DWORD attr = GetFileAttributesA(p.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::string LowerAscii(std::string s);
+
+// ---- English textures (translation_map.h) --------------------------------------------------------
+// Indexed once at start-up, before the game opens anything, so the lookup on every file open is a
+// hash probe and never a disk hit. Built by tools\texture_translate.py.
+static std::unordered_map<std::string, std::string> g_translatedTextures;   // key -> file on disk
+
+static void IndexTranslationDir(const std::string& dir, const std::string& relLower) {
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const std::string name = fd.cFileName;
+        if (name == "." || name == "..") continue;
+        const std::string full = dir + "\\" + name;
+        const std::string rel = relLower + (relLower.empty() ? "" : "\\") + LowerAscii(name);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) IndexTranslationDir(full, rel);
+        else g_translatedTextures[rel] = full;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static void LoadTranslatedTextures() {
+    if (!Config().englishTextures) return;
+    const std::string root = JoinPath(GetExeDirectory(), "Translation");
+    IndexTranslationDir(JoinPath(root, "system"), "system");
+    LogLine("[english] %lu translated textures in '%s'", (unsigned long)g_translatedTextures.size(), root.c_str());
+}
+
+// The English copy of a game file, or null to open the original.
+static const std::string* TranslatedTexture(const char* name) {
+    if (!name || g_translatedTextures.empty()) return nullptr;
+    static const std::string exeLower = LowerAscii(GetExeDirectory());
+    const std::string key = TranslationKey(name, exeLower);
+    if (key.empty()) return nullptr;
+    auto it = g_translatedTextures.find(key);
+    return it == g_translatedTextures.end() ? nullptr : &it->second;
 }
 
 static bool EndsWithCaseInsensitive(const std::string& p, const char* suffix) {
@@ -2468,6 +2508,7 @@ static bool InstallDirectBmsHook() {
 }
 
 static void* __cdecl HookGameFsOpen(const char* name, const char* mode) {
+    if (const std::string* en = TranslatedTexture(name)) name = en->c_str();
     g_redirectForCrt = true;
     std::string redirected = MaybeRedirectCustomPath(name);
     g_redirectForCrt = false;
@@ -3113,6 +3154,7 @@ static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share,
             }
         }
     }
+    if (const std::string* en = TranslatedTexture(name)) name = en->c_str();
     std::string redirected = MaybeRedirectCustomPath(name);
     if (redirected == "\x01ram") {
         HANDLE vh = OpenVirtualBytes(std::move(g_pendingVirtualBytes));
@@ -3511,6 +3553,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     bool logPatchOk = InstallJmp(Rva(0x2880), reinterpret_cast<void*>(&GameLogHook), g_gameLogPatch, 5);
     LogLine("[patch] game logger FUN_00402880 patch ok=%d", logPatchOk ? 1 : 0);
 
+    LoadTranslatedTextures();   // before the file hooks: the lookup is read-only from then on
     InstallWindowApiHooks();
     InstallFileHooks();
     InstallGameFsOpenHook();
