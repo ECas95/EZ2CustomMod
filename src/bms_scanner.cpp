@@ -7,6 +7,7 @@
 #include "fnex_crypto.h"
 #include "progress_popup.h"
 #include "audio_decode.h"
+#include "lane_fold.h"
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -454,11 +455,14 @@ static void parseBmsMeta(const std::string& path, CustomBmsChart& meta) {
             const int measure = (s[1]-'0')*100 + (s[2]-'0')*10 + (s[3]-'0');
             char chpair[3] = { s[4], s[5], 0 };
             const int channel = (int)strtol(chpair, nullptr, 16);
-            // P1's playable lanes, long notes folded onto the lane they belong to. A long note is
+            // Playable lanes, long notes folded onto the lane they belong to. A long note is
             // one note here: its head is what has to be hit, and counting the tail would flatter
-            // every chart that uses them.
+            // every chart that uses them. The 2P side counts too: the 5-key mode folds it onto the
+            // five keys (lane_fold.h), so a double or pop'n chart is played with all of it.
             const bool playLane = (channel >= 0x11 && channel <= 0x19) ||
-                                  (channel >= 0x51 && channel <= 0x59);
+                                  (channel >= 0x51 && channel <= 0x59) ||
+                                  (channel >= 0x21 && channel <= 0x29) ||
+                                  (channel >= 0x61 && channel <= 0x69);
             if (channel != 2 && channel != 3 && channel != 8 && !playLane) continue;
             const std::string data = trim(s.substr(s.find(':') + 1));
             if (channel == 2) { measureScale[measure] = parseDoubleSafe(data, 1.0); continue; }
@@ -789,6 +793,9 @@ static int bmsChannelToEzTrackMode(int ch, bool sevenKey) {
 static bool g_curModeSevenKey = false;
 static std::string g_curGenerateMode = "5keyOnly";
 static bool g_curAutoGenerate = false;
+// The 5-key mode's own charts are folded onto keys 1-5 (lane_fold.h); every other mode is
+// generated onto its own lanes and reads the chart as written.
+static bool g_curFoldFiveKeys = false;
 // Set for the SOURCE mode's own charts: extract scratch/pedal, but never move the authored notes.
 static bool g_curAutoEnrich = false;
 static int bmsChannelToEzTrack5Key(int ch) { return bmsChannelToEzTrackMode(ch, g_curModeSevenKey); }
@@ -2392,6 +2399,44 @@ static bool AbmFrameToBgr(const std::string& path, int size, std::vector<unsigne
 
 // The best numbered run of frames in bg\<id>\, masks excluded.
 //
+// A whole .abm or .bmp (bytes, as the game would read them) into top-down BGR24 at its own size.
+// The texture ring refills a recycled surface from this, so it reads what the game's own loader
+// would have: both magics, 16 (1:5:5:5) / 24 / 32 bpp, either row order.
+bool ArtBytesToBgr(std::vector<unsigned char> b, int& w, int& h, std::vector<unsigned char>& out) {
+    int bpp = 0;
+    size_t dataOff = 0;
+    bool bottomUp = true;
+    if (b.size() >= 54 && b[0] == 'B' && b[1] == 'M') {
+        uint32_t off = 0; int32_t bw = 0, bh = 0; uint16_t bb = 0;
+        memcpy(&off, b.data() + 10, 4); memcpy(&bw, b.data() + 18, 4);
+        memcpy(&bh, b.data() + 22, 4);  memcpy(&bb, b.data() + 28, 2);
+        if (bw <= 0 || bh == 0 || (bb != 16 && bb != 24 && bb != 32) || off >= b.size()) return false;
+        w = bw; h = bh < 0 ? -bh : bh; bpp = bb; dataOff = off; bottomUp = bh > 0;
+    } else if (!AbmDecodeHeader(b, w, h, bpp, dataOff, bottomUp)) {
+        return false;
+    }
+    const int bytesPP = bpp / 8;
+    const size_t stride = (((size_t)w * bytesPP + 3) & ~(size_t)3);
+    if (dataOff + stride * (size_t)h > b.size()) return false;
+    out.assign((size_t)w * h * 3, 0);
+    for (int y = 0; y < h; ++y) {
+        const unsigned char* row = b.data() + dataOff + (size_t)(bottomUp ? (h - 1 - y) : y) * stride;
+        unsigned char* dst = out.data() + (size_t)y * w * 3;
+        for (int x = 0; x < w; ++x) {
+            const unsigned char* p = row + (size_t)x * bytesPP;
+            if (bpp == 16) {           // 1:5:5:5, see AbmFrameToBgr
+                const uint16_t v = (uint16_t)(p[0] | (p[1] << 8));
+                dst[x*3+0] = (unsigned char)(( v        & 0x1f) << 3);
+                dst[x*3+1] = (unsigned char)(((v >> 5)  & 0x1f) << 3);
+                dst[x*3+2] = (unsigned char)(((v >> 10) & 0x1f) << 3);
+            } else {
+                dst[x*3+0] = p[0]; dst[x*3+1] = p[1]; dst[x*3+2] = p[2];
+            }
+        }
+    }
+    return true;
+}
+
 // A real .scr composites several layers, each placed and scaled by keyframes -- and those transforms
 // live in the .scr and .str, which nobody has documented past their headers (freem's formats.md
 // marks the layer and keyframe structures "todo", and says outright that how a .scr times its .str
@@ -3549,11 +3594,28 @@ static bool ezCacheMatchesGrid(const std::string& ezPath) {
     return res == (uint16_t)kEzTicksPerMeasure;
 }
 
+// The chart as the current mode plays it: parsed, then, for the 5-key mode, folded onto five keys
+// and cleared of notes stacked on one key (lane_fold.h).
+static bool parseBmsForCurrentMode(const std::string& bmsPath, ParsedBmsForEz& bms) {
+    if (!parseBmsForEz(bmsPath, bms)) return false;
+    if (!g_curFoldFiveKeys) return true;
+    const LaneFoldResult f = FoldChartToFiveKeys(bms.events, bms.lnObjId);
+    if (f.changed()) {
+        static unsigned s_lines = 0;
+        if (s_lines++ < 200)
+            LogLine("[fold5k] chart='%s' %d key lanes%s: %d notes moved (%d stacked/overlapping), "
+                    "%d kept as background",
+                    fileNameOnlyLocal(bmsPath).c_str(), f.lanesBefore, f.folded ? " -> 5" : "",
+                    f.moved, f.overlaps, f.toBackground);
+    }
+    return true;
+}
+
 static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezPath,
                               const std::string& baseName, std::string* report,
                               std::vector<unsigned char>* memoryOut = nullptr) {
     ParsedBmsForEz bms;
-    if (!parseBmsForEz(bmsPath, bms)) return false;
+    if (!parseBmsForCurrentMode(bmsPath, bms)) return false;
     std::vector<EzRawEventOut> byTrack[64];
     uint32_t totalTicks = kEzTicksPerMeasure;
     for (const auto& e : bms.events) {
@@ -3583,20 +3645,30 @@ static bool generateEzFromBms(const std::string& bmsPath, const std::string& ezP
 
         // BMS LNTYPE 1 uses alternating endpoints. EZ uses one event whose length is
         // the distance to the release; emitting both endpoints creates phantom MISSes.
-        int open = -1;
-        for (size_t i = 0; i < events.size(); ++i) {
-            if (!isLongNoteChannel(events[i].ch)) continue;
-            if (open < 0) {
-                open = (int)i;
-            } else {
-                uint32_t delta = events[i].tick > events[(size_t)open].tick ? events[i].tick - events[(size_t)open].tick : 7;
-                events[(size_t)open].len = (int)std::min<uint32_t>(delta, 0xffff);
-                if (events[(size_t)open].len < kMinNoteLenTicks)
-                    events[(size_t)open].len = kMinNoteLenTicks;
-                events[i].type = -1;
-                open = -1;
+        // Which endpoints pair up is ln_pairing.h's call, not plain alternation: a lane that lost
+        // one event would otherwise have every later hold inverted over the notes between them.
+        {
+            std::vector<size_t> lnIdx;
+            std::vector<uint32_t> lnTicks, tapTicks;
+            for (size_t i = 0; i < events.size(); ++i) {
+                const auto& ev = events[i];
+                if (isLongNoteChannel(ev.ch)) { lnIdx.push_back(i); lnTicks.push_back(ev.tick); }
+                else if (ev.type == 1 && ev.ch != 1 && !(bms.lnObjId > 0 && ev.wav == bms.lnObjId))
+                    tapTicks.push_back(ev.tick);
+            }
+            std::sort(tapTicks.begin(), tapTicks.end());
+            const std::vector<int> roles = PairLongNotes(lnTicks, tapTicks);
+            for (size_t k = 0; k + 1 < lnIdx.size(); ++k) {
+                if (roles[k] != kLnHead) continue;
+                auto& head = events[lnIdx[k]];
+                auto& tail = events[lnIdx[k + 1]];
+                uint32_t delta = tail.tick > head.tick ? tail.tick - head.tick : 7;
+                head.len = (int)std::min<uint32_t>(delta, 0xffff);
+                if (head.len < kMinNoteLenTicks) head.len = kMinNoteLenTicks;
+                tail.type = -1;
                 ++longNotes;
             }
+            // A lone event (kLnAlone) stays an ordinary note: its length is already the tap floor.
         }
 
         std::vector<EzRawEventOut> normalized;
@@ -3979,7 +4051,7 @@ std::string ResolveDirectBmsVisual(const CustomBmsSong& song, const std::string&
 
 static bool generateEziFromBms(const CustomBmsSong& song, const std::string& bmsPath, const std::string& eziPath, const std::string& ezzPath, bool materializeAudio) {
     ParsedBmsForEz bms;
-    if (!parseBmsForEz(bmsPath, bms)) return false;
+    if (!parseBmsForCurrentMode(bmsPath, bms)) return false;
 
     std::set<int> playableIds;
     std::set<int> bgmIds;
@@ -4278,6 +4350,7 @@ static void GeneratePlayableCacheV10(const CustomBmsSong& song, bool materialize
     g_curModeSevenKey = modeIsSevenKey(song.mode);
     g_curGenerateMode = song.mode;
     g_curAutoGenerate = song.autoGenerated;
+    g_curFoldFiveKeys = !song.autoGenerated && NormalizeModeName(song.mode) == "5keyMix";
     g_curAutoEnrich = !song.autoGenerated && Config().autoGenerateEnrichSource;
     std::vector<CustomBmsChart> charts = song.chartMeta;
     charts.erase(std::remove_if(charts.begin(), charts.end(), [](const CustomBmsChart& c){ return c.slot < 0 || c.slot >= kChartSlots; }), charts.end());
@@ -4875,6 +4948,7 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
     g_curModeSevenKey = modeIsSevenKey(song->mode);
     g_curGenerateMode = song->mode;
     g_curAutoGenerate = song->autoGenerated;
+    g_curFoldFiveKeys = !song->autoGenerated && NormalizeModeName(song->mode) == "5keyMix";
     g_curAutoEnrich = !song->autoGenerated && Config().autoGenerateEnrichSource;
     std::vector<unsigned char> ez;
     std::string report;
@@ -4953,7 +5027,13 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
         std::string source, unused;
         if (!resolveBmsAudioAsset(song->songDir, definition->second, source, unused)) { ++missing; continue; }
         void* sample = nullptr;
-        if (endsWith(source, ".wav") || endsWith(source, ".ssf")) {
+        // The game's own loader only ever opens .ssf: it swaps any extension it is handed for .ssf
+        // (the game asks for "Preview\%s.wav" and ships .ssf), so a BMS .wav reaches it only when a
+        // converted .ssf sits beside it. Otherwise it was two failed opens and two "Open Error :
+        // OpenSample" lines per keysound before loadDirectPcm below loaded the .wav anyway.
+        const bool gameCanOpen = endsWith(source, ".ssf") ||
+            (endsWith(source, ".wav") && fileExistsLocal(replaceExtensionLocal(source, ".ssf")));
+        if (gameCanOpen) {
             std::string nativePath = source;
             std::string root = GetExeDirectory();
             std::string sourceLow = lowerPathLocal(source), rootLow = lowerPathLocal(root);
@@ -5113,10 +5193,12 @@ void EnsureSongPreview(const CustomBmsSong& song) {
     // well past the window so the cut can start somewhere other than the intro -- the shipped ones
     // are hand-picked at the chorus -- and 40 s of source gives it the first 20 to choose from.
     std::string tmp = dst + ".tmp";
+    const DWORD cutStart = GetTickCount();
     bool ok = mediaFoundationToSsfLocal(bestSrc, tmp, kPreviewSourceSeconds);
     if (ok && !MakeRandomPreviewSsf(tmp, dst, kPreviewWindowSeconds)) ok = copyFileSimple(tmp, dst);
     DeleteFileA(tmp.c_str());
-    LogLine("[cache] preview id='%s' src='%s' ok=%d", song.id.c_str(), bestSrc.c_str(), ok ? 1 : 0);
+    LogLine("[cache] preview id='%s' src='%s' ok=%d in %lu ms", song.id.c_str(), bestSrc.c_str(), ok ? 1 : 0,
+            (unsigned long)(GetTickCount() - cutStart));
 }
 
 const CustomBmsSong* FindCustomSongByCacheDir(const std::string& cacheDir) {
@@ -5744,7 +5826,7 @@ bool BuildCategoryAbmInMemory(const std::string& mode, size_t categoryIndex, int
     return ok && AbmFromBmpBytes(out);
 }
 
-static bool GenerateAbmFromBmp(const std::string& bmpPath) {
+static bool GenerateAbmFromBmp(const std::string& bmpPath, const std::string& abmOut) {
     FILE* f = fopen(bmpPath.c_str(), "rb");
     if (!f) return false;
     fseek(f, 0, SEEK_END);
@@ -5773,7 +5855,7 @@ static bool GenerateAbmFromBmp(const std::string& bmpPath) {
         v ^= xors[i];
         memcpy(b.data() + offsets[i], &v, 4);
     }
-    bool ok = writeBinaryFile(replaceExtensionLocal(bmpPath, ".abm"), b);
+    bool ok = writeBinaryFile(abmOut, b);
     // The .bmp is a build-time intermediate; the game only ever opens the .abm. Drop it once the .abm
     // is written (25777 leftover .bmp = ~1.4GB of dead cache before this). Callers self-check the .abm,
     // not the .bmp, so this is safe. (eyecatch/splash already deleted theirs; now it's uniform.)
@@ -5787,10 +5869,15 @@ static int GenerateVisualPair(const std::string& bmpPath, int w, int h,
                               Gdiplus::Image* artwork = nullptr, bool styledText = false,
                               bool circularArtwork = false, int outputBpp = 24) {
     if (!GenerateBmpFile(bmpPath, w, h, bg, fg, line1, line2, artwork, styledText, circularArtwork, outputBpp)) return 0;
-    if (!GenerateAbmFromBmp(bmpPath)) return 1;
-    std::string abmPath = replaceExtensionLocal(bmpPath, ".abm");
+    // Written under a temporary name and published only once it checks out. With the art in RAM
+    // the game thread absorbs (reads, then deletes) any .abm it finds, without the render lock --
+    // and it once found one between this write and the check below, deleted it, and the check
+    // failed on a file that was fine ("got=0bpp/0x0"), so a good render became a flat tile.
+    const std::string abmPath = replaceExtensionLocal(bmpPath, ".abm");
+    const std::string partPath = abmPath + ".part";
+    if (!GenerateAbmFromBmp(bmpPath, partPath)) { DeleteFileA(partPath.c_str()); return 1; }
     unsigned char header[10] = {};
-    FILE* f = fopen(abmPath.c_str(), "rb");
+    FILE* f = fopen(partPath.c_str(), "rb");
     size_t got = f ? fread(header, 1, sizeof(header), f) : 0;
     if (f) fclose(f);
     uint16_t bpp = 0, aw = 0, ah = 0;
@@ -5800,9 +5887,14 @@ static int GenerateVisualPair(const std::string& bmpPath, int w, int h,
         memcpy(&ah, header + 8, 2);
     }
     if (got != sizeof(header) || header[0] != 'A' || header[1] != 'W' || bpp != outputBpp || aw != w || ah != h) {
-        DeleteFileA(abmPath.c_str());
+        DeleteFileA(partPath.c_str());
         LogLine("[assets] ABM selfcheck failed file='%s' expected=%dbpp/%dx%d got=%ubpp/%ux%u",
                 abmPath.c_str(), outputBpp, w, h, bpp, aw, ah);
+        return 1;
+    }
+    if (!MoveFileExA(partPath.c_str(), abmPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileA(partPath.c_str());
+        LogLine("[assets] could not publish '%s' (error %lu)", abmPath.c_str(), (unsigned long)GetLastError());
         return 1;
     }
     return 2;
@@ -6556,12 +6648,18 @@ bool SongPreviewBytes(const CustomBmsSong& song, std::vector<unsigned char>& out
 // The preview is opened by the game's CRT fopen (openSample), which cannot take a memory
 // handle, so in the RAM mode it is written back to disk for that one open -- the previous one
 // deleted first, so at most one .ssf sits in the cache at a time.
+static bool RamAssetGet(const std::string& key, std::vector<unsigned char>& out);
+static void RamAssetPut(const std::string& key, std::vector<unsigned char>&& bytes);
 std::string SongPreviewFileForCrt(const CustomBmsSong& song) {
     static std::vector<std::string> s_recent;     // newest last; the oldest are deleted
     if (song.cacheDir.empty()) return std::string();
     const std::string path = JoinPath(song.cacheDir, song.id + ".ssf");
     if (!fileExistsLocal(path)) {
-        EnsureSongPreview(song);                  // writes the .ssf; no RAM round trip
+        // A preview pushed off the disk below is kept in the RAM store, so coming back to the song
+        // writes it out again instead of decoding 40 s of its audio on the game thread -- the
+        // ~100 ms hitch a revisited song used to cost on hover.
+        std::vector<unsigned char> kept;
+        if (!(RamAssetGet(path, kept) && writeBinaryFile(path, kept))) EnsureSongPreview(song);
         if (!fileExistsLocal(path)) return std::string();
     }
     auto at = std::find(s_recent.begin(), s_recent.end(), path);
@@ -6569,7 +6667,12 @@ std::string SongPreviewFileForCrt(const CustomBmsSong& song) {
     s_recent.push_back(path);
     // Deep enough that nothing still being played is ever the one deleted, shallow enough that
     // the cache does not grow without bound at ~2 MB a song.
-    while (s_recent.size() > 64) { DeleteFileA(s_recent.front().c_str()); s_recent.erase(s_recent.begin()); }
+    while (s_recent.size() > 64) {
+        std::vector<unsigned char> bytes;
+        if (readWholeFileForModel(s_recent.front(), bytes) && !bytes.empty()) RamAssetPut(s_recent.front(), std::move(bytes));
+        DeleteFileA(s_recent.front().c_str());
+        s_recent.erase(s_recent.begin());
+    }
     return path;
 }
 
@@ -6980,7 +7083,7 @@ static void ExpandAutoGeneratedModes() {
 // Bumped whenever the MEANING of something cached changes, because the entries carry finished
 // values, not raw input: ...4 added the note measurements, ...5 the density profile, ...6 the
 // blended score (a cache from ...5 would keep serving levels rated on peak density alone).
-static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','8' };
+static const char kScanCacheMagic[8] = { 'E','Z','2','S','C','A','N','9' };
 
 struct ScanCacheEntry {
     uint64_t mtime = 0;

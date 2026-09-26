@@ -171,6 +171,8 @@ std::string EnsureSongVisualAsset(const CustomBmsSong& song, const std::string& 
 // scratch, removed once absorbed). The preview .ssf likewise.
 bool SongVisualAssetBytes(const CustomBmsSong& song, const std::string& request, std::vector<unsigned char>& out);
 bool SongPreviewBytes(const CustomBmsSong& song, std::vector<unsigned char>& out);
+// .abm/.bmp bytes -> top-down BGR24 at the image's own size (the texture ring refills from it).
+bool ArtBytesToBgr(std::vector<unsigned char> bytes, int& w, int& h, std::vector<unsigned char>& out);
 std::string SongPreviewFileForCrt(const CustomBmsSong& song);   // the .ssf as a file, for fopen
 // Is this role's art already there (RAM store or .abm) without a render? The wheel window asks
 // before it hands the game a request, so the game thread never renders wheel art itself.

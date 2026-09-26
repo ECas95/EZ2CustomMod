@@ -11,6 +11,7 @@
 #include "bms_scanner.h"
 #include "trace_hooks.h"
 #include "progress_popup.h"
+#include "texture_ring.h"
 #include <string>
 #include <unordered_map>
 #include <cctype>
@@ -2384,6 +2385,9 @@ static int __fastcall HookSongPackage(void* self, void*, const char* request) {
     return r;
 }
 
+// The texture ring's detour of loadTexture (0x8d00); defined with the ring further down.
+static JumpPatch g_loadTexturePatch;
+
 static bool InstallDirectBmsHook() {
     void* target = Rva(0x11720);
     const unsigned char songPackage[] = {0x81,0xec,0x10,0x03,0x00,0x00};
@@ -2419,7 +2423,13 @@ static bool InstallDirectBmsHook() {
     };
     for (const auto& signature : signatures) {
         void* address = Rva(signature.rva);
-        if (!CanReadGamePtr(address, signature.size) || memcmp(address, signature.bytes, signature.size) != 0) {
+        // A function we detour ourselves is checked against the bytes the detour saved. The texture
+        // ring patches loadTexture before this runs, and comparing its jmp to the original prologue
+        // switched the whole direct bridge off -- every song then went through the disk fallback,
+        // and a cold cache took over 15 minutes of start-up to rebuild.
+        const void* actual = address;
+        if (address == g_loadTexturePatch.target && g_loadTexturePatch.installed) actual = g_loadTexturePatch.original;
+        if (!CanReadGamePtr(address, signature.size) || memcmp(actual, signature.bytes, signature.size) != 0) {
             LogLine("[direct] executable profile mismatch rva=0x%05lx; using disk fallback",
                     (unsigned long)signature.rva);
             return false;
@@ -2602,6 +2612,143 @@ static bool InstallCategoryWheelGuard() {
     EmitU32Local(p, static_cast<unsigned long>((intptr_t)g_wheelGateway - (intptr_t)(p + 4)));
     bool ok = InstallJmp(target, stub, g_wheelGuardPatch, len);
     LogLine("[wheelguard] FUN_00432200 null-slot guard ok=%d gateway=%p stub=%p", ok ? 1 : 0, g_wheelGateway, (void*)stub);
+    return ok;
+}
+
+// ---- texture ring for custom-song art ----------------------------------------------------------
+//
+// loadTexture (0x408d00) keeps every texture it loads, keyed by file name, until song select is torn
+// down, and each one is a DirectDraw surface with a GDI object behind it. Native art is a fixed set;
+// custom art was one new name per song the wheel or the big disc ever showed, so browsing without
+// playing walked the GDI count up ~40 per category change (2182 -> 2753 in one minute of the
+// 2026-09-25 log) toward the 10 000 per-process ceiling, past which no texture loads at all.
+//
+// Custom art now lives in a fixed ring per role. A ring slot's first use creates its texture the
+// normal way, from the song's own file, under the slot's cache key; every later use finds that
+// texture by the key and refills its surface with the new song's pixels (Lock/Unlock, no GDI)
+// instead of creating another. Each ring is sized well past what can be on screen at once -- the
+// wheel shows 16 names and 7 small discs, the big disc is one -- and the wheel asks
+// TextureRingHolds before trusting a row pointer a recycled slot may have moved on from.
+//
+// Every use goes through the key lookup rather than a remembered pointer, because leaving song
+// select for a song frees the whole cache: the lookup then misses, creates the texture afresh from
+// the requested file, and the ring simply adopts the new pointer.
+struct RingRole { size_t size; std::vector<RingSlot> slots; };
+static const char* const kRingDirs[] = {"songname", "discsmall", "disc", "eyecatch", "resultdisc"};
+static RingRole g_rings[] = {{64, {}}, {40, {}}, {8, {}}, {4, {}}, {4, {}}};   // same order as kRingDirs
+static unsigned long g_ringClock = 0;
+static unsigned long g_ringCreated = 0, g_ringRefilled = 0, g_ringFallbacks = 0;
+
+using LoadTextureFn = int (__thiscall*)(void*, const char*, void**, const char*);
+static LoadTextureFn g_realLoadTexture = nullptr;
+
+// The pixels the game's own loader would have put in the texture for this request.
+static bool RingArtPixels(void* gfx, const CustomBmsSong& song, const char* name,
+                          int& w, int& h, std::vector<unsigned char>& bgr) {
+    std::string request = name;
+    if (*reinterpret_cast<const uint32_t*>(reinterpret_cast<const unsigned char*>(gfx) + 0xd4) != 0 &&
+        EndsWithCaseInsensitive(request, ".bmp"))
+        request.replace(request.size() - 4, 4, ".abm");    // the loader's alternate-artwork switch
+    std::vector<unsigned char> bytes;
+    if (!(Config().assetsInMemory && SongVisualAssetBytes(song, request, bytes))) {
+        std::string path = ResolveDirectBmsVisual(song, request);
+        if (path.empty()) path = EnsureSongVisualAsset(song, request);
+        if (path.empty()) return false;
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return false;
+        fseek(f, 0, SEEK_END);
+        const long size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (size > 54 && size < (32L << 20)) {
+            bytes.resize((size_t)size);
+            if (fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
+        }
+        fclose(f);
+    }
+    return !bytes.empty() && ArtBytesToBgr(bytes, w, h, bgr);
+}
+
+static int LoadTextureRinged(void* gfx, const char* name, void** out, const char* key);
+static int __fastcall HookLoadTexture(void* gfx, void* /*edx*/, const char* name, void** out, const char* key) {
+    const long long t0 = ModTimeNow();
+    const int r = LoadTextureRinged(gfx, name, out, key);
+    ModTimeAdd(kModTimeTex, ModTimeNow() - t0);
+    return r;
+}
+
+static int LoadTextureRinged(void* gfx, const char* name, void** out, const char* key) {
+    std::string id;
+    const int r = (!key && name && out) ? RingRoleOf(name, kRingDirs, 5, id) : -1;
+    RingRole* role = r >= 0 ? &g_rings[r] : nullptr;
+    const CustomBmsSong* song = role ? FindCustomSongById(id.c_str()) : nullptr;
+    if (!song) return g_realLoadTexture(gfx, name, out, key);
+
+    if (role->slots.empty()) role->slots.resize(role->size);
+    ++g_ringClock;
+    bool same = false;
+    RingSlot* slot = PickRingSlot(role->slots, id, same);
+    const size_t index = (size_t)(slot - role->slots.data());
+    char ringKey[48];
+    snprintf(ringKey, sizeof(ringKey), "ezring\\%s\\%u", kRingDirs[r], (unsigned)index);
+
+    void* tex = nullptr;
+    const int result = g_realLoadTexture(gfx, name, &tex, ringKey);   // hit: the slot's texture
+    if (!tex) { *out = nullptr; return result; }
+    const bool ready = SongVisualAssetReady(*song, kRingDirs[r]);
+    if (tex != slot->tex) {
+        // Created just now from `name` -- a fresh slot, or the cache was torn down since.
+        ++g_ringCreated;
+    } else if (!same || slot->placeholder) {
+        int w = 0, h = 0;
+        std::vector<unsigned char> bgr;
+        const float tw = *reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(tex) + 0x80);
+        const float th = *reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(tex) + 0x84);
+        void* surface = *reinterpret_cast<void**>(tex);
+        if (!RingArtPixels(gfx, *song, name, w, h, bgr) || tw < 1.0f || th < 1.0f ||
+            !UploadPixelsToSurface(surface, bgr.data(), w, h, 24, w * 3, true, 0, 0, w, h, (int)tw, (int)th)) {
+            // The slot keeps its old picture; this one request gets its own texture, as before.
+            ++g_ringFallbacks;
+            return g_realLoadTexture(gfx, name, out, key);
+        }
+        ++g_ringRefilled;
+    }
+    slot->tex = tex;
+    slot->id = id;
+    slot->stamp = g_ringClock;
+    slot->placeholder = !ready;
+    *out = tex;
+    static unsigned long s_reported = 0;
+    const unsigned long total = g_ringCreated + g_ringRefilled;
+    if (total >= s_reported + 500 || (total && !s_reported)) {
+        s_reported = total;
+        LogLine("[texring] created=%lu refilled=%lu fallbacks=%lu (textures the pool would otherwise have added: %lu)",
+                g_ringCreated, g_ringRefilled, g_ringFallbacks, g_ringRefilled);
+    }
+    return 1;
+}
+
+bool TextureRingHolds(const void* tex, const char* id) {
+    if (!tex || !id) return false;
+    for (const RingRole& r : g_rings)
+        for (const RingSlot& s : r.slots)
+            if (s.tex == tex) return _stricmp(s.id.c_str(), id) == 0;
+    return true;    // not a ring texture: a pointer the game or an older load made, still valid
+}
+
+static bool InstallTextureRing() {
+    void* target = Rva(0x8d00);
+    const size_t len = 6;                                   // sub esp,0x18c -- position independent
+    const unsigned char expected[len] = {0x81, 0xEC, 0x8C, 0x01, 0x00, 0x00};
+    if (!target || memcmp(target, expected, len) != 0) {
+        LogLine("[texring] loadTexture prologue not as expected; ring not installed");
+        return false;
+    }
+    memcpy(g_loadTexturePatch.original, target, len);
+    void* gateway = nullptr;
+    if (!BuildSimpleGateway(target, len, g_loadTexturePatch.original, &gateway)) return false;
+    g_realLoadTexture = reinterpret_cast<LoadTextureFn>(gateway);
+    const bool ok = InstallJmp(target, reinterpret_cast<void*>(&HookLoadTexture), g_loadTexturePatch, len);
+    LogLine("[texring] loadTexture ring ok=%d gateway=%p", ok ? 1 : 0, gateway);
     return ok;
 }
 
@@ -3186,7 +3333,22 @@ static LONG CALLBACK FirstChanceCrashVEH(EXCEPTION_POINTERS* ep) {
                         for (int k = 0; k < 95 && nm[k] && !IsBadReadPtr((void*)(nm + k), 1); ++k) tn[k] = nm[k], tn[k+1] = 0;
                     }
                 }
-                LogLine("[throw] #%lu C++ exception type='%s'", cppN, tn);
+                // The ThrowInfo lives in the thrower's own .rdata, so its module says whose exception
+                // this is -- the game, the mod, or a driver/wrapper DLL (a _com_error at window
+                // creation, 2026-09-25, could not be placed without it).
+                char mod[MAX_PATH] = "?";
+                if (er->NumberParameters >= 3) {
+                    HMODULE hm = nullptr;
+                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           reinterpret_cast<LPCSTR>(er->ExceptionInformation[2]), &hm) && hm) {
+                        char full[MAX_PATH] = {};
+                        if (GetModuleFileNameA(hm, full, MAX_PATH)) {
+                            const char* slash = strrchr(full, '\\');
+                            lstrcpynA(mod, slash ? slash + 1 : full, MAX_PATH);
+                        }
+                    }
+                }
+                LogLine("[throw] #%lu C++ exception type='%s' thrower='%s'", cppN, tn, mod);
             }
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -3333,6 +3495,8 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
     LogLine("[init] base=%p exeDir='%s'", GetModuleHandleA(nullptr), GetExeDirectory().c_str());
         LogLine("[config] bridgeMode=%d redirectCustomToNative=%d pinCustomAtTop=%d forceSelectCustom=%d bmsRoot='%s' cacheRoot='%s'", Config().bridgeMode?1:0, Config().redirectCustomToNative?1:0, Config().pinCustomAtTop?1:0, Config().forceSelectCustom?1:0, Config().bmsRoot.c_str(), Config().cacheRoot.c_str());
+        LogLine("[config] memory tier=%s keysoundCache=%dMB assetCache=%dMB previewFps=%d",
+                Config().memoryTier, Config().keysoundCacheMB, Config().assetCacheMB, Config().previewFps);
         LogLine("[autochart-config] enable=%d source='%s' targets='%s' intensity=%d seed=%d learnNative=%d nativeRoot='%s' maxCharts=%d",
                 Config().autoGenerateModes ? 1 : 0, Config().autoGenerateSourceMode.c_str(),
                 Config().autoGenerateTargetModes.c_str(), Config().autoGenerateIntensity,
@@ -3352,6 +3516,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     InstallPoolOverflowGuard(); // texture pool full → flush+retry instead of null-deref crash (0x41455b)
     InstallTextRenderNullGuard();// stop the 5Key SongSelect AV: pool-full → null text-texture → sub_407A50
     InstallCategoryWheelGuard(); // stop the category-change AV: null disc-texture slot → FUN_00432200 deref
+    if (Config().textureRing) InstallTextureRing(); // custom art reuses a fixed set of textures (GDI ceiling)
     // InstallTexPoolGrow() removed: the 32MB KResourceContainer texture pool is allocated before our
     // init and hands out ABSOLUTE pointers into its buffer, so it can't be grown or relocated without
     // dangling every texture handle (lost native discs). The songname budget caps loads to fit it.

@@ -37,6 +37,9 @@ void EzColumnDraw(uint32_t obj);
 void ConstantSpeedNoteSelection(float bpm, const char* id);
 int  ConstantSpeedPredict(float bpm);          // 0 = no change would be made
 void DetailPanelsDraw(const char* id, int slot);   // song-select stats + density graph
+// False when `tex` is a ring texture that now shows another song than `id` (mod_main's loadTexture
+// ring recycles custom art surfaces); true for anything else.
+bool TextureRingHolds(const void* tex, const char* id);
 void DetailPanelsReset();
 float JudgeTickMs();                            // ms per engine tick of the chart loaded now
 int   JudgeOffsetTicks();                       // the [Gameplay] JudgeOffsetMs, in those ticks                            // the "now playing" card, any screen but song select
@@ -44,6 +47,10 @@ int   JudgeOffsetTicks();                       // the [Gameplay] JudgeOffsetMs,
 // Frame-time meter. Every hook of ours adds the QPC ticks it spent to one of these buckets; the
 // frame-end hook reports frame pacing and the buckets every few seconds, so a stutter can be
 // attributed (or not) to the mod. Defined in trace_hooks.
-enum ModTimeBucket { kModTimeTrace = 0, kModTimeFiles = 1, kModTimeVideo = 2, kModTimeBuckets = 3 };
+// tex = every loadTexture call (the game's own and the ring's), filter = the category filter.
+// They overlap trace when the call comes from one of the traced hooks; they are there to name the
+// cause of a slow frame, not to be summed.
+enum ModTimeBucket { kModTimeTrace = 0, kModTimeFiles = 1, kModTimeVideo = 2, kModTimeTex = 3,
+                     kModTimeFilter = 4, kModTimeBuckets = 5 };
 void ModTimeAdd(int bucket, long long qpcTicks);
 long long ModTimeNow();

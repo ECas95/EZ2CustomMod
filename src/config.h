@@ -30,13 +30,16 @@ struct ModConfig {
     // and a session that browsed a lot reached 1470 MB committed across 10896 regions -- fine while
     // the EXE is large-address aware on a 64-bit host, but XP 32-bit stops at 2 GB without /3GB,
     // and one disc render had already failed for want of a contiguous block.
-    int  keysoundCacheMB = 384;    // decoded keysound PCM held for the song under the cursor
-    int  assetCacheMB = 256;       // generated art and previews, LRU
+    // 0 = sized from the machine (MemoryBudgetFor below); any other value is taken as given.
+    int  keysoundCacheMB = 0;      // decoded keysound PCM held for the song under the cursor
+    int  assetCacheMB = 0;         // generated art and previews, LRU
+    const char* memoryTier = "";   // which MemoryBudgetFor tier the auto sizes came from (for the log)
     // Rate charts from their own note data instead of trusting #PLAYLEVEL. The declared level
     // stops discriminating at the top: 46% of songs call their hardest chart 18, and inside that
     // one level the peak density runs from 13 to 83 notes a second.
     bool levelFromNotes = true;
     bool detailPanels = true;      // the song-select stats block and density graph
+    bool textureRing = true;       // custom art reuses a fixed set of textures instead of one per song
     // Frames a second for the BGA preview on the disc in song select. The clip is decoded whole
     // into memory before it plays, so this is a straight trade: 256x256x3 is 192 KB a frame, and
     // the buffer holds PreviewFps x 12 seconds of them (10 fps = 23 MB, 20 fps = 46 MB).
@@ -91,6 +94,19 @@ struct ModConfig {
     std::string nativeChartRoot = "SOUND";
     int nativeModelMaxChartsPerMode = 192;
 };
+
+// Automatic cache sizes. What limits us is the process's address space before physical memory:
+// 2 GB on XP 32-bit (3 GB with /3GB), 4 GB for this large-address-aware EXE on a 64-bit host. A
+// session that browsed a lot reached ~1.5 GB committed with 384 + 256, which leaves nothing on a
+// 2 GB process, so the smaller tiers cut the caches and the preview clip (the clip is decoded
+// whole: 192 KB a frame for 12 s) to fit. A small physical memory takes the tier below too.
+struct MemoryBudget { int keysoundMB; int assetMB; int previewFpsCap; const char* tier; };
+inline MemoryBudget MemoryBudgetFor(unsigned long long totalVirtual, unsigned long long totalPhys) {
+    const unsigned long long mb = 1ull << 20;
+    if (totalVirtual <= 2200 * mb || (totalPhys && totalPhys < 1536 * mb)) return {128, 96, 10, "2GB"};
+    if (totalVirtual <= 3200 * mb || (totalPhys && totalPhys < 3072 * mb)) return {256, 160, 20, "3GB"};
+    return {384, 256, 30, "4GB"};
+}
 
 ModConfig LoadConfig();
 const ModConfig& Config();

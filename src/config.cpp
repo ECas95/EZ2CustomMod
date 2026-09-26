@@ -55,13 +55,25 @@ ModConfig LoadConfig() {
     cfg.hudPanelY = readInt("Gameplay", "HudPanelY", 86, ini);
     cfg.fpsLimit = readInt("Gameplay", "FpsLimit", 0, ini);
     cfg.judgeOffsetMs = readInt("Gameplay", "JudgeOffsetMs", 0, ini);
-    cfg.keysoundCacheMB = readInt("CustomSongs", "KeysoundCacheMB", 384, ini);
-    cfg.assetCacheMB = readInt("CustomSongs", "AssetCacheMB", 256, ini);
+    cfg.keysoundCacheMB = readInt("CustomSongs", "KeysoundCacheMB", 0, ini);
+    cfg.assetCacheMB = readInt("CustomSongs", "AssetCacheMB", 0, ini);
     cfg.levelFromNotes = readBool("CustomSongs", "LevelFromNotes", true, ini);
     cfg.detailPanels = readBool("Gameplay", "DetailPanels", true, ini);
+    cfg.textureRing = readBool("Gameplay", "TextureRing", true, ini);
     cfg.previewFps = readInt("Gameplay", "PreviewFps", 20, ini);
     if (cfg.previewFps < 5) cfg.previewFps = 5;
     if (cfg.previewFps > 30) cfg.previewFps = 30;
+    {
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        const bool known = GlobalMemoryStatusEx(&ms) != 0;
+        const MemoryBudget b = MemoryBudgetFor(known ? ms.ullTotalVirtual : (2ull << 30),
+                                               known ? ms.ullTotalPhys : 0);
+        cfg.memoryTier = b.tier;
+        if (cfg.keysoundCacheMB <= 0) cfg.keysoundCacheMB = b.keysoundMB;
+        if (cfg.assetCacheMB <= 0) cfg.assetCacheMB = b.assetMB;
+        if (cfg.previewFps > b.previewFpsCap) cfg.previewFps = b.previewFpsCap;
+    }
     if (cfg.keysoundCacheMB < 16) cfg.keysoundCacheMB = 16;
     if (cfg.assetCacheMB < 16) cfg.assetCacheMB = 16;
     cfg.artPrefetch = readBool("Gameplay", "ArtPrefetch", true, ini);

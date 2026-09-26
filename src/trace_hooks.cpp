@@ -1153,8 +1153,14 @@ static void LoadSongnameWindow(uint32_t obj, uint32_t selected, uint32_t visible
         // Outside the disc band this row only ever needs its name, so a filled name is enough
         // to skip it -- testing both would keep re-walking rows whose disc we deliberately skip.
         const bool wantDisc = (k >= -discHalf && k <= discHalf);
+        const char* const rowId = reinterpret_cast<const char*>(entry + kEntryIdOff);
+        const std::string idCopy(rowId, strnlen(rowId, 31));
+        const char* id = idCopy.c_str();
+        // A filled slot is only as good as the texture behind it: a ring texture that has since
+        // been refilled for another song leaves this row pointing at that song's art.
+        if (*nameSlot && !TextureRingHolds(reinterpret_cast<void*>(*nameSlot), id)) *nameSlot = 0;
+        if (*discSlot && !TextureRingHolds(reinterpret_cast<void*>(*discSlot), id)) *discSlot = 0;
         if (*nameSlot && (!wantDisc || *discSlot)) continue;
-        const char* id = reinterpret_cast<const char*>(entry + kEntryIdOff);
         if (id[0] != 'b' || id[1] != 'm' || id[2] != 's') continue;     // native songs: not ours
         if (!GdiHeadroomAvailable(2)) { ++blocked; break; }
         // Art not rendered yet is left to the art thread (this row goes to the front of its
@@ -1811,12 +1817,17 @@ static void LogKnownFunctionArgs(TraceHook* h, PushadRegs* r, unsigned long hit)
 // ---- frame-time meter --------------------------------------------------------------------------
 static volatile long long g_modTime[kModTimeBuckets] = {};
 static long g_modCalls[kModTimeBuckets] = {};
+// The same, for the current frame only: what a slow frame is attributed with.
+static volatile long long g_frameModTime[kModTimeBuckets] = {};
+static long g_frameModCalls[kModTimeBuckets] = {};
 
 long long ModTimeNow() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 void ModTimeAdd(int bucket, long long qpcTicks) {
     if (bucket < 0 || bucket >= kModTimeBuckets) return;
     g_modTime[bucket] += qpcTicks;
     ++g_modCalls[bucket];
+    g_frameModTime[bucket] += qpcTicks;
+    ++g_frameModCalls[bucket];
 }
 
 // Called at every frame end (doOp7(1), any screen). Reports every 5 seconds: frames, average and
@@ -1826,25 +1837,41 @@ static void FrameTimeTick() {
     static long s_frames = 0, s_slow = 0;
     if (!s_freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); s_freq = f.QuadPart ? f.QuadPart : 1; }
     const long long now = ModTimeNow();
+    const double ms = 1000.0 / (double)s_freq;
     if (s_last) {
         const long long dt = now - s_last;
         s_sum += dt;
         ++s_frames;
         if (dt > s_worst) s_worst = dt;
         if (dt * 1000 > s_freq * 25) ++s_slow;
+        // A single frame past 100 ms, with what the mod spent inside it. Gaps of seconds are not
+        // frames -- the meter does not run while a song is being played -- so they are left out.
+        static unsigned s_slowLines = 0;
+        if (dt * 10 > s_freq && dt < s_freq * 10 && s_slowLines < 80) {
+            ++s_slowLines;
+            LogLine("[slowframe] %.0f ms | tex %.1f ms (%ld loads) filter %.1f ms (%ld) trace %.1f ms files %.1f ms (%ld) video %.1f ms",
+                    (double)dt * ms,
+                    (double)g_frameModTime[kModTimeTex] * ms, g_frameModCalls[kModTimeTex],
+                    (double)g_frameModTime[kModTimeFilter] * ms, g_frameModCalls[kModTimeFilter],
+                    (double)g_frameModTime[kModTimeTrace] * ms,
+                    (double)g_frameModTime[kModTimeFiles] * ms, g_frameModCalls[kModTimeFiles],
+                    (double)g_frameModTime[kModTimeVideo] * ms);
+        }
     } else {
         s_windowStart = now;
     }
     s_last = now;
+    for (int i = 0; i < kModTimeBuckets; ++i) { g_frameModTime[i] = 0; g_frameModCalls[i] = 0; }
     if (now - s_windowStart < s_freq * 5) return;
     if (s_frames) {
-        const double ms = 1000.0 / (double)s_freq;
-        LogLine("[frametime] %ld frames in %.1fs: avg %.1f ms, worst %.1f ms, >25ms: %ld | mod: trace %.1f ms (%ld), files %.1f ms (%ld), video %.1f ms (%ld)",
+        LogLine("[frametime] %ld frames in %.1fs: avg %.1f ms, worst %.1f ms, >25ms: %ld | mod: trace %.1f ms (%ld), files %.1f ms (%ld), video %.1f ms (%ld), tex %.1f ms (%ld), filter %.1f ms (%ld)",
                 s_frames, (double)(now - s_windowStart) / (double)s_freq,
                 (double)s_sum / (double)s_frames * ms, (double)s_worst * ms, s_slow,
                 (double)g_modTime[kModTimeTrace] * ms, g_modCalls[kModTimeTrace],
                 (double)g_modTime[kModTimeFiles] * ms, g_modCalls[kModTimeFiles],
-                (double)g_modTime[kModTimeVideo] * ms, g_modCalls[kModTimeVideo]);
+                (double)g_modTime[kModTimeVideo] * ms, g_modCalls[kModTimeVideo],
+                (double)g_modTime[kModTimeTex] * ms, g_modCalls[kModTimeTex],
+                (double)g_modTime[kModTimeFilter] * ms, g_modCalls[kModTimeFilter]);
     }
     s_windowStart = now; s_frames = 0; s_slow = 0; s_worst = 0; s_sum = 0;
     for (int i = 0; i < kModTimeBuckets; ++i) { g_modTime[i] = 0; g_modCalls[i] = 0; }
@@ -2679,7 +2706,14 @@ static void RollRandomRow(uint32_t obj, uint32_t count) {
 }
 
 // ---- the filter itself ------------------------------------------------------------------------
+static uint32_t FilterCategoryBody(uint32_t obj, uint32_t cat, uint32_t keepSelection);
 static uint32_t FilterCategoryImpl(uint32_t obj, uint32_t cat, uint32_t keepSelection) {
+    const long long t0 = ModTimeNow();
+    const uint32_t r = FilterCategoryBody(obj, cat, keepSelection);
+    ModTimeAdd(kModTimeFilter, ModTimeNow() - t0);
+    return r;
+}
+static uint32_t FilterCategoryBody(uint32_t obj, uint32_t cat, uint32_t keepSelection) {
     DropRangeCaches();
     BgaPreviewStop(obj);       // the list is about to be rebuilt under the preview
     SongSelectPreFilter(obj, cat);
