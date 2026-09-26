@@ -11,6 +11,7 @@
 #include "path_rebase.h"
 #include "text_codec.h"
 #include "play_data.h"
+#include "image_bga.h"
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -44,12 +45,17 @@ static float g_directBmsDominantBpm = 0.0f;
 // True when the clip came from the generic Video\_spv pool rather than the song's own BGA.
 // Those are shorter than most songs, so they are the ones worth looping.
 static bool g_directBmsVideoFallback = false;
+// Image BGA (image_bga.h): each channel-04 picture and when it goes up, in ms after the first.
+// Empty when the chart plays a movie or nothing.
+static std::vector<uint32_t> g_imageBgaMs;
+static std::vector<std::string> g_imageBgaPaths;
 
 void SetDirectBmsEnabled(bool enabled) { g_directBmsEnabled = enabled; }
 bool DirectBmsEnabled() { return g_directBmsEnabled; }
 void ResetDirectBmsVideo() { StopDirectBmsFfmpegVideo(); g_directBmsVideoPath.clear();
                              g_directBmsVideoStartMs = 0; g_directBmsVideoFallback = false;
-                             g_directBmsDominantBpm = 0.0f; }
+                             g_directBmsDominantBpm = 0.0f; g_imageBgaMs.clear(); g_imageBgaPaths.clear(); }
+bool DirectBmsVideoIsImages() { return !g_imageBgaPaths.empty(); }
 const std::string& DirectBmsVideoPath() { return g_directBmsVideoPath; }
 uint32_t DirectBmsVideoStartMs() { return g_directBmsVideoStartMs; }
 float DirectBmsDominantBpm() { return g_directBmsDominantBpm; }
@@ -3414,6 +3420,55 @@ void StopDirectBmsFfmpegVideo() {
     }
 }
 
+// The image BGA's reader: the same slot and gate as the ffmpeg one, a picture per channel-04 event
+// instead of a frame per 1/30 s. The next picture is decoded while the current one is up, so an
+// animation only falls behind when one decode outlasts a frame's time on screen, and then it jumps
+// to whatever is due instead of drifting. The timeline is the thread's own copy, and a newer start
+// (gen) retires it even if Stop gave up waiting for a slow decode.
+struct ImageBgaJob { std::vector<uint32_t> ms; std::vector<std::string> paths; LONG gen; };
+static volatile LONG g_imageBgaGen = 0;
+
+static DWORD WINAPI imageBgaReader(void* param) {
+    std::unique_ptr<ImageBgaJob> job(static_cast<ImageBgaJob*>(param));
+    auto live = [&] { return !g_ffmpegVideoStop && InterlockedCompareExchange(&g_imageBgaGen, 0, 0) == job->gen; };
+    std::vector<unsigned char> frame;
+    size_t have = (size_t)-1;
+    auto decode = [&](size_t i) {
+        have = i;
+        if (!RenderImageToBgr(job->paths[i], 640, 480, frame, true) || frame.size() != kFfmpegVideoFrameBytes)
+            frame.clear();
+    };
+    decode(0);
+    while (live() && InterlockedCompareExchange(&g_ffmpegVideoGate, 0, 0) == 0) Sleep(4);
+    const DWORD clock = GetTickCount();
+    while (live()) {
+        const size_t i = ImageBgaFrameAt(job->ms, GetTickCount() - clock);
+        if (have != i) decode(i);
+        if (!frame.empty() && live()) {
+            EnterCriticalSection(&g_ffmpegVideoLock);
+            memcpy(g_ffmpegVideoLatest, frame.data(), kFfmpegVideoFrameBytes);
+            g_ffmpegVideoFrameReady = true;
+            LeaveCriticalSection(&g_ffmpegVideoLock);
+        }
+        if (i + 1 >= job->ms.size()) break;          // the last picture stays up
+        decode(i + 1);
+        const DWORD due = clock + job->ms[i + 1];
+        while (live() && (LONG)(GetTickCount() - due) < 0) Sleep(4);
+    }
+    return 0;
+}
+
+static bool startImageBga() {
+    ImageBgaJob* job = new ImageBgaJob{g_imageBgaMs, g_imageBgaPaths, InterlockedIncrement(&g_imageBgaGen)};
+    InterlockedExchange(&g_ffmpegVideoStop, 0);
+    InterlockedExchange(&g_ffmpegVideoGate, 0);
+    g_ffmpegVideoThread = CreateThread(nullptr, 0, imageBgaReader, job, 0, nullptr);
+    if (!g_ffmpegVideoThread) { delete job; return false; }
+    LogLine("[bga-direct] image BGA started events=%lu first='%s' last event at %lu ms",
+            (unsigned long)job->paths.size(), g_imageBgaPaths[0].c_str(), (unsigned long)g_imageBgaMs.back());
+    return true;
+}
+
 bool StartDirectBmsFfmpegVideo(const std::string& path) {
     StopDirectBmsFfmpegVideo();
     if (!g_ffmpegVideoLockReady) {
@@ -3424,6 +3479,7 @@ bool StartDirectBmsFfmpegVideo(const std::string& path) {
         g_ffmpegVideoLatest = static_cast<unsigned char*>(
             VirtualAlloc(nullptr, kFfmpegVideoFrameBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!g_ffmpegVideoLatest) return false;
+    if (!g_imageBgaPaths.empty()) return startImageBga();
     PROCESS_INFORMATION process{};
     HANDLE pipe = nullptr;
     if (!startFfmpegPipe(path, "-an -r 30 -s 640x480 -pix_fmt bgr24 -f rawvideo -",
@@ -3442,7 +3498,7 @@ bool StartDirectBmsFfmpegVideo(const std::string& path) {
 }
 
 bool ReadDirectBmsFfmpegFrame(void* buffer, uint32_t bytes) {
-    if (!g_ffmpegVideoProcess || !buffer || bytes != kFfmpegVideoFrameBytes ||
+    if ((!g_ffmpegVideoProcess && !g_ffmpegVideoThread) || !buffer || bytes != kFfmpegVideoFrameBytes ||
         !g_ffmpegVideoLockReady || !TryEnterCriticalSection(&g_ffmpegVideoLock)) return false;
     bool ready = g_ffmpegVideoFrameReady;
     if (ready) memcpy(buffer, g_ffmpegVideoLatest, bytes);
@@ -4679,6 +4735,59 @@ static float dominantBpm(float baseBpm, const std::vector<DirectRawEvent>& timin
     return (float)dominantBpmWeighted(baseBpm, changes, (double)endTick / kDirectTicksPerBeat);
 }
 
+// A #BMP picture on disk: as written or, the usual BMS habit, under the extension the file really
+// has (a.bmp declared, a.png shipped). "" for anything GDI+ cannot draw.
+static std::string resolveDirectImageAsset(const CustomBmsSong& song, const std::string& relIn) {
+    static const char* const kExts[] = {".png", ".jpg", ".jpeg", ".bmp", ".gif"};
+    auto drawable = [](const std::string& p) { return endsWithAny(p, kExts, 5); };
+    std::string rel = normalizeRelPath(stripQuotes(trim(relIn)));
+    if (rel.empty()) return std::string();
+    const std::string path = JoinPath(song.songDir, rel);
+    if (drawable(path) && fileExistsLocal(path)) return path;
+    const size_t extLen = fileNameOnlyLocal(rel).size() - stemOnlyLocal(rel).size();
+    const std::string stem = path.substr(0, path.size() - extLen);
+    for (const char* ext : kExts)
+        if (fileExistsLocal(stem + ext)) return stem + ext;
+    std::string found;
+    if (recursiveFindAudioByName(song.songDir, fileNameOnlyLocal(rel), true, 0, found) && drawable(found)) return found;
+    return std::string();
+}
+
+// Channel 04 as a picture timeline (g_imageBgaMs/Paths) with the first picture's time as the BGA
+// start. Layers (07) and the miss picture (06) are not drawn.
+// ponytail: base layer only; add 07 with black-as-transparent if a pack needs it.
+static bool selectDirectBmsImages(const CustomBmsSong& song, const ParsedBmsForEz& chart,
+                                  const std::map<int, std::string>& bmpDefinitions, float bpm,
+                                  const std::vector<DirectRawEvent>& timing) {
+    std::map<int, std::string> resolved;                     // one lookup per #BMP, not per event
+    std::vector<std::pair<uint32_t, std::string>> events;    // {tick, picture}
+    for (const auto& event : chart.events) {
+        if (event.channel != 0x04) continue;
+        auto hit = resolved.find(event.wavId);
+        if (hit == resolved.end()) {
+            auto def = bmpDefinitions.find(event.wavId);
+            hit = resolved.emplace(event.wavId, def == bmpDefinitions.end() ? std::string()
+                                                : resolveDirectImageAsset(song, def->second)).first;
+        }
+        if (!hit->second.empty())
+            events.emplace_back(bmsTickToEzTick(chart, event.measure, event.index, event.div), hit->second);
+    }
+    if (events.empty()) return false;
+    std::stable_sort(events.begin(), events.end(),
+                     [](const std::pair<uint32_t, std::string>& a, const std::pair<uint32_t, std::string>& b) {
+                         return a.first < b.first; });
+    g_directBmsVideoStartMs = directTickToMilliseconds(events[0].first, bpm, timing);
+    for (const auto& e : events) {
+        const uint32_t ms = directTickToMilliseconds(e.first, bpm, timing);
+        g_imageBgaMs.push_back(ms > g_directBmsVideoStartMs ? ms - g_directBmsVideoStartMs : 0);
+        g_imageBgaPaths.push_back(e.second);
+    }
+    LogLine("[bga-direct] selected id='%s' image BGA pictures=%lu events=%lu first='%s' startMs=%lu",
+            song.id.c_str(), (unsigned long)resolved.size(), (unsigned long)events.size(),
+            events[0].second.c_str(), (unsigned long)g_directBmsVideoStartMs);
+    return true;
+}
+
 static void selectDirectBmsVideo(const CustomBmsSong& song, const ParsedBmsForEz& chart,
                                  const std::map<int, std::string>& bmpDefinitions,
                                  const std::string& explicitVideo, float bpm,
@@ -4709,6 +4818,10 @@ static void selectDirectBmsVideo(const CustomBmsSong& song, const ParsedBmsForEz
         }
     }
     if (selected.empty()) findFirstDirectVideo(song.songDir, 0, selected);
+    if (selected.empty() && selectDirectBmsImages(song, chart, bmpDefinitions, bpm, timing)) {
+        g_directBmsVideoPath = g_imageBgaPaths[0];
+        return;
+    }
     g_directBmsVideoFallback = selected.empty() && selectRandomBgaPoolVideo(selected);
     if (selected.empty()) {
         LogLine("[bga-direct] no playable video id='%s'", song.id.c_str());
@@ -5236,7 +5349,8 @@ static bool EnsureGdiplusStarted() {
 
 // Decode any image GDI+ can read into raw BGR24 at an exact size, the layout StretchDIBits wants.
 // Used for the per-category bg.png / ico.png overlays, which are drawn into surfaces we own.
-bool RenderImageToBgr(const std::string& path, int w, int h, std::vector<unsigned char>& out) {
+// `fit` places it as a BGA picture (ImageBgaRect) on black instead of stretching it to w x h.
+bool RenderImageToBgr(const std::string& path, int w, int h, std::vector<unsigned char>& out, bool fit) {
     out.clear();
     if (w <= 0 || h <= 0) return false;
     if (!EnsureGdiplusStarted()) return false;
@@ -5261,8 +5375,12 @@ bool RenderImageToBgr(const std::string& path, int w, int h, std::vector<unsigne
         DeleteObject(black);
         {
             Gdiplus::Graphics g(hdc);
-            g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-            ok = g.DrawImage(&img, Gdiplus::Rect(0, 0, w, h),
+            // Bilinear for BGA pictures: an animation decodes one per frame on the cabinet's CPU.
+            g.SetInterpolationMode(fit ? Gdiplus::InterpolationModeBilinear
+                                       : Gdiplus::InterpolationModeHighQualityBicubic);
+            const BgaRect r = fit ? ImageBgaRect((int)img.GetWidth(), (int)img.GetHeight(), w, h)
+                                  : BgaRect{0, 0, w, h};
+            ok = g.DrawImage(&img, Gdiplus::Rect(r.x, r.y, r.w, r.h),
                              0, 0, (INT)img.GetWidth(), (INT)img.GetHeight(),
                              Gdiplus::UnitPixel) == Gdiplus::Ok;
         }

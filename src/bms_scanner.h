@@ -159,6 +159,7 @@ uint32_t DirectBmsVideoStartMs();
 // call its BPM, and the constant-speed rule divides by it.
 float DirectBmsDominantBpm();
 bool DirectBmsVideoIsFallback();   // clip came from the generic pool, so it should loop
+bool DirectBmsVideoIsImages();     // the BGA is channel-04 pictures (image_bga.h), not a movie
 
 // Committed memory, largest free block, GDI/USER handles, and the ten biggest regions.
 // Cheap enough to call on a category change, far too slow for a frame.
@@ -203,7 +204,7 @@ bool DecodeScrPreview(const std::string& songId, int size, int fps, int seconds,
 std::string BgaVideoPathForSong(const std::string& id);
 
 // Per-category overlays: BMSData\<mode>\<category>\bg.png and ico.png.
-bool RenderImageToBgr(const std::string& path, int w, int h, std::vector<unsigned char>& out);
+bool RenderImageToBgr(const std::string& path, int w, int h, std::vector<unsigned char>& out, bool fit = false);
 std::string CategoryOverlayPath(const std::string& mode, const std::string& category,
                                 const char* which);
 

@@ -2124,14 +2124,27 @@ static int __fastcall HookDirectBackgroundLoad(void* self, void*, const char* sc
         g_directVideoTargetReady = false;
     }
 
-    lstrcpynA(reinterpret_cast<char*>(manager + 184), g_directVideoPath, MAX_PATH);
-    DWORD* useBackground = reinterpret_cast<DWORD*>(ExeBase() + 0x172ef40);
-    DWORD oldUse = 0;
-    bool haveUseFlag = CanWriteGamePtr(useBackground, sizeof(*useBackground));
-    if (haveUseFlag) { oldUse = *useBackground; *useBackground = 1; }
-    int result = RealBackgroundLoad ? RealBackgroundLoad(self, script) : 0;
-    if (haveUseFlag) *useBackground = oldUse;
-    bool opened = ready(videoObject) != 0;
+    // Image BGA must not reach DirectShow -- it has a still-image source and would "play" the first
+    // picture alone. What the fallback below needs from the loader is only the renderer it stores
+    // in the video object (FUN_0040b370: video+0x450 = DAT_01b2f054, after an _access check on the
+    // file, so a made-up name does not get that far), and that is set here directly. The pictures
+    // then come through the ffmpeg path's frame slot, as a PIU .mpg does.
+    const bool images = DirectBmsVideoIsImages();
+    int result = 0;
+    if (images) {
+        void** rendererVar = reinterpret_cast<void**>(ExeBase() + 0x172f054);
+        if (CanReadGamePtr(rendererVar, sizeof(*rendererVar)))
+            *reinterpret_cast<void**>(static_cast<unsigned char*>(videoObject) + 1104) = *rendererVar;
+    } else {
+        lstrcpynA(reinterpret_cast<char*>(manager + 184), g_directVideoPath, MAX_PATH);
+        DWORD* useBackground = reinterpret_cast<DWORD*>(ExeBase() + 0x172ef40);
+        DWORD oldUse = 0;
+        bool haveUseFlag = CanWriteGamePtr(useBackground, sizeof(*useBackground));
+        if (haveUseFlag) { oldUse = *useBackground; *useBackground = 1; }
+        result = RealBackgroundLoad ? RealBackgroundLoad(self, script) : 0;
+        if (haveUseFlag) *useBackground = oldUse;
+    }
+    bool opened = !images && ready(videoObject) != 0;
     bool targetReady = opened && PrepareDirectVideoObject(videoObject);
     if (!g_directVideoOpenLogged || opened) {
         LogLine("[bga-direct] %s source='%s' script='%s' ready=%d target=%d startMs=%lu",
@@ -2158,6 +2171,7 @@ static int __fastcall HookDirectBackgroundLoad(void* self, void*, const char* sc
     g_directVideoDisabled = true;
     g_directVideoObject = nullptr;
     g_directVideoTargetReady = false;
+    if (images) return RealBackgroundLoad ? RealBackgroundLoad(self, script) : 0;   // as with no BGA at all
     return result;
 }
 
