@@ -2711,6 +2711,19 @@ static bool RingArtPixels(void* gfx, const CustomBmsSong& song, const char* name
     return !bytes.empty() && ArtBytesToBgr(bytes, w, h, bgr);
 }
 
+// A texture's current surface, or null if the object is unreadable.
+static void* RingSurfaceOf(void* tex) {
+    return IsBadReadPtr(tex, sizeof(void*)) ? nullptr : *reinterpret_cast<void**>(tex);
+}
+
+// Empty every slot left over from before a pool rebuild (texture_ring.h). Cheap -- 120 pointer
+// compares -- and run before any slot is picked or trusted.
+static void DropStaleRingTextures() {
+    unsigned dropped = 0;
+    for (RingRole& r : g_rings) dropped += DropStaleRingSlots(r.slots, RingSurfaceOf);
+    if (dropped) LogLine("[texring] texture pool was rebuilt: %u stale slots emptied", dropped);
+}
+
 static int LoadTextureRinged(void* gfx, const char* name, void** out, const char* key);
 static int __fastcall HookLoadTexture(void* gfx, void* /*edx*/, const char* name, void** out, const char* key) {
     const long long t0 = ModTimeNow();
@@ -2727,6 +2740,7 @@ static int LoadTextureRinged(void* gfx, const char* name, void** out, const char
     if (!song) return g_realLoadTexture(gfx, name, out, key);
 
     if (role->slots.empty()) role->slots.resize(role->size);
+    DropStaleRingTextures();
     ++g_ringClock;
     bool same = false;
     RingSlot* slot = PickRingSlot(role->slots, id, same);
@@ -2756,6 +2770,7 @@ static int LoadTextureRinged(void* gfx, const char* name, void** out, const char
         ++g_ringRefilled;
     }
     slot->tex = tex;
+    slot->surf = RingSurfaceOf(tex);
     slot->id = id;
     slot->stamp = g_ringClock;
     slot->placeholder = !ready;
@@ -2772,6 +2787,7 @@ static int LoadTextureRinged(void* gfx, const char* name, void** out, const char
 
 bool TextureRingHolds(const void* tex, const char* id) {
     if (!tex || !id) return false;
+    DropStaleRingTextures();       // a pre-rebuild slot must not claim a texture it no longer owns
     for (const RingRole& r : g_rings)
         for (const RingSlot& s : r.slots)
             if (s.tex == tex) return _stricmp(s.id.c_str(), id) == 0;

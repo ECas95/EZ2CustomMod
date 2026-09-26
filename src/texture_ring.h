@@ -8,10 +8,26 @@
 
 struct RingSlot {
     void* tex = nullptr;       // the KTexture the slot owns, once created
+    void* surf = nullptr;      // tex's surface when the slot took it (see DropStaleRingSlots)
     std::string id;            // the song whose art it holds now
     unsigned long stamp = 0;   // last use, for least-recently-used recycling
     bool placeholder = false;  // filled before the real art existed: refill on the next request
 };
+
+// Playing a song tears the texture pool down and rebuilds it WITHOUT recreating song select, and
+// the pool recycles its KTexture objects -- often at the very addresses they had. A slot still
+// holding a pre-song pointer then "owns" whatever texture now lives there: TextureRingHolds found
+// that stale slot first, denied the row its (valid, new) texture, the wheel reloaded it, and the
+// next frame denied it again, so the names around the cursor never filled and the wheel churned.
+// A recycled texture has a new surface, so a slot whose texture no longer points at the surface
+// it took is from the old pool and is emptied. `surfaceOf` reads a texture's current surface.
+template <class SurfaceOf>
+inline unsigned DropStaleRingSlots(std::vector<RingSlot>& slots, SurfaceOf surfaceOf) {
+    unsigned dropped = 0;
+    for (RingSlot& s : slots)
+        if (s.tex && surfaceOf(s.tex) != s.surf) { s = RingSlot(); ++dropped; }
+    return dropped;
+}
 
 // "system\songname\bms000123.bmp" with dirs {"songname", ...} -> index of "songname", id
 // "bms000123". -1 for anything that is not a custom song's art in one of the ring directories.
