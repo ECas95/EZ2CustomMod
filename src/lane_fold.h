@@ -7,7 +7,10 @@
 // either a pedal note nobody authored or unplayable.
 //   - Five lanes or fewer, just not 11-15: kept in their left-to-right order on keys 1-5.
 //   - More than five: each lane goes to its proportional place on the five keys.
-//   - 2P scratch / free zone (26/27) join the 1P ones (16/17).
+//   - Scratch / free zone (16/17, and the 2P 26/27) too: the 5-key mode has no turntable (the
+//     shipped 5keyMix charts hold 0 scratch notes in 168,643), so a scratch note was a note on a
+//     lane nobody could see or hit. It takes the free key nearest key 1, beside which the scratch
+//     sits; the key notes are not spread to make room.
 //
 // OVERLAPS. Converted charts carry notes stacked on one key: two on the same tick, or one landing
 // while a long note on that key is still held. Neither can be played. Every note keeps its own key
@@ -37,11 +40,13 @@ struct LaneFoldResult {
 
 namespace lanefold {
 // Keys in their physical left-to-right order: 1P keys 1-7, then the 2P side (pop'n 9-key is
-// 11-15 + 22-25, and so lands in this order too).
+// 11-15 + 22-25, and so lands in this order too). The scratch lanes come last, outside that order:
+// they are placed by kScratchFirst, not by position.
 static const int kKeyOrder[] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x18, 0x19,
-                                0x21, 0x22, 0x23, 0x24, 0x25, 0x28, 0x29};
+                                0x21, 0x22, 0x23, 0x24, 0x25, 0x28, 0x29, 0x16, 0x17};
+static const int kLanes = 16, kScratchFirst = 14;
 inline int keyIndex(int base) {
-    for (int i = 0; i < 14; ++i) if (kKeyOrder[i] == base) return i;
+    for (int i = 0; i < kLanes; ++i) if (kKeyOrder[i] == base) return i;
     return -1;
 }
 inline int baseOf(int ch) { return (ch >= 0x51 && ch <= 0x69) ? ch - 0x40 : ch; }
@@ -58,30 +63,29 @@ template <class Event>
 LaneFoldResult FoldChartToFiveKeys(std::vector<Event>& events, int lnObjId) {
     using namespace lanefold;
     LaneFoldResult r;
-    bool used[14] = {};
-    bool outside = false;
-    for (const Event& e : events) {
+    for (Event& e : events) {                                  // 2P scratch onto the 1P one
         const int b = baseOf(e.channel);
-        if (b == 0x26 || b == 0x27) outside = true;          // 2P scratch / free zone
-        const int k = keyIndex(b);
+        if (b == 0x26 || b == 0x27) e.channel -= 0x10;
+    }
+    bool used[kLanes] = {};
+    bool outside = false, keysOutside = false;   // any lane off keys 1-5 / a KEY lane off them
+    for (const Event& e : events) {
+        const int k = keyIndex(baseOf(e.channel));
         if (k < 0) continue;
         used[k] = true;
         if (k >= 5) outside = true;
+        if (k >= 5 && k < kScratchFirst) keysOutside = true;
     }
     for (bool u : used) r.lanesBefore += u ? 1 : 0;
     r.folded = outside;
-    if (outside)
-        for (Event& e : events) {                              // 2P scratch onto the 1P one
-            const int b = baseOf(e.channel);
-            if (b == 0x26 || b == 0x27) e.channel -= 0x10;
-        }
 
-    std::vector<int> lanes;                      // key indexes in use, left to right
-    for (int k = 0; k < 14; ++k) if (used[k]) lanes.push_back(k);
+    std::vector<int> lanes;                      // key indexes in use, left to right, scratch aside
+    for (int k = 0; k < kScratchFirst; ++k) if (used[k]) lanes.push_back(k);
     const int n = (int)lanes.size();
     // Where a note of this lane wants to be, 0..4. On a 5-key chart that is simply its own key.
     auto target = [&](int keyIdx) -> double {
-        if (!outside) return (double)keyIdx;
+        if (keyIdx >= kScratchFirst) return 0.0;
+        if (!keysOutside) return (double)keyIdx;
         const int i = (int)(std::find(lanes.begin(), lanes.end(), keyIdx) - lanes.begin());
         return n <= 5 ? (double)i : (double)i * 4.0 / (double)(n - 1);
     };
@@ -89,8 +93,8 @@ LaneFoldResult FoldChartToFiveKeys(std::vector<Event>& events, int lnObjId) {
     // Notes in time order: a head, and its end if it is a long note.
     struct Note { long long pos, end; size_t head; long long tail; int key; };
     std::vector<Note> notes;
-    std::vector<long long> open(14, -1);         // LNTYPE 1: index into notes of an open head
-    std::vector<long long> last(14, -1);         // #LNOBJ: last note on the lane
+    std::vector<long long> open(kLanes, -1);         // LNTYPE 1: index into notes of an open head
+    std::vector<long long> last(kLanes, -1);         // #LNOBJ: last note on the lane
     std::vector<size_t> order;
     for (size_t i = 0; i < events.size(); ++i)
         if (keyIndex(baseOf(events[i].channel)) >= 0) order.push_back(i);
@@ -101,7 +105,7 @@ LaneFoldResult FoldChartToFiveKeys(std::vector<Event>& events, int lnObjId) {
     // Which LNTYPE 1 events are heads and tails: ln_pairing.h, per key, so a lane that lost one
     // event does not come out inverted -- and so this and the chart converter read it the same way.
     std::vector<int> lnRole(events.size(), kLnAlone);
-    for (int k = 0; k < 14; ++k) {
+    for (int k = 0; k < kLanes; ++k) {
         std::vector<long long> lnPos, tapPos;
         std::vector<size_t> lnIdx;
         for (size_t i : order) {
