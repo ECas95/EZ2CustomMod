@@ -12,6 +12,7 @@
 #include "trace_hooks.h"
 #include "progress_popup.h"
 #include "texture_ring.h"
+#include "supersample.h"
 #include <string>
 #include <unordered_map>
 #include <cctype>
@@ -1273,10 +1274,13 @@ static bool RenderDetailBgr(const ChartStats& st, bool graph,
                             std::vector<unsigned char>& artOut, std::vector<unsigned char>& maskOut) {
     const int w = graph ? kGraphPanelW : kStatsPanelW;
     const int h = graph ? kGraphPanelH : kStatsPanelH;
+    // Drawn at kSuper x through a world transform (every coordinate below stays in panel pixels)
+    // and averaged back down: smooth type and corners like the game's own art. See supersample.h.
+    const int kSuper = 4;
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(info.bmiHeader);
-    info.bmiHeader.biWidth = w;
-    info.bmiHeader.biHeight = -h;
+    info.bmiHeader.biWidth = w * kSuper;
+    info.bmiHeader.biHeight = -h * kSuper;
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 24;
     info.bmiHeader.biCompression = BI_RGB;
@@ -1290,6 +1294,9 @@ static bool RenderDetailBgr(const ChartStats& st, bool graph,
     HBITMAP bmM = dcM ? CreateDIBSection(dcM, &info, DIB_RGB_COLORS, &bitsM, nullptr, 0) : nullptr;
     if (dcA && dcM && bmA && bmM && bitsA && bitsM) {
         HGDIOBJ oldA = SelectObject(dcA, bmA), oldM = SelectObject(dcM, bmM);
+        const XFORM up = { (FLOAT)kSuper, 0.f, 0.f, (FLOAT)kSuper, 0.f, 0.f };
+        SetGraphicsMode(dcA, GM_ADVANCED); SetWorldTransform(dcA, &up);
+        SetGraphicsMode(dcM, GM_ADVANCED); SetWorldTransform(dcM, &up);
         SetBkMode(dcA, TRANSPARENT);
         DetailPlate(dcA, dcM, w, h);
 
@@ -1318,7 +1325,7 @@ static bool RenderDetailBgr(const ChartStats& st, bool graph,
             int y = 26;                          // 26 + 4 rows of 11 ends at 70, inside the 76 plate
             for (const Row& r : rows) {
                 snprintf(buf, sizeof(buf), r.fmt, r.value);
-                PanelText(dcA, r.label, 9, FW_NORMAL, kPanelSub, RECT{pad, y, split, y + 11}, DT_LEFT, true);
+                PanelText(dcA, r.label, 9, FW_BOLD, kPanelSub, RECT{pad, y, split, y + 11}, DT_LEFT, true);
                 PanelText(dcA, buf, 10, FW_BOLD, kPanelText, RECT{split, y, right, y + 11}, DT_RIGHT, true);
                 y += 11;
             }
@@ -1332,7 +1339,7 @@ static bool RenderDetailBgr(const ChartStats& st, bool graph,
             PanelText(dcA, "DENSITY", 9, FW_BOLD, kPanelTitle, RECT{8, 3, w - 8, 15}, DT_LEFT, true);
             char len[24];
             snprintf(len, sizeof(len), "%d:%02d", (int)st.seconds / 60, (int)st.seconds % 60);
-            PanelText(dcA, len, 9, FW_NORMAL, kPanelSub, RECT{8, 3, w - 8, 15}, DT_RIGHT, true);
+            PanelText(dcA, len, 9, FW_BOLD, kPanelSub, RECT{8, 3, w - 8, 15}, DT_RIGHT, true);
             for (int i = 0; i < kDensityBuckets; ++i) {
                 const int v = st.density[i];
                 int bh = (v * tall + 127) / 255;
@@ -1354,8 +1361,8 @@ static bool RenderDetailBgr(const ChartStats& st, bool graph,
         }
 
         GdiFlush();
-        artOut.assign(static_cast<unsigned char*>(bitsA), static_cast<unsigned char*>(bitsA) + (size_t)w * h * 3);
-        maskOut.assign(static_cast<unsigned char*>(bitsM), static_cast<unsigned char*>(bitsM) + (size_t)w * h * 3);
+        BoxDownsample(static_cast<unsigned char*>(bitsA), w, h, kSuper, artOut);
+        BoxDownsample(static_cast<unsigned char*>(bitsM), w, h, kSuper, maskOut);
         SelectObject(dcA, oldA); SelectObject(dcM, oldM);
         ok = true;
     }
