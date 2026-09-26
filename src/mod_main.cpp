@@ -16,6 +16,7 @@
 #include "text_codec.h"
 #include "translation_map.h"
 #include "rank_redirect.h"
+#include "lane_cover.h"
 #include <string>
 #include <unordered_map>
 #include <cctype>
@@ -1935,6 +1936,132 @@ void BgaPreviewStop(uint32_t obj) {
     g_previewFrameCount = 0;
 }
 
+// ---- SUDDEN+ lane cover (lane_cover.h) ---------------------------------------------------------
+//
+// Drawn by the keys panel's own per-frame draw (Panel::update @0x42d5c0, every key mode except the
+// scratch modes' GFPanel and Ez2Catch): its one call to the overlay draw m42bbe0 is pointed at
+// HookPanelOverlay, so the cover lands after the notes and under the panel's overlay. The lane
+// field is the panel's TargetBar record -- the judge line, which spans every lane: x = fe4 +
+// 0x1844, width 0x184c, y = 0x1848 less the global lift at 0x1b2ef8c (Panel::m42bce0 draws the
+// bar from exactly these). The picture is a fixed 256x512 texture stretched over the lane and
+// slid down with the cover, IIDX-style, so its bottom edge is always the one in view.
+static const uint32_t kLaneCoverOverlayCall = 0x42d672;   // e8 rel32 -> Panel::m42bbe0 @0x42bbe0
+static const int kLaneCoverTexW = 256, kLaneCoverTexH = 512;
+static int  g_laneCoverSize = 0;
+static bool g_laneCoverDirty = false;    // changed since it was last written to BMSMod.ini
+static int  g_laneCoverPrevAccum = 0;
+static LaneCoverEfx g_laneCoverEfx;
+static void* g_laneCoverTex = nullptr;
+static void* g_laneCoverSurf = nullptr;
+using PanelOverlay_t = void (__thiscall*)(void*);
+
+static bool EnsureLaneCoverTexture(void* renderer) {
+    if (OverlayTexUsable(g_laneCoverTex, g_laneCoverSurf)) return true;
+    g_laneCoverTex = g_laneCoverSurf = nullptr;
+    if (!MakeOverlaySurface(renderer, "system\\disc\\bmspreviewbase.bmp", "bms-lanecover",
+                            kLaneCoverTexW, kLaneCoverTexH, &g_laneCoverTex, &g_laneCoverSurf))
+        return false;
+    std::vector<unsigned char> px;
+    const std::string& image = Config().laneCoverImage;
+    const std::string path = JoinPath(JoinPath(GetExeDirectory(), "LaneCover"), image);
+    if (image.empty() || !RenderImageToBgr(path, kLaneCoverTexW, kLaneCoverTexH, px))
+        px.assign((size_t)kLaneCoverTexW * kLaneCoverTexH * 3, 0);
+    BlitBgrToSurface(g_laneCoverSurf, px, kLaneCoverTexW, kLaneCoverTexH);
+    LogLine("[lanecover] texture ready image='%s' size=%d", image.empty() ? "<black>" : path.c_str(), g_laneCoverSize);
+    return true;
+}
+
+// EFX1 held + turntable. Run on every panel draw; a second panel in the same frame reads no new
+// movement, so two players' panels do not double it.
+static void LaneCoverInput() {
+    const uint32_t big = *reinterpret_cast<uint32_t*>(0x1b2e710);          // Obj40C180* g_bigInstance
+    if (!big || IsBadReadPtr(reinterpret_cast<void*>(big + 0x420238), 4)) return;
+    auto state = [big](int slot) { return *reinterpret_cast<int*>(big + 0x10 + (uint32_t)slot * 20); };
+    const int accum = *reinterpret_cast<int*>(big + 0x420238);              // turntable 1P, running total
+    int counts = TurntableCounts(g_laneCoverPrevAccum, accum);
+    g_laneCoverPrevAccum = accum;
+    // Keyboard play (2EZConfig io_emu) turns the dial with the two 1P dial keys instead.
+    static int s_lastUp = 0, s_lastDown = 0;
+    const int up = state(0xf), down = state(0x10);
+    if (up == LaneCoverEfx::kPressed && s_lastUp != up) counts += 10;
+    if (down == LaneCoverEfx::kPressed && s_lastDown != down) counts -= 10;
+    s_lastUp = up; s_lastDown = down;
+
+    if (state(6) >= LaneCoverEfx::kPressed) {
+        if (counts) {
+            g_laneCoverEfx.moved();
+            g_laneCoverSize = LaneCoverAfter(g_laneCoverSize, counts, Config().laneCoverStep);
+            g_laneCoverDirty = true;
+        }
+    } else if (g_laneCoverDirty) {
+        g_laneCoverDirty = false;
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", g_laneCoverSize);
+        WritePrivateProfileStringA("Gameplay", "LaneCoverSize", buf, JoinPath(GetExeDirectory(), "BMSMod.ini").c_str());
+        LogLine("[lanecover] size %d", g_laneCoverSize);
+    }
+}
+
+static void DrawLaneCover(void* panel) {
+    const unsigned char* p = static_cast<const unsigned char*>(panel);
+    if (IsBadReadPtr(p + 0x1844, 12)) return;
+    float fe4, barX, barY, barW, lift;
+    memcpy(&fe4, p + 0xe4, 4);
+    memcpy(&barX, p + 0x1844, 4);
+    memcpy(&barY, p + 0x1848, 4);
+    memcpy(&barW, p + 0x184c, 4);
+    memcpy(&lift, reinterpret_cast<const void*>(0x1b2ef8c), 4);
+    const float judgeY = barY - lift;
+    if (g_laneCoverSize <= 0 || barW < 8.0f || judgeY < 16.0f) return;
+    void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
+    if (!renderer || !EnsureLaneCoverTexture(renderer)) return;
+    const float bottom = LaneCoverBottom(judgeY, g_laneCoverSize);
+    auto setBlend = reinterpret_cast<SetBlendFn>(Rva(0x0a490));
+    auto draw     = reinterpret_cast<DrawSpriteFn>(Rva(0x03f80));
+    setBlend(renderer, kBlendOne, kBlendZero);     // opaque; also what m42bbe0 sets next
+    draw(renderer, reinterpret_cast<uint32_t>(g_laneCoverTex), FloatBits(fe4 + barX), FloatBits(bottom - judgeY),
+         barW, judgeY, 0x00ffffff);
+}
+
+static void __fastcall HookPanelOverlay(void* panel, void*) {
+    LaneCoverInput();
+    DrawLaneCover(panel);
+    reinterpret_cast<PanelOverlay_t>(Rva(0x2bbe0))(panel);
+}
+
+// Obj40C180::getState @0x40c1c0 (14 bytes, `return slotsA[i].state`), replaced whole. Only the
+// effector tick (Effector6thStyle::update2, 0x41e620..0x41f85f) is shown EFX1 through
+// LaneCoverEfx; every other caller, and every other slot, gets the real state.
+static int __fastcall HookGetState(void* self, void*, int slot) {
+    const int raw = *reinterpret_cast<int*>(static_cast<unsigned char*>(self) + 0x10 + slot * 20);
+    if (slot != 6) return raw;
+    const uintptr_t from = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    if (from < 0x41e620 || from >= 0x41f860) return raw;
+    return g_laneCoverEfx.effectorState(raw);
+}
+
+static void InstallLaneCover() {
+    if (!Config().laneCover) return;
+    g_laneCoverSize = Config().laneCoverSize;
+    static const unsigned char kCall[5] = {0xe8, 0x69, 0xe5, 0xff, 0xff};
+    static const unsigned char kGetState[14] = {0x8b, 0x44, 0x24, 0x04, 0x8d, 0x04, 0x80,
+                                                0x8b, 0x44, 0x81, 0x10, 0xc2, 0x04, 0x00};
+    void* call = reinterpret_cast<void*>(kLaneCoverOverlayCall);
+    void* getState = Rva(0x0c1c0);
+    if (memcmp(call, kCall, sizeof(kCall)) != 0 || memcmp(getState, kGetState, sizeof(kGetState)) != 0) {
+        LogLine("[lanecover] executable does not match; lane cover off");
+        return;
+    }
+    static JumpPatch s_getState;
+    const bool input = InstallJmp(getState, reinterpret_cast<void*>(&HookGetState), s_getState, 5);
+    unsigned char patched[5] = {0xe8};
+    const int32_t rel = (int32_t)(reinterpret_cast<uintptr_t>(&HookPanelOverlay) - (kLaneCoverOverlayCall + 5));
+    memcpy(patched + 1, &rel, 4);
+    const bool draw = input && WriteMemory(call, patched, sizeof(patched));
+    LogLine("[lanecover] hooks getState=%d overlay=%d size=%d image='%s' step=%d", input ? 1 : 0, draw ? 1 : 0,
+            g_laneCoverSize, Config().laneCoverImage.c_str(), Config().laneCoverStep);
+}
+
 static DWORD g_directVideoValidFrames = 0, g_directVideoFrameFailures = 0;
 static unsigned char* g_directVideoFrameBuffer = nullptr;
 static DWORD g_directVideoFrameCapacity = 0;
@@ -3646,6 +3773,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     bool directBms = InstallDirectBmsHook();
     SetDirectBmsEnabled(directBms);
     InstallJudgeOffset();
+    InstallLaneCover();
     if (Config().showProgressPopup) ShowStartupPopup();
     ScanBMSData();
     InstallTraceHooks();

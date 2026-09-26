@@ -62,6 +62,10 @@ ModConfig LoadConfig() {
     cfg.textureRing = readBool("Gameplay", "TextureRing", true, ini);
     cfg.englishTextures = readBool("Gameplay", "EnglishTextures", true, ini);
     cfg.virtualCategories = readBool("Gameplay", "VirtualCategories", true, ini);
+    cfg.laneCover = readBool("Gameplay", "LaneCover", true, ini);
+    cfg.laneCoverSize = std::max(0, std::min(1000, readInt("Gameplay", "LaneCoverSize", 0, ini)));
+    cfg.laneCoverStep = readInt("Gameplay", "LaneCoverStep", 2, ini);
+    cfg.laneCoverImage = readString("Gameplay", "LaneCoverImage", "", ini);
     cfg.previewFps = readInt("Gameplay", "PreviewFps", 20, ini);
     if (cfg.previewFps < 5) cfg.previewFps = 5;
     if (cfg.previewFps > 30) cfg.previewFps = 30;

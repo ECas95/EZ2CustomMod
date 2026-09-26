@@ -42,6 +42,11 @@ struct ModConfig {
     bool textureRing = true;       // custom art reuses a fixed set of textures instead of one per song
     bool englishTextures = true;   // Translation\system\... replaces the Korean UI textures when present
     bool virtualCategories = true; // FAVORITES / RECENT / MOST PLAYED at the head of the custom categories
+    // SUDDEN+ lane cover (lane_cover.h): EFX1 held + turntable in play. The size is remembered here.
+    bool laneCover = true;
+    int  laneCoverSize = 0;        // 0..1000 of the way down to the judge line; 0 = none
+    int  laneCoverStep = 2;        // cover units per turntable count (negative turns the other way)
+    std::string laneCoverImage;    // a picture in LaneCover\, or black when empty / missing
     // Frames a second for the BGA preview on the disc in song select. The clip is decoded whole
     // into memory before it plays, so this is a straight trade: 256x256x3 is 192 KB a frame, and
     // the buffer holds PreviewFps x 12 seconds of them (10 fps = 23 MB, 20 fps = 46 MB).
