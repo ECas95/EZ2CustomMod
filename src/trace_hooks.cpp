@@ -1948,8 +1948,12 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
             if (arg == 1) {
                 if (GetTickCount() - g_ssFrameStamp < 250) {
                     EzColumnDraw(g_ssFrameObj);
-                    DetailPanelsDrawForSelection(g_ssFrameObj);
-                    HudPanelDraw();
+                    // These draw last, over everything; the option panel covers the same right half
+                    // of the screen, so they step aside while it is open.
+                    if (!g_ssFrameObj || SafeRead32(g_ssFrameObj + kObjOptionPanel) == 0) {
+                        DetailPanelsDrawForSelection(g_ssFrameObj);
+                        HudPanelDraw();
+                    }
                 }
                 FpsLimitTick();
                 FrameTimeTick();
