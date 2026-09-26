@@ -120,6 +120,15 @@ std::vector<CustomBmsSong> GetCustomBmsSongsForActiveMode();
 std::vector<std::string> GetCustomBmsCategoriesForMode(const std::string& mode);
 bool IsCustomSongId(const char* id);
 const CustomBmsSong* FindCustomSongById(const char* id);
+
+// FAVORITES / RECENT / MOST PLAYED: the first VirtualCategoryCount() names of every mode's category
+// list (play_data.h). Their ids are computed, not scanned; never empty -- a category with nothing
+// in it yet gets a handful of random picks, and *fallback says so.
+size_t VirtualCategoryCount();
+std::vector<std::string> VirtualCategoryIds(size_t which, const std::string& mode, bool* fallback);
+unsigned long PlayDataGeneration();                  // bumps on every favourite toggle and play
+int ToggleFavoriteForSongId(const char* id);         // 1 added, 0 removed, -1 not a custom song
+void RecordCustomPlay(const CustomBmsSong& song);
 const CustomBmsSong* FindCustomSongByCacheDir(const std::string& cacheDir);
 std::string GetCustomSongBackingId(const char* id);
 

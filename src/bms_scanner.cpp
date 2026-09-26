@@ -10,6 +10,7 @@
 #include "lane_fold.h"
 #include "path_rebase.h"
 #include "text_codec.h"
+#include "play_data.h"
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -5108,6 +5109,7 @@ bool LoadCustomBmsDirect(void* songPackage, const char* request) {
     LogLine("[direct] keysounds: %lu decoded here (%lu prefetched on hover, %u threads, %lu ms), load total %lu ms",
             (unsigned long)deferred.size(), (unsigned long)prefetched, decodeThreads,
             (unsigned long)decodeMs, (unsigned long)(GetTickCount() - loadStart));
+    RecordCustomPlay(*song);                // RECENT / MOST PLAYED
     return true;
 }
 
@@ -7679,6 +7681,9 @@ std::vector<CustomBmsSong> GetCustomBmsSongsForActiveMode() {
 static std::map<std::string, std::vector<std::string> > g_catsByMode;
 static size_t g_catsByModeStamp = (size_t)-1;
 
+static const char* const kVirtualCategoryNames[] = {"FAVORITES", "RECENT", "MOST PLAYED"};
+static const size_t kVirtualCategories = 3;
+
 static void DropCatalogueCaches() {
     g_catsByMode.clear();
     g_catsByModeStamp = (size_t)-1;
@@ -7705,8 +7710,122 @@ std::vector<std::string> GetCustomBmsCategoriesForMode(const std::string& mode) 
                        [](unsigned char c) { return (char)tolower(c); });
         if (seen.insert(key).second) out.push_back(s.category);
     }
+    // The virtual categories lead every mode that has songs, so their wheel slots never move.
+    if (!out.empty() && Config().virtualCategories)
+        out.insert(out.begin(), kVirtualCategoryNames, kVirtualCategoryNames + kVirtualCategories);
     g_catsByMode[n] = out;
     return out;
+}
+
+// ---- FAVORITES / RECENT / MOST PLAYED (play_data.h) -------------------------------------------
+static PlayData g_playData;
+static bool g_playDataLoaded = false;
+static unsigned long g_playDataGen = 1;
+
+static std::string playDataPath() {
+    return JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), "playdata.txt");
+}
+
+static PlayData& playData() {
+    if (!g_playDataLoaded) {
+        g_playDataLoaded = true;
+        std::vector<unsigned char> bytes;
+        FILE* f = fopen(playDataPath().c_str(), "rb");
+        if (f) {
+            char buf[65536];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) bytes.insert(bytes.end(), buf, buf + n);
+            fclose(f);
+        }
+        g_playData.parse(std::string(bytes.begin(), bytes.end()));
+    }
+    return g_playData;
+}
+
+// Written whole to a temporary and renamed, so a power cut mid-write keeps the previous file.
+static void savePlayData() {
+    ensureDir(JoinPath(GetExeDirectory(), Config().cacheRoot));
+    const std::string path = playDataPath(), tmp = path + ".tmp";
+    const std::string text = playData().serialize();
+    std::vector<unsigned char> bytes(text.begin(), text.end());
+    if (writeBinaryFile(tmp, bytes)) {
+        DeleteFileA(path.c_str());
+        if (!MoveFileA(tmp.c_str(), path.c_str())) DeleteFileA(tmp.c_str());
+    }
+}
+
+// The song's folder relative to BMSData, lowercased: shared by every mode's copy of the song.
+static std::string songPlayKey(const CustomBmsSong& s) {
+    static const std::string root = lowerCopy(JoinPath(GetExeDirectory(), Config().bmsRoot));
+    std::string k = lowerCopy(s.songDir);
+    if (k.size() > root.size() + 1 && k.compare(0, root.size(), root) == 0) k.erase(0, root.size() + 1);
+    return k;
+}
+
+size_t VirtualCategoryCount() { return Config().virtualCategories ? kVirtualCategories : 0; }
+unsigned long PlayDataGeneration() { return g_playDataGen; }
+
+std::vector<std::string> VirtualCategoryIds(size_t which, const std::string& mode, bool* fallback) {
+    std::string n = NormalizeModeName(mode);
+    if (n.empty()) n = mode;
+    // key -> this mode's id, rebuilt when the mode or the catalogue changes.
+    static std::unordered_map<std::string, std::string> s_ids;
+    static std::vector<std::string> s_all;
+    static std::string s_mode;
+    static size_t s_stamp = (size_t)-1;
+    if (s_mode != n || s_stamp != g_songs.size()) {
+        s_ids.clear();
+        s_all.clear();
+        for (const auto& s : g_songs) {
+            if (_stricmp(s.mode.c_str(), n.c_str()) != 0) continue;
+            s_ids.emplace(songPlayKey(s), s.id);
+            s_all.push_back(s.id);
+        }
+        s_mode = n;
+        s_stamp = g_songs.size();
+    }
+    std::vector<std::string> keys;
+    if (which == 0) keys = playData().favorites(kWheelPageCap);
+    else if (which == 1) keys = playData().recent(100);
+    else keys = playData().mostPlayed(100);
+    std::vector<std::string> ids;
+    for (const auto& k : keys) {
+        auto it = s_ids.find(k);
+        if (it != s_ids.end()) ids.push_back(it->second);
+    }
+    if (fallback) *fallback = ids.empty();
+    if (ids.empty() && !s_all.empty()) {
+        // A category may never be empty (the game divides by its size). Until there is something
+        // to show, 30 random songs of the mode -- the same 30 for the whole session.
+        static std::map<std::string, std::vector<std::string>> s_picks;
+        std::vector<std::string>& p = s_picks[n + "|" + std::to_string(which)];
+        if (p.empty()) {
+            uint32_t seed = GetTickCount() ^ (uint32_t)(which * 2654435761u);
+            for (int i = 0; i < 30 && i < (int)s_all.size(); ++i) {
+                seed = seed * 1664525u + 1013904223u;
+                const std::string& id = s_all[(seed >> 8) % s_all.size()];
+                if (std::find(p.begin(), p.end(), id) == p.end()) p.push_back(id);
+            }
+        }
+        ids = p;
+    }
+    return ids;
+}
+
+int ToggleFavoriteForSongId(const char* id) {
+    const CustomBmsSong* s = FindCustomSongById(id);
+    if (!s) return -1;
+    const bool on = playData().toggleFavorite(songPlayKey(*s));
+    savePlayData();
+    ++g_playDataGen;
+    LogLine("[favorites] %s '%s' (%s)", on ? "added" : "removed", s->title.c_str(), songPlayKey(*s).c_str());
+    return on ? 1 : 0;
+}
+
+void RecordCustomPlay(const CustomBmsSong& song) {
+    playData().recordPlay(songPlayKey(song));
+    savePlayData();
+    ++g_playDataGen;
 }
 
 bool IsCustomSongId(const char* id) { return FindCustomSongById(id) != nullptr; }

@@ -61,6 +61,7 @@ ModConfig LoadConfig() {
     cfg.detailPanels = readBool("Gameplay", "DetailPanels", true, ini);
     cfg.textureRing = readBool("Gameplay", "TextureRing", true, ini);
     cfg.englishTextures = readBool("Gameplay", "EnglishTextures", true, ini);
+    cfg.virtualCategories = readBool("Gameplay", "VirtualCategories", true, ini);
     cfg.previewFps = readInt("Gameplay", "PreviewFps", 20, ini);
     if (cfg.previewFps < 5) cfg.previewFps = 5;
     if (cfg.previewFps > 30) cfg.previewFps = 30;

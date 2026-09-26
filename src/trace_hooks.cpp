@@ -652,6 +652,11 @@ static void RefreshRelocatedNativeCategoryTables() {
 // One-shot: append custom songs to the master array and populate the native category
 // tables so the game's own filter lists them under their custom category. After this the
 // mod never touches visible[] — the native filter rebuilds it correctly on every entry.
+// FAVORITES / RECENT / MOST PLAYED (written by WriteVirtualCategory, with the sort code below).
+static unsigned long g_virtualWritten[8] = {};      // PlayDataGeneration() each list was built from
+static bool g_virtualFallback[8] = {};              // the list is the placeholder picks
+static uint32_t WriteVirtualCategory(uint32_t cat);
+
 static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uint32_t categoryParam) {
     DropRangeCaches();
     (void)categoryParam;
@@ -880,6 +885,12 @@ static void InjectCustomSongsIntoSongSelect(uint32_t ecx, const char* phase, uin
     // categories that exist and are empty.
     for (size_t ci = 0; ci < categories.size() && (kCustomCatBase + ci) < kWheelMax; ++ci) {
         const uint32_t cat = kCustomCatBase + (uint32_t)ci;
+        if (ci < VirtualCategoryCount()) {              // FAVORITES / RECENT / MOST PLAYED
+            const uint32_t n = WriteVirtualCategory(cat);
+            LogLine("[category] %s virtual cat=%lu name='%s' songs=%lu%s", phase, (unsigned long)cat,
+                    categories[ci].c_str(), (unsigned long)n, g_virtualFallback[ci] ? " (placeholder picks)" : "");
+            continue;
+        }
         uint32_t k = 0, available = 0;
         for (const auto& song : allSongs) {
             if (_stricmp(song.category.c_str(), categories[ci].c_str()) != 0) continue;
@@ -1437,6 +1448,35 @@ static void SortCategoryIds(uint32_t cat, int mode, uint32_t column) {
         SafeWriteBytes(base + k * kCatNameSize, keys[k].id.data(), kCatNameSize);
 }
 
+// ---- FAVORITES / RECENT / MOST PLAYED -----------------------------------------------------------
+// The first VirtualCategoryCount() custom categories. Their id lists are written here from the play
+// data rather than by the inject's folder walk, and written again whenever that data has changed
+// since -- so a favourite marked now is in FAVORITES the next time the category is entered, without
+// leaving song select. The ids are songs already in master[] (every song of the mode is), so the
+// filter finds them like any other.
+static bool IsVirtualCategory(uint32_t cat) {
+    return cat >= kCustomCatBase && cat - kCustomCatBase < VirtualCategoryCount();
+}
+
+static uint32_t WriteVirtualCategory(uint32_t cat) {
+    const size_t which = cat - kCustomCatBase;
+    bool fallback = false;
+    const std::vector<std::string> ids = VirtualCategoryIds(which, GetActiveMode(), &fallback);
+    uint32_t k = 0;
+    for (const std::string& id : ids) {
+        if (k >= kCatNameStride) break;
+        char idbuf[kCatNameSize] = {};
+        strncpy(idbuf, id.c_str(), kCatNameSize - 1);
+        SafeWriteBytes(CatNameTable() + (k + cat * kCatNameStride) * kCatNameSize, idbuf, kCatNameSize);
+        ++k;
+    }
+    if (k) SafeWriteBytes(CatCountTable() + cat * 4, &k, 4);   // never register an empty category
+    g_folderOrder.erase(cat);                                  // the sort's "folder order" is this list
+    g_virtualWritten[which] = PlayDataGeneration();
+    g_virtualFallback[which] = fallback;
+    return k;
+}
+
 // ---- custom Top-5 ------------------------------------------------------------------------------
 // The game keeps a rank file per song and difficulty (sound\rank_<mode>_<id>[-hd|-shd|-ex].bin:
 // five 8-byte names, five scores) and writes it after a play -- for customs too. Its song-select
@@ -1476,7 +1516,9 @@ static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visib
     if (s_welcomedObj != obj) {
         s_welcomedObj = obj;
         if (Config().categorySort && g_customCategoryCount)
-            HudPanelShow("EZ2CustomMod", "SORT CATEGORY", "PEDAL + E2 / E3 : JUMP 10 CATEGORIES", "PEDAL+E4", 3500);
+            HudPanelShow("EZ2CustomMod", "SORT CATEGORY",
+                         VirtualCategoryCount() ? "PEDAL + E2 / E3 : JUMP 10    PEDAL + E1 : FAVORITE"
+                                                : "PEDAL + E2 / E3 : JUMP 10 CATEGORIES", "PEDAL+E4", 3500);
     }
     // Entering the difficulty pick: say what the constant-speed rule will set for this song.
     {
@@ -1497,12 +1539,30 @@ static void SongSelectExtrasTick(uint32_t obj, uint32_t selected, uint32_t visib
         }
         s_lastState = state;
     }
-    if (!Config().categorySort || !g_customCategoryCount) return;
+    if (!g_customCategoryCount) return;
     if (SafeRead32(obj + kObjOptionPanel) != 0) return;          // the option panel owns EFX now
     if (SafeRead32(obj + kObjSelState) != 4) return;             // browsing, not the difficulty stepper
     const int pedal1 = InputState(kSlotPedal1), pedal2 = InputState(kSlotPedal2);
     const bool pedal = pedal1 == kInputHeld || pedal1 == kInputPressed || pedal2 == kInputHeld || pedal2 == kInputPressed;
     const uint32_t cat = SafeRead32(obj + kObjCatIndex);
+
+    // PEDAL + EFX1: the song under the cursor into / out of FAVORITES. EFX1 alone opens the option
+    // panel, but the game refuses that while a pedal is down (songselectupdate2.cpp), so the pair
+    // is free -- the same reason the category keys below are pedal chords.
+    if (VirtualCategoryCount() && pedal && InputPressed(kSlotEfx1) && selected < visible) {
+        const char* id = reinterpret_cast<const char*>(obj + kVisibleBase + selected * kEntryBytes + kEntryIdOff);
+        const std::string sid(id, strnlen(id, 15));
+        const CustomBmsSong* song = FindCustomSongById(sid.c_str());
+        if (selected == 0) {
+            HudPanelShow("FAVORITES", "PICK A SONG", "the RANDOM row changes every time", "PEDAL+E1", 1800);
+        } else if (song) {
+            const int on = ToggleFavoriteForSongId(sid.c_str());
+            PlayMoveBlip(obj);
+            HudPanelShow("FAVORITES", on == 1 ? "ADDED" : "REMOVED", song->title.c_str(), "PEDAL+E1", 1800);
+        }
+        return;
+    }
+    if (!Config().categorySort) return;
     const uint32_t catCount = kCustomCatBase + g_customCategoryCount;
     const uint32_t column = SafeRead32(obj + kObjDiffColumn);
 
@@ -2722,6 +2782,20 @@ static uint32_t FilterCategoryBody(uint32_t obj, uint32_t cat, uint32_t keepSele
     BgaPreviewStop(obj);       // the list is about to be rebuilt under the preview
     SongSelectPreFilter(obj, cat);
     ProbeVacatedMaster(obj);
+    if (IsVirtualCategory(cat)) {
+        const size_t which = cat - kCustomCatBase;
+        if (g_virtualWritten[which] != PlayDataGeneration()) {
+            WriteVirtualCategory(cat);
+            if (g_sortMode != kSortFolder) SortCategoryIds(cat, g_sortMode, SafeRead32(obj + kObjDiffColumn));
+        }
+        if (!keepSelection && g_virtualFallback[which]) {
+            static const char* const how[] = {"PEDAL + E1 on a song adds it here",
+                                              "the songs you play will be listed here",
+                                              "your most played songs will be listed here"};
+            HudPanelShow(which == 0 ? "FAVORITES" : which == 1 ? "RECENT" : "MOST PLAYED",
+                         "NOTHING HERE YET", how[which < 3 ? which : 2], "random picks for now", 3000);
+        }
+    }
 
     const uint32_t masterCount = SafeRead32(obj + kObjMasterCount);
     const uint32_t masterBase  = obj + kMasterOrig + (g_capacityPatched ? kMasterRel : 0u);
