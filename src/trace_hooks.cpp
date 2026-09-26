@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "patch.h"
 #include "bms_scanner.h"
+#include "rank_redirect.h"
 #include <windows.h>
 #include <cstdint>
 #include <cstring>
@@ -1495,8 +1496,9 @@ static void FillCustomTop5(uint32_t obj, uint32_t row, const char* id, bool ez) 
         for (int i = 0; i < 5; ++i) { memcpy(names[i], "EZ2AC_FN", 8); scores[i] = 0; }
         if (course != 2) {
             char path[MAX_PATH];
-            snprintf(path, sizeof(path), "%s\\sound\\rank_%s_%s%s.bin", GetExeDirectory().c_str(), modeName, id, suffix[course]);
-            FILE* f = fopen(path, "rb");
+            snprintf(path, sizeof(path), "sound\\rank_%s_%s%s.bin", modeName, id, suffix[course]);
+            const std::string moved = CustomRankPath(path);
+            FILE* f = fopen(moved.empty() ? (GetExeDirectory() + "\\" + path).c_str() : moved.c_str(), "rb");
             if (f) {
                 if (fread(names, 8, 5, f) != 5 || fread(scores, 4, 5, f) != 5) {
                     for (int i = 0; i < 5; ++i) { memcpy(names[i], "EZ2AC_FN", 8); scores[i] = 0; }

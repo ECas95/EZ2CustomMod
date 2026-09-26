@@ -15,6 +15,7 @@
 #include "supersample.h"
 #include "text_codec.h"
 #include "translation_map.h"
+#include "rank_redirect.h"
 #include <string>
 #include <unordered_map>
 #include <cctype>
@@ -286,6 +287,27 @@ static const std::string* TranslatedTexture(const char* name) {
     if (key.empty()) return nullptr;
     auto it = g_translatedTextures.find(key);
     return it == g_translatedTextures.end() ? nullptr : &it->second;
+}
+
+std::string CustomRankPath(const char* path) {
+    const std::string file = path ? CustomRankFileName(path) : std::string();
+    if (file.empty()) return file;
+    static const std::string dir = [] {
+        const std::string root = JoinPath(GetExeDirectory(), Config().cacheRoot);
+        CreateDirectoryA(root.c_str(), nullptr);
+        const std::string d = JoinPath(root, "rank");
+        CreateDirectoryA(d.c_str(), nullptr);
+        return d;
+    }();
+    return JoinPath(dir, file);
+}
+
+// The file the game should really get for `name`: its English copy, or a custom song's rank table
+// in CustomCache\rank; `name` itself otherwise.
+static const char* GameFileOverride(const char* name, std::string& hold) {
+    if (const std::string* en = TranslatedTexture(name)) return en->c_str();
+    hold = CustomRankPath(name);
+    return hold.empty() ? name : hold.c_str();
 }
 
 static bool EndsWithCaseInsensitive(const std::string& p, const char* suffix) {
@@ -2508,7 +2530,8 @@ static bool InstallDirectBmsHook() {
 }
 
 static void* __cdecl HookGameFsOpen(const char* name, const char* mode) {
-    if (const std::string* en = TranslatedTexture(name)) name = en->c_str();
+    std::string overrideHold;
+    name = GameFileOverride(name, overrideHold);
     g_redirectForCrt = true;
     std::string redirected = MaybeRedirectCustomPath(name);
     g_redirectForCrt = false;
@@ -3170,7 +3193,8 @@ static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share,
             }
         }
     }
-    if (const std::string* en = TranslatedTexture(name)) name = en->c_str();
+    std::string overrideHold;
+    name = GameFileOverride(name, overrideHold);
     std::string redirected = MaybeRedirectCustomPath(name);
     if (redirected == "\x01ram") {
         HANDLE vh = OpenVirtualBytes(std::move(g_pendingVirtualBytes));
@@ -3182,6 +3206,14 @@ static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share,
     if (Config().traceFileApi && finalName) LogLine("[file] CreateFileA '%s' access=0x%08lx creation=%lu", finalName, access, creation);
     return RealCreateFileA ? RealCreateFileA(finalName, access, share, sa, creation, flags, templ)
                            : CreateFileA(finalName, access, share, sa, creation, flags, templ);
+}
+
+// The CRT's _access -- the game's "is there a rank table yet" check -- has to see the moved file.
+static GetFileAttributesA_t RealGetFileAttributesA = nullptr;
+static DWORD WINAPI HookGetFileAttributesA(LPCSTR name) {
+    const std::string rank = CustomRankPath(name);
+    const char* finalName = rank.empty() ? name : rank.c_str();
+    return RealGetFileAttributesA ? RealGetFileAttributesA(finalName) : GetFileAttributesA(finalName);
 }
 
 static HANDLE WINAPI HookFindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA data) {
@@ -3211,6 +3243,22 @@ static void InstallFileHooks() {
     bool b = HookIAT("KERNEL32.dll", "FindFirstFileA", reinterpret_cast<void*>(HookFindFirstFileA), reinterpret_cast<void**>(&RealFindFirstFileA));
     bool c = HookIAT("KERNEL32.dll", "FindNextFileA", reinterpret_cast<void*>(HookFindNextFileA), reinterpret_cast<void**>(&RealFindNextFileA));
     bool d = HookIAT("KERNEL32.dll", "SetCurrentDirectoryA", reinterpret_cast<void*>(HookSetCurrentDirectoryA), reinterpret_cast<void**>(&RealSetCurrentDirectoryA));
+    bool ga = HookIAT("KERNEL32.dll", "GetFileAttributesA", reinterpret_cast<void*>(HookGetFileAttributesA), reinterpret_cast<void**>(&RealGetFileAttributesA));
+    // Tables written before the move are still in Sound\: carry them over once (a copy that is
+    // already in CustomCache\rank wins).
+    unsigned moved = 0;
+    WIN32_FIND_DATAA fd;
+    const std::string soundDir = JoinPath(GetExeDirectory(), "sound");
+    HANDLE fh = FindFirstFileA(JoinPath(soundDir, "*rank_*_bms*.bin").c_str(), &fd);
+    if (fh != INVALID_HANDLE_VALUE) {
+        do {
+            const std::string to = CustomRankPath(("sound\\" + std::string(fd.cFileName)).c_str());
+            if (!to.empty() && MoveFileA(JoinPath(soundDir, fd.cFileName).c_str(), to.c_str())) ++moved;
+        } while (FindNextFileA(fh, &fd));
+        FindClose(fh);
+    }
+    LogLine("[rank] custom rank tables in '%s' (GetFileAttributesA hook=%d, %u moved from Sound)",
+            JoinPath(JoinPath(GetExeDirectory(), Config().cacheRoot), "rank").c_str(), ga ? 1 : 0, moved);
     LogLine("[file] IAT hooks CreateFile=%d FindFirst=%d FindNext=%d SetCwd=%d realCreate=%p realSetCwd=%p", a?1:0, b?1:0, c?1:0, d?1:0, RealCreateFileA, RealSetCurrentDirectoryA);
     bool g1 = HookIAT("KERNEL32.dll", "GetFileSize", reinterpret_cast<void*>(HookGetFileSize), reinterpret_cast<void**>(&RealGetFileSize));
     bool g2 = HookIAT("KERNEL32.dll", "ReadFile", reinterpret_cast<void*>(HookReadFile), reinterpret_cast<void**>(&RealReadFile));

@@ -30,3 +30,7 @@ inline std::string CustomRankFileName(const std::string& path) {
     if (rest != ".bin" && rest != "-ez.bin" && rest != "-hd.bin" && rest != "-shd.bin" && rest != "-ex.bin") return "";
     return path.substr(slash == std::string::npos ? 0 : slash + 1);
 }
+
+// Where that file lives now: <exe>\<CacheRoot>\rank\<name> (folder created on first use), or "" when
+// `path` is not a custom song's rank table. mod_main.cpp.
+std::string CustomRankPath(const char* path);
