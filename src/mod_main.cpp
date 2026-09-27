@@ -1988,8 +1988,19 @@ static bool EnsureLaneCoverTexture(void* renderer) {
     std::vector<unsigned char> px;
     const std::string& image = Config().laneCoverImage;
     const std::string path = JoinPath(JoinPath(GetExeDirectory(), "LaneCover"), image);
-    if (image.empty() || !RenderImageToBgr(path, kLaneCoverTexW, kLaneCoverTexH, px))
+    if (image.empty() || !RenderImageToBgr(path, kLaneCoverTexW, kLaneCoverTexH, px)) {
+        // Black, with a light edge along the bottom: the texture slides down with the cover, so its
+        // last rows are always the cover's lower edge -- without it a black cover over black lanes
+        // shows only as notes appearing late.
         px.assign((size_t)kLaneCoverTexW * kLaneCoverTexH * 3, 0);
+        for (int y = kLaneCoverTexH - 6; y < kLaneCoverTexH; ++y)
+            memset(&px[(size_t)y * kLaneCoverTexW * 3], 200, (size_t)kLaneCoverTexW * 3);
+    }
+    // Pure black is the game's transparent colour key: a black cover drew only its edge and let
+    // the lanes show through. Lift it to the darkest shade that survives a 16-bit surface (a
+    // channel under 8 rounds back to 0 in 5 bits); a picture's black areas get the same.
+    for (size_t i = 0; i + 2 < px.size(); i += 3)
+        if (px[i] < 8 && px[i + 1] < 8 && px[i + 2] < 8) px[i] = px[i + 1] = px[i + 2] = 8;
     BlitBgrToSurface(g_laneCoverSurf, px, kLaneCoverTexW, kLaneCoverTexH);
     LogLine("[lanecover] texture ready image='%s' size=%d", image.empty() ? "<black>" : path.c_str(), g_laneCoverSize);
     return true;
@@ -2029,22 +2040,48 @@ static void LaneCoverInput() {
 static void DrawLaneCover(void* panel) {
     const unsigned char* p = static_cast<const unsigned char*>(panel);
     if (IsBadReadPtr(p + 0x1844, 12)) return;
-    float fe4, barX, barY, barW, lift;
+    float fe4, barX, barY, barW, lift, laneX, laneY, laneW;
     memcpy(&fe4, p + 0xe4, 4);
     memcpy(&barX, p + 0x1844, 4);
     memcpy(&barY, p + 0x1848, 4);
     memcpy(&barW, p + 0x184c, 4);
     memcpy(&lift, reinterpret_cast<const void*>(0x1b2ef8c), 4);
+    // The lanes' own bounding box (Panel::loadGdsItem @0x427820 grows it over every lane item:
+    // +0x11c x, +0x120 y, +0x124 width). The judge bar is NOT the lane width everywhere -- in 7-key
+    // its texture runs 300 wide from x=20 over lanes that span ~210 -- so it is only the fallback.
+    memcpy(&laneX, p + 0x11c, 4);
+    memcpy(&laneY, p + 0x120, 4);
+    memcpy(&laneW, p + 0x124, 4);
+    if (!(laneW >= 8.0f && laneW <= 640.0f && laneX >= -64.0f && laneX < 640.0f)) { laneX = barX; laneW = barW; }
     const float judgeY = barY - lift;
-    if (g_laneCoverSize <= 0 || barW < 8.0f || judgeY < 16.0f) return;
+    const float top = laneY > 0.0f && laneY < judgeY - 16.0f ? laneY : 0.0f;
+    if (g_laneCoverSize <= 0 || laneW < 8.0f || judgeY < 16.0f) return;
     void* renderer = reinterpret_cast<void*>(*reinterpret_cast<uint32_t*>(0x1b2f054));
     if (!renderer || !EnsureLaneCoverTexture(renderer)) return;
-    const float bottom = LaneCoverBottom(judgeY, g_laneCoverSize);
+    const float bottom = LaneCoverBottom(top, judgeY, g_laneCoverSize);
+    const float height = judgeY - top;
     auto setBlend = reinterpret_cast<SetBlendFn>(Rva(0x0a490));
     auto draw     = reinterpret_cast<DrawSpriteFn>(Rva(0x03f80));
     setBlend(renderer, kBlendOne, kBlendZero);     // opaque; also what m42bbe0 sets next
-    draw(renderer, reinterpret_cast<uint32_t>(g_laneCoverTex), FloatBits(fe4 + barX), FloatBits(bottom - judgeY),
-         barW, judgeY, 0x00ffffff);
+    // Opaque white (-1), as the game's own overlay passes: the panel draws with alpha testing on,
+    // and a vertex alpha of 0 (0x00ffffff, which the BGA path gets away with) discards every pixel.
+    // Only the covered part is drawn, top to bottom, showing the texture's LOWER slice through its
+    // UV window (KTexture +0x88 flag, +0x8c u0, +0x90 v0, +0x94 u1, +0x98 v1): the picture slides
+    // down with the cover, IIDX-style, and nothing spills above the lanes.
+    if (bottom - top < 1.0f) return;
+    unsigned char* tex = static_cast<unsigned char*>(g_laneCoverTex);
+    const float window[4] = {0.0f, 1.0f - (bottom - top) / height, 1.0f, 1.0f};
+    *reinterpret_cast<int*>(tex + 0x88) = 1;
+    memcpy(tex + 0x8c, window, sizeof(window));
+    draw(renderer, reinterpret_cast<uint32_t>(g_laneCoverTex), FloatBits(fe4 + laneX), FloatBits(top),
+         laneW, bottom - top, 0xffffffff);
+    static void* s_loggedPanel = nullptr;
+    if (s_loggedPanel != panel) {
+        s_loggedPanel = panel;
+        LogLine("[lanecover] panel=%p lanes x=%.0f w=%.0f top=%.0f judgeY=%.0f (bar x=%.0f w=%.0f y=%.0f lift=%.0f) "
+                "size=%d bottom=%.0f", panel, fe4 + laneX, laneW, top, judgeY, fe4 + barX, barW, barY, lift,
+                g_laneCoverSize, bottom);
+    }
 }
 
 static void __fastcall HookPanelOverlay(void* panel, void*) {

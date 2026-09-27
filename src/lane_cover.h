@@ -48,7 +48,8 @@ inline int LaneCoverAfter(int value, int counts, int unitsPerCount) {
     return v < 0 ? 0 : v > kLaneCoverMax ? kLaneCoverMax : v;
 }
 
-// Where the cover ends, in screen y: `value` thousandths of the way from the top to the judge line.
-inline float LaneCoverBottom(float judgeY, int value) {
-    return judgeY * (float)value / (float)kLaneCoverMax;
+// Where the cover ends, in screen y: `value` thousandths of the way from the top of the lanes to
+// the judge line.
+inline float LaneCoverBottom(float top, float judgeY, int value) {
+    return top + (judgeY - top) * (float)value / (float)kLaneCoverMax;
 }

@@ -64,7 +64,7 @@ ModConfig LoadConfig() {
     cfg.virtualCategories = readBool("Gameplay", "VirtualCategories", true, ini);
     cfg.laneCover = readBool("Gameplay", "LaneCover", true, ini);
     cfg.laneCoverSize = std::max(0, std::min(1000, readInt("Gameplay", "LaneCoverSize", 0, ini)));
-    cfg.laneCoverStep = readInt("Gameplay", "LaneCoverStep", 2, ini);
+    cfg.laneCoverStep = readInt("Gameplay", "LaneCoverStep", 8, ini);
     cfg.laneCoverImage = readString("Gameplay", "LaneCoverImage", "", ini);
     cfg.customCourses = std::max(0, readInt("Gameplay", "CustomCourses", 12, ini));
     cfg.previewFps = readInt("Gameplay", "PreviewFps", 20, ini);

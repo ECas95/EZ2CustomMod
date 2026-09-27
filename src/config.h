@@ -45,7 +45,7 @@ struct ModConfig {
     // SUDDEN+ lane cover (lane_cover.h): EFX1 held + turntable in play. The size is remembered here.
     bool laneCover = true;
     int  laneCoverSize = 0;        // 0..1000 of the way down to the judge line; 0 = none
-    int  laneCoverStep = 2;        // cover units per turntable count (negative turns the other way)
+    int  laneCoverStep = 8;        // cover units per turntable count (negative turns the other way)
     std::string laneCoverImage;    // a picture in LaneCover\, or black when empty / missing
     int  customCourses = 12;       // custom Radio Mix courses per family (course_builder.h); 0 = none
     // Frames a second for the BGA preview on the disc in song select. The clip is decoded whole
