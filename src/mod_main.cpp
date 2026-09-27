@@ -602,6 +602,30 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
         if (PathIsUnderDirectory(p, cacheRoot)) return std::string();
     }
 
+    // Custom Radio Mix courses (bms_scanner CustomCourseStageIniFile): the family's course list,
+    // and the preview each course plays in the list -- its first song's.
+    if (Config().customCourses > 0) {
+        const std::string lp = LowerAscii(p);
+        static const char* const kDirs[][2] = {{"system\\5radiomix\\", "5radio"}, {"system\\10radiomix\\", "10radio"},
+                                               {"system\\14radiomix\\", "14radio"}, {"system\\radiomix\\", "radio"}};
+        const std::string file = FileNameOnly(lp);
+        if (file == "stage.ini") {
+            for (const auto& d : kDirs) {
+                if (lp.find(d[0]) == std::string::npos) continue;
+                const std::string built = CustomCourseStageIniFile(d[1]);
+                if (!built.empty()) return built;
+                break;
+            }
+        }
+        if (lp.find("\\preview_") != std::string::npos) {
+            const size_t dot = file.find_last_of('.');
+            if (const CustomBmsSong* first = CustomCourseFirstSong(file.substr(0, dot))) {
+                const std::string preview = SongPreviewFileForCrt(*first);
+                return preview.empty() ? BlankPreviewFile() : preview;
+            }
+        }
+    }
+
     // v24 crash fix: DO NOT redirect system\<mode>\Stage.ini to a synthetic file.
     // The v23/v23.1 file-level Stage.ini redirect made the game enter SongSelect with
     // a reduced synthetic category table and caused a crash immediately after selecting
@@ -2543,6 +2567,8 @@ static std::string EzRequestFor(const char* request) {
     std::string r = request ? request : "";
     if (*reinterpret_cast<int*>(0x4abd14) != 0) return r;
     std::string low = LowerAscii(r);
+    // A Radio Mix course stage names its chart itself; the column cursor is song select's.
+    if (low.find("radiomix") != std::string::npos) return r;
     if (low.find("-hd") != std::string::npos || low.find("-shd") != std::string::npos ||
         low.find("-ex") != std::string::npos || low.find("-ez") != std::string::npos) return r;
     size_t dot = r.rfind('.');
@@ -3308,6 +3334,20 @@ static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share,
         if (lower.find("bmslabelez") != std::string::npos) {
             HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmLabelEz);
             if (vh != INVALID_HANDLE_VALUE) return vh;
+        }
+        // A custom course's channel art (bms_scanner BuildCourseAbmInMemory).
+        if (lower.find("\\channel_") != std::string::npos && lower.find("bmsc") != std::string::npos) {
+            const std::string file = FileNameOnly(lower);
+            const std::string course = file.substr(0, file.find_last_of('.'));
+            const int kind = lower.find("\\channel_disc\\") != std::string::npos ? kCourseArtDisc
+                           : lower.find("\\channel_info\\") != std::string::npos ? kCourseArtInfo
+                           : lower.find("\\channel_tag\\") != std::string::npos ? kCourseArtTag
+                           : lower.find("\\channel_eyecatch\\") != std::string::npos ? kCourseArtEyecatch : -1;
+            std::vector<unsigned char> bytes;
+            if (kind >= 0 && BuildCourseAbmInMemory(course, kind, bytes)) {
+                HANDLE vh = OpenVirtualBytes(std::move(bytes));
+                if (vh != INVALID_HANDLE_VALUE) return vh;
+            }
         }
         if (lower.find("bmsrandom") != std::string::npos) {
             HANDLE vh = OpenVirtualAsset(GetActiveMode(), 0, kCatAbmRandom);

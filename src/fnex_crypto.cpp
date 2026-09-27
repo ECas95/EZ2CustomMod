@@ -162,6 +162,44 @@ std::vector<unsigned char> FnexEncryptBuffer(const unsigned char* data, size_t s
     return tmp;
 }
 
+// The inverse of FnexEncryptBuffer: the same block walk, the whole-buffer reverse undone first
+// and the key subtracted instead of added. What the game's KParser does before it reads an .ini.
+std::vector<unsigned char> FnexDecryptBuffer(const unsigned char* data, size_t size, FnexCryptoKind kind) {
+    const unsigned char* key = selectKey(kind);
+    std::vector<unsigned char> out(size, 0);
+    if (!data || size == 0) return out;
+    std::vector<unsigned char> tmp(data, data + size);
+    std::reverse(tmp.begin(), tmp.end());
+
+    size_t off = 0;
+    int keyIndex = 0;
+    bool wideBlock = false;
+    while (off < size) {
+        size_t len = 0;
+        if (size < off + 8) {
+            len = size - off;
+        } else {
+            if (wideBlock) {
+                len = 16;
+                if (size < off + 16) len = size - off;
+            } else {
+                len = 8;
+            }
+            wideBlock = !wideBlock;
+        }
+        for (size_t u = 0; u < len; ++u) {
+            int k = keyIndex + static_cast<int>(len) - static_cast<int>(u) - 1;
+            if (k > 0x1ff) k -= 0x200;
+            out[off + u] = static_cast<unsigned char>((tmp[off + len - 1 - u] - key[k & 0x1ff]) & 0xff);
+        }
+        keyIndex += static_cast<int>(len);
+        if (keyIndex > 0x1ff) keyIndex -= 0x200;
+        if (len > 8) off = (off - 8) + len;
+        off += 8;
+    }
+    return out;
+}
+
 std::vector<unsigned char> FnexEncryptString(const std::string& text, FnexCryptoKind kind) {
     return FnexEncryptBuffer(reinterpret_cast<const unsigned char*>(text.data()), text.size(), kind);
 }
