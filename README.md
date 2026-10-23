@@ -28,7 +28,9 @@ modern PCs.
 
 | Document | What it covers |
 |---|---|
-| [docs/GUIDE.md](docs/GUIDE.md) | Installing on the cabinet, organising `BMSData`, controls and settings |
+| [docs/GUIDE.md](docs/GUIDE.md) | User guide: installing, adding songs, controls, lane cover and settings, with examples |
+| [CHANGELOG.md](CHANGELOG.md) | What changed in every version, from the v3 prototypes to today |
+| [docs/RESEARCH.md](docs/RESEARCH.md) | How the game was reverse-engineered: structures, formats, weaknesses and addresses |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, tests, architecture, the log and troubleshooting |
 | [BMSMod.ini](BMSMod.ini) | The production configuration, with every option commented |
 

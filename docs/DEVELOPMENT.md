@@ -81,9 +81,19 @@ cabinet can be rolled back without a PC.
 1. Bump the version string logged at start-up: `LogLine("[version] EZ2CustomMod_vXX_Y_Z_...")` in
    `src/mod_main.cpp`.
 2. Build, run `tests/run_tests.py` and `tests/xp_compat_check.py`.
-3. Tag `vXX.Y.Z` and attach `EZ2CustomMod-vXX.Y.Z.zip`, which contains `EZ2CustomMod.dll`,
-   `BMSMod.ini`, `ffmpeg.exe`, `pthreadGC2.dll`, `wqy-microhei.ttc` (and its licence) and an empty
-   `LaneCover\` folder.
+3. Add the version to `CHANGELOG.md`.
+4. Tag `vXX.Y.Z` and attach `EZ2CustomMod-vXX.Y.Z.zip`. Its top folder holds `EZ2CustomMod.dll`,
+   `BMSMod.ini`, `ffmpeg.exe`, `pthreadGC2.dll`, `wqy-microhei.ttc` (and its licence), `GUIDE.md`,
+   an empty `LaneCover\` folder and `xp\gdiplus.dll` (taken from an XP machine's WinSxS; only XP needs
+   it).
+
+### History and older releases
+
+The history before this repository existed was rebuilt from the dated source backups kept during
+development: one commit per backup on the `history` side of the merge, from the partial v35.4.0
+baseline (2026-07-12) to the v36.0.0 production build (2026-09-26). The `v36.0.0-dev.YYYYMMDD` tags
+mark weekly development builds. The August ones carry the DLLs built at the time; the September ones
+were rebuilt from their snapshot with the current toolchain.
 
 ## How it works
 

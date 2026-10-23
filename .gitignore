@@ -5,6 +5,7 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/CHANGELOG.md
 !/BMSMod.ini
 !/CMakeLists.txt
 !/build_mingw_direct.py
