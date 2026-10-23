@@ -31,6 +31,7 @@ modern PCs.
 | [docs/GUIDE.md](docs/GUIDE.md) | User guide: installing, adding songs, controls, lane cover and settings, with examples |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in every version, from the v3 prototypes to today |
 | [docs/RESEARCH.md](docs/RESEARCH.md) | Research in eight chapters: the binary, engine, file formats, judgement and scoring, song select, BMS conversion and performance on the cabinet |
+| [docs/paper/paper.pdf](docs/paper/paper.pdf) | The research condensed into a 10-page technical report ([HTML](docs/paper/paper.html)) |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, tests, architecture, the log and troubleshooting |
 | [BMSMod.ini](BMSMod.ini) | The production configuration, with every option commented |
 

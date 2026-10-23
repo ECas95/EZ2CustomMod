@@ -24,6 +24,9 @@ the game's files.
 | 7 | [From BMS to FNEX](research/07-bms-to-fnex.md) | Channel mapping, the 384-tick grid, long notes, folding charts onto five keys, AutoChart's learned model, rating charts from their notes, difficulties, text, audio and video |
 | 8 | [Performance on the cabinet](research/08-performance-on-xp.md) | The cabinet's limits, the start-up timeline, the two song-select freezes and their causes, graphics-resource budgets and the rules that came out of it |
 
+A condensed version is available as a technical report: [paper.pdf](paper/paper.pdf)
+([HTML](paper/paper.html); rebuilt with `py -3 docs/paper/build_paper.py --pdf`).
+
 ## Main findings
 
 - **The retail executable is AES-protected** with a licence-derived key, so all analysis targets an

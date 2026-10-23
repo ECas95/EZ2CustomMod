@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Twenty-Three Thousand Songs on a 2010 Arcade Machine</title>
+<style>
+  :root { --ink: #0b0b0b; --ink2: #52514e; --rule: #cfcec8; --paper: #ffffff; }
+  @page { size: A4; margin: 20mm 19mm 22mm 19mm; }
+  html { background: var(--paper); }
+  body { font-family: "Times New Roman", Georgia, serif; font-size: 10.6pt; line-height: 1.42;
+         color: var(--ink); background: var(--paper); max-width: 172mm; margin: 0 auto; padding: 0 4mm; }
+  h1 { font-size: 19pt; line-height: 1.2; text-align: center; margin: 4mm 0 2mm; }
+  .subtitle { text-align: center; font-size: 11.5pt; margin: 0 0 3mm; color: var(--ink2); }
+  .authors { text-align: center; margin: 0 0 1mm; }
+  .meta { text-align: center; font-size: 9.5pt; color: var(--ink2); margin-bottom: 5mm; }
+  .abstract { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); padding: 3mm 6mm;
+              margin: 0 0 4mm; font-size: 10pt; }
+  .abstract b { font-variant: small-caps; }
+  .keywords { font-size: 9.5pt; margin: 0 0 5mm; }
+  h2 { font-size: 12.5pt; margin: 6mm 0 2mm; break-after: avoid; }
+  h3 { font-size: 11pt; margin: 4mm 0 1.5mm; font-style: italic; break-after: avoid; }
+  p { margin: 0 0 2.4mm; text-align: justify; hyphens: auto; }
+  ul, ol { margin: 0 0 2.4mm 0; padding-left: 6mm; }
+  li { margin-bottom: 1mm; }
+  code { font-family: Consolas, "Courier New", monospace; font-size: 9pt; }
+  pre { font-family: Consolas, "Courier New", monospace; font-size: 8.8pt; background: #f6f5f2;
+        padding: 2mm 3mm; border-left: 2px solid var(--rule); margin: 0 0 3mm; white-space: pre-wrap; }
+  figure { margin: 4mm 0; break-inside: avoid; }
+  figure svg { width: 100%; height: auto; display: block; font-family: Arial, Helvetica, sans-serif; }
+  figcaption, .tcap { font-size: 9.3pt; color: var(--ink2); margin-top: 1.5mm; }
+  table { border-collapse: collapse; width: 100%; font-size: 9.3pt; margin: 2mm 0 1mm; break-inside: avoid; }
+  th, td { border-bottom: 1px solid var(--rule); padding: 1.1mm 1.6mm; text-align: left; vertical-align: top; }
+  thead th { border-bottom: 1.5px solid var(--ink); }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .tablewrap { margin: 3mm 0 4mm; break-inside: avoid; }
+  .refs li { font-size: 9.4pt; margin-bottom: 1.2mm; }
+  .note { font-size: 9.4pt; color: var(--ink2); }
+</style>
+</head>
+<body>
+
+<h1>Twenty-Three Thousand Songs on a 2010 Arcade Machine</h1>
+<p class="subtitle">Characterising and extending the rhythm game EZ2AC FNEX for a community BMS library on its original hardware</p>
+<p class="authors">ECas95</p>
+<p class="meta">Independent research · October 2026 · Private technical report</p>
+
+<div class="abstract">
+<p><b>Abstract.</b> EZ2AC FNEX is the last release of a Korean arcade rhythm-game series whose
+arcade line has been dormant since 2020. It ships about 430 songs and was built for fixed arcade
+hardware. We describe how the game was characterised in enough depth to load a community library
+of 23,587 BMS songs into it, without modifying its files, on its original Windows XP cabinet: a
+2010-era dual-core PC with 2 GB of RAM. We combine four decompilers, a separate byte-matching
+decompilation, run-time observation from inside the process, sweeps over all ~290,000 shipped data
+files, and measurements on the cabinet. Three results come out of this. First, a characterisation
+of the engine, its file formats and its timing model: judgement happens in chart ticks of 1/192 of
+a beat with a fixed five-tick latency compensation; each chart ships its own judgement windows
+(327 distinct sets); hold notes are graded twice but counted once; and the two scoring models are
+flat per-tier in the key modes and logarithmic in Ez2Catch. Second, a conversion from BMS to the
+game's format: a finer tick grid that removes a 4.17 ms mean displacement affecting 24% of notes,
+repair of malformed long notes, an AutoChart generator that learns lane usage and timing statistics
+from the game's own charts, and a note-based difficulty rating that spreads a library in which 46%
+of songs claimed the top level. Third, a performance study on the original hardware, which found
+and removed two freezes, of 0.7–1.7 s and 0.4–0.6 s, that no development PC could reproduce.</p>
+</div>
+<p class="keywords"><b>Keywords:</b> reverse engineering, rhythm games, game preservation, file formats,
+timing analysis, BMS, legacy hardware, Windows XP.</p>
+
+<h2>1. Introduction</h2>
+<p>Arcade rhythm games are an awkward subject for preservation. Their software is tied to a cabinet,
+their song lists are fixed at release, and when a series ends, the machines remain in arcades and
+private collections with no new content and no maintainer. EZ2AC FNEX (Final EX), the last
+entry of a series started by Amuse World in 1999, is such a game. Its community, meanwhile, keeps a
+large library of charts in BMS, the open text-based chart format used by most community rhythm-game
+players.</p>
+<p>This report describes the work needed to make the original game play that library on its
+original cabinet. The constraints were strict:</p>
+<ul>
+<li>the game's files are not modified;</li>
+<li>the hardware is a 2010-era PC running Windows XP;</li>
+<li>the result must feel like the original game: the same judgement, the same scoring, the same
+screens, with 55 times as many songs.</li>
+</ul>
+<p>Our contributions are:</p>
+<ul>
+<li>a <b>methodology</b> that combines five independent lines of evidence and replaces reading with
+mechanical verification wherever possible (Section 3);</li>
+<li>a <b>characterisation</b> of the game's binary, engine, file formats, judgement timing, hold
+notes and scoring (Section 4);</li>
+<li>a <b>BMS-to-FNEX conversion</b> backed by measurements over the library: grid choice, long-note
+repair, lane folding, a learned chart generator and note-based rating (Section 5);</li>
+<li>a <b>performance study</b> on the original hardware (Section 6), and the lessons we draw from the
+whole effort (Section 7).</li>
+</ul>
+
+<h2>2. Background</h2>
+<h3>2.1 The game and its platform</h3>
+<p>EZ2AC FNEX is a Windows program written in C++ against a small in-house engine. It renders 640×480
+graphics with DirectDraw 7 and Direct3D 7, plays audio through DirectSound, and reads its controls
+through DirectInput and the cabinet's I/O board. Thirteen play modes range from 5-key layouts with a
+turntable and a pedal to 14-key doubles and a catch mode. The cabinet studied here has a Pentium
+Dual-Core E5800 (3.2 GHz), 2 GB of RAM, a GeForce GT 520 and Windows XP Professional 32-bit. On that
+system the game process has 2 GB of address space.</p>
+<p>On home and cabinet installations alike, the game is started by the community launcher
+2EZConfig, which emulates the I/O board, offers configuration patches and can load additional
+user DLLs into the game. Our extension is such a DLL. It integrates with the game in memory and
+leaves every game file on disk untouched.</p>
+<h3>2.2 BMS</h3>
+<p>A BMS song is a folder: one or more plain-text charts (<code>.bms</code>, <code>.bme</code>,
+<code>.bml</code>) and their sounds and images. A chart assigns sounds to positions within measures on
+numbered channels, one per lane, with separate channels for background music, tempo changes, stops
+and long notes. Charts declare a difficulty level (<code>#PLAYLEVEL</code>) but no text encoding.
+The library used here has 23,587 songs in 106 folders, gathered from many community packs whose
+conventions differ.</p>
+
+<h2>3. Methodology</h2>
+<p>No single source of evidence proved reliable on its own, so every important claim was confirmed
+by at least two of the following.</p>
+<ul>
+<li><b>Static decompilation.</b> Four decompilers (a Ghidra headless export of 2,014 functions,
+IDA/Hex-Rays, Snowman and Rec Studio) disagree on exactly the code that is hard: compiler-specific
+calling conventions, stack-cookie prologues, jump tables and SSE floating point. Disagreement
+marks the instructions worth reading by hand.</li>
+<li><b>A byte-matching decompilation.</b> A separate private project, EZ2DECOMP, reconstructs source
+that recompiles with the original compiler into byte-identical functions, verified per function
+with <code>reccmp</code> [1]. It identified that compiler from the Rich header (Visual C++ 7.1,
+build 3077) and reconstructs every referenced function; 1,351 of 1,563 compared entities match
+byte for byte. A matched function is the original logic, not an interpretation of it.</li>
+<li><b>Run-time observation.</b> Our DLL logged arguments, structures and timings from inside the
+running game. Early versions did nothing else. "Marker builds" settled questions of identity by
+writing distinct markers into candidate arrays and observing which one appeared on screen.</li>
+<li><b>Library-wide sweeps.</b> Every format parser was run over everything the game ships and required
+to land exactly on the end of every file. Every rule in Section 4.3 that was wrong in a first draft
+was corrected by a sweep, not by reasoning.</li>
+<li><b>Measurement on the target.</b> All performance claims come from logs written on the cabinet,
+with a millisecond clock on every line and a per-frame breakdown of where the time went.</li>
+</ul>
+<p>The strongest check was a <b>differential trace</b>. The game's judgement sink was observed in the
+running game; each call was recorded with its inputs, its call site and the state before and after;
+and the record was replayed through an independent reimplementation of the scoring rules. A first
+live capture of one stage (552 events) and a two-player capture (226 events) both replayed with zero
+divergences. The trace was needed because reading had failed: in the scoring code alone, four
+readings that looked right were wrong, and only one of them had been caught by a mechanical check.</p>
+<p><b>Handling rules.</b> No bytes of the original executable, no assets and no key tables are
+reproduced in this report or in the project's documentation. Addresses, structure layouts and
+descriptions of behaviour are analysis. The retail executable is licence-protected (Section 4.1);
+we describe that protection only to explain why all analysis targets an unpacked image, and we give
+no procedure for obtaining one.</p>
+
+<h2>4. Characterising the game</h2>
+<h3>4.1 The binary</h3>
+<p>The retail executable is protected: a dropper at the entry point starts a licence-checking
+loader, and the game's code section is encrypted with AES-128 in ECB mode under a key derived at run
+time from the licence. The key is not stored in the file. All analysis therefore uses an unpacked
+image of the same build.</p>
+<p>That image can be validated without the key. ECB maps every 16-byte block to a fixed ciphertext
+block, so pairing the image's code blocks with the retail file's must give a consistent one-to-one
+codebook. For our image the codebook is a perfect bijection over 31,983 distinct blocks, with zero
+conflicts in either direction; the data section is identical, and the read-only section differs only
+in its import table, which the protector rebuilds at run time.</p>
+<p>The image has a fixed base address with no relocations, so every function and global keeps the same
+address on every run. It also has a <b>53.7 MB static data section</b>: most game state lives in fixed
+global tables (input, songs, categories, chart queues), and most of the game's limits are simply the
+sizes of those tables. The compiler adds stack cookies only to functions with character buffers
+(275 of them), and links the C runtime statically.</p>
+
+<h3>4.2 The engine</h3>
+<p>A screen driver runs one <i>director</i> per screen: title, mode select, song select, three gameplay
+directors (key modes, scratch modes, catch mode), result and ranking. Engine services provide graphics,
+sound, input and configuration:</p>
+<ul>
+<li><b>Graphics.</b> The renderer draws pre-transformed quads, blends through two render states, and
+offers sixteen fixed-function multitexture recipes, the same sixteen presets the authoring tool
+exposes.</li>
+<li><b>Textures.</b> Textures use a black colour key rather than alpha (43,819 of 62,201 shipped textures
+rely on it). They are cached by file name and released only when a screen ends.</li>
+<li><b>Sound.</b> Sound is one DirectSound buffer per voice, two voices per sample, driven by a pump
+thread that wakes every millisecond. That thread, not the frame loop, advances the song clock.</li>
+<li><b>Text.</b> The game ships two bitmap fonts: ASCII, and the 2,350 Hangul syllables of KS X 1001.
+Song titles are not text at all: every title is a pre-rendered 256×32 picture named after the song.</li>
+</ul>
+
+<h3>4.3 File formats</h3>
+<p>Table 1 summarises the sweeps. Most formats descend from 1990s tools and still carry their original
+four-character tags. Community documentation [2] described the containers; the sweeps added the
+rules below.</p>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Format</th><th>Content</th><th class="n">Files</th><th class="n">Parsed</th><th>Notable rule</th></tr></thead>
+<tbody>
+<tr><td><code>.ez</code></td><td>charts (v7/v8)</td><td class="n">12,361</td><td class="n">12,359</td><td>64 tracks; lengths biased by 6; the v7 widening shifts every field</td></tr>
+<tr><td><code>.ezi</code></td><td>keysound indexes</td><td class="n">12,359</td><td class="n">12,359</td><td>mode-2 lines carry a second name; 4,703 references point into other songs</td></tr>
+<tr><td><code>.ssf</code></td><td>samples</td><td class="n">178,474</td><td class="n">178,470</td><td>no magic; header validated by its two redundant fields</td></tr>
+<tr><td><code>.str</code></td><td>animated scenes</td><td class="n">10,593</td><td class="n">10,593</td><td>three variants; rotation is a table index</td></tr>
+<tr><td><code>.scr</code></td><td>scene timelines</td><td class="n">314</td><td class="n">311</td><td>planes play concurrently; times in 60 Hz frames</td></tr>
+<tr><td><code>.ini</code></td><td>judgement and gauge</td><td class="n">12,342</td><td class="n">12,342</td><td>values read by position; 327 window sets</td></tr>
+<tr><td><code>.abm</code></td><td>textures</td><td class="n">62,201</td><td class="n">62,201</td><td>XOR-masked BMP header; 16-bit is 1:5:5:5</td></tr>
+</tbody>
+</table>
+<p class="tcap">Table 1. Whole-library parse results. The few failures are corrupt files in the shipped game,
+identified by independent checks (for example, a healthy chart contains its track tag exactly 64 times).</p>
+</div>
+<p>Several rules are silent when wrong:</p>
+<ul>
+<li><b>The <code>.ez</code> v7 widening.</b> v7 widened the keysound index by one byte. Reading a v8
+chart at the older offsets turns every note's length of 6 into 1,536: every note becomes an endless
+hold, yet the chart still parses and looks plausible.</li>
+<li><b>Two spare bytes in <code>.abm</code>.</b> In 35,376 textures two spare bytes lie at the end of
+the file, not the start. Placing them wrongly shifts every pixel, yet the result is still a
+recognisable picture; a greyscale mask decoded both ways (100% versus 93% grey) settled it.</li>
+<li><b>Lane order is data.</b> A mode's lane order comes from a plain-text descriptor read in file
+order, not from code.</li>
+<li><b>Scene times.</b> The animated-scene timelines express time in 60 Hz frames. Across 3,251 entry
+pairs, the gap the timeline leaves for a scene equals that scene's own length (median ratio 1.00);
+read as milliseconds, every scene plays 16.7 times too slowly.</li>
+<li><b>File obfuscation.</b> The game's data files are obfuscated with a 512-byte additive keystream
+and a fixed block permutation, the same for every file of a kind.</li>
+</ul>
+
+<h3>4.4 Timing and judgement</h3>
+<p><b>The clock.</b> The judge's clock counts chart ticks. The chart loader rescales the file's 48 ticks
+per beat by four, so a tick is 1/192 of a beat:</p>
+<pre>1 tick = 312.5 / BPM  milliseconds</pre>
+<p><b>The press time.</b> A press is detected once per frame. Its time is synthesised when the frame
+processes it, as the current tick minus a fixed five-tick compensation, about the mean delay of frame
+sampling.</p>
+<p><b>The windows.</b> Each chart ships its own windows in its <code>.ini</code>, and the engine widens
+them by three ticks before use. The windows are therefore <b>beat-relative</b>: the same file is three
+times stricter in milliseconds at 200 BPM than at 66 BPM (Figure 1, Table 2).</p>
+<p><b>Grades.</b> A press scores KOOL, COOL or GOOD. A press outside GOOD but inside the miss window is
+a FAIL, which drains the gauge but does not break the combo. Only a note nobody pressed is a MISS.
+Community documentation had read the window values as milliseconds.</p>
+<figure>
+<svg viewBox="0 0 640 300" role="img" aria-label="Judgement windows in milliseconds against tempo">
+<line x1="52" x2="570" y1="260.0" y2="260.0" stroke="#e2e1dc" stroke-width="1"/>
+<text x="46" y="264.0" text-anchor="end" font-size="11" fill="#52514e">0</text>
+<line x1="52" x2="570" y1="219.3" y2="219.3" stroke="#e2e1dc" stroke-width="1"/>
+<text x="46" y="223.3" text-anchor="end" font-size="11" fill="#52514e">50</text>
+<line x1="52" x2="570" y1="178.7" y2="178.7" stroke="#e2e1dc" stroke-width="1"/>
+<text x="46" y="182.7" text-anchor="end" font-size="11" fill="#52514e">100</text>
+<line x1="52" x2="570" y1="138.0" y2="138.0" stroke="#e2e1dc" stroke-width="1"/>
+<text x="46" y="142.0" text-anchor="end" font-size="11" fill="#52514e">150</text>
+<line x1="52" x2="570" y1="97.3" y2="97.3" stroke="#e2e1dc" stroke-width="1"/>
+<text x="46" y="101.3" text-anchor="end" font-size="11" fill="#52514e">200</text>
+<line x1="52" x2="570" y1="56.7" y2="56.7" stroke="#e2e1dc" stroke-width="1"/>
+<text x="46" y="60.7" text-anchor="end" font-size="11" fill="#52514e">250</text>
+<line x1="52" x2="570" y1="16.0" y2="16.0" stroke="#e2e1dc" stroke-width="1"/>
+<text x="46" y="20.0" text-anchor="end" font-size="11" fill="#52514e">300</text>
+<text x="52.0" y="276" text-anchor="middle" font-size="11" fill="#52514e">80</text>
+<text x="116.8" y="276" text-anchor="middle" font-size="11" fill="#52514e">100</text>
+<text x="181.5" y="276" text-anchor="middle" font-size="11" fill="#52514e">120</text>
+<text x="246.2" y="276" text-anchor="middle" font-size="11" fill="#52514e">140</text>
+<text x="311.0" y="276" text-anchor="middle" font-size="11" fill="#52514e">160</text>
+<text x="375.8" y="276" text-anchor="middle" font-size="11" fill="#52514e">180</text>
+<text x="440.5" y="276" text-anchor="middle" font-size="11" fill="#52514e">200</text>
+<text x="505.2" y="276" text-anchor="middle" font-size="11" fill="#52514e">220</text>
+<text x="570.0" y="276" text-anchor="middle" font-size="11" fill="#52514e">240</text>
+<text x="311" y="294" text-anchor="middle" font-size="11" fill="#52514e">Tempo (BPM)</text>
+<text x="14" y="138" text-anchor="middle" font-size="11" fill="#52514e" transform="rotate(-90 14 138)">Half-width of window (ms)</text>
+<polyline points="52.0,231.4 58.5,232.1 65.0,232.8 71.4,233.4 77.9,234.0 84.4,234.6 90.8,235.1 97.3,235.7 103.8,236.2 110.3,236.7 116.8,237.1 123.2,237.6 129.7,238.0 136.2,238.4 142.6,238.8 149.1,239.2 155.6,239.6 162.1,239.9 168.6,240.3 175.0,240.6 181.5,240.9 188.0,241.2 194.5,241.6 200.9,241.8 207.4,242.1 213.9,242.4 220.3,242.7 226.8,242.9 233.3,243.2 239.8,243.4 246.2,243.7 252.7,243.9 259.2,244.1 265.7,244.3 272.1,244.5 278.6,244.8 285.1,245.0 291.6,245.1 298.0,245.3 304.5,245.5 311.0,245.7 317.5,245.9 323.9,246.1 330.4,246.2 336.9,246.4 343.4,246.5 349.8,246.7 356.3,246.9 362.8,247.0 369.3,247.1 375.8,247.3 382.2,247.4 388.7,247.6 395.2,247.7 401.7,247.8 408.1,248.0 414.6,248.1 421.1,248.2 427.6,248.3 434.0,248.4 440.5,248.6 447.0,248.7 453.4,248.8 459.9,248.9 466.4,249.0 472.9,249.1 479.3,249.2 485.8,249.3 492.3,249.4 498.8,249.5 505.2,249.6 511.7,249.7 518.2,249.8 524.7,249.9 531.2,250.0 537.6,250.1 544.1,250.1 550.6,250.2 557.0,250.3 563.5,250.4 570.0,250.5" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="570.0" cy="250.5" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="578.0" y="254.5" font-size="11" fill="#0b0b0b">KOOL ±9t</text>
+<polyline points="52.0,174.2 58.5,176.3 65.0,178.3 71.4,180.2 77.9,182.0 84.4,183.8 90.8,185.4 97.3,187.0 103.8,188.5 110.3,190.0 116.8,191.4 123.2,192.7 129.7,194.0 136.2,195.3 142.6,196.5 149.1,197.6 155.6,198.7 162.1,199.8 168.6,200.8 175.0,201.8 181.5,202.8 188.0,203.8 194.5,204.7 200.9,205.5 207.4,206.4 213.9,207.2 220.3,208.0 226.8,208.8 233.3,209.5 239.8,210.3 246.2,211.0 252.7,211.7 259.2,212.3 265.7,213.0 272.1,213.6 278.6,214.2 285.1,214.9 291.6,215.4 298.0,216.0 304.5,216.6 311.0,217.1 317.5,217.6 323.9,218.2 330.4,218.7 336.9,219.2 343.4,219.6 349.8,220.1 356.3,220.6 362.8,221.0 369.3,221.4 375.8,221.9 382.2,222.3 388.7,222.7 395.2,223.1 401.7,223.5 408.1,223.9 414.6,224.3 421.1,224.6 427.6,225.0 434.0,225.3 440.5,225.7 447.0,226.0 453.4,226.4 459.9,226.7 466.4,227.0 472.9,227.3 479.3,227.6 485.8,227.9 492.3,228.2 498.8,228.5 505.2,228.8 511.7,229.1 518.2,229.4 524.7,229.6 531.2,229.9 537.6,230.2 544.1,230.4 550.6,230.7 557.0,230.9 563.5,231.2 570.0,231.4" fill="none" stroke="#eb6834" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="570.0" cy="231.4" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="578.0" y="235.4" font-size="11" fill="#0b0b0b">COOL ±27t</text>
+<polyline points="52.0,136.1 58.5,139.1 65.0,142.0 71.4,144.7 77.9,147.4 84.4,149.9 90.8,152.3 97.3,154.5 103.8,156.7 110.3,158.9 116.8,160.9 123.2,162.8 129.7,164.7 136.2,166.5 142.6,168.2 149.1,169.9 155.6,171.5 162.1,173.0 168.6,174.5 175.0,176.0 181.5,177.4 188.0,178.8 194.5,180.1 200.9,181.3 207.4,182.6 213.9,183.8 220.3,184.9 226.8,186.0 233.3,187.1 239.8,188.2 246.2,189.2 252.7,190.2 259.2,191.2 265.7,192.1 272.1,193.0 278.6,193.9 285.1,194.8 291.6,195.6 298.0,196.5 304.5,197.3 311.0,198.0 317.5,198.8 323.9,199.6 330.4,200.3 336.9,201.0 343.4,201.7 349.8,202.4 356.3,203.0 362.8,203.7 369.3,204.3 375.8,204.9 382.2,205.5 388.7,206.1 395.2,206.7 401.7,207.3 408.1,207.8 414.6,208.4 421.1,208.9 427.6,209.4 434.0,209.9 440.5,210.4 447.0,210.9 453.4,211.4 459.9,211.9 466.4,212.3 472.9,212.8 479.3,213.2 485.8,213.7 492.3,214.1 498.8,214.5 505.2,214.9 511.7,215.3 518.2,215.7 524.7,216.1 531.2,216.5 537.6,216.9 544.1,217.3 550.6,217.6 557.0,218.0 563.5,218.4 570.0,218.7" fill="none" stroke="#1baf7a" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="570.0" cy="218.7" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="578.0" y="222.7" font-size="11" fill="#0b0b0b">GOOD ±39t</text>
+<polyline points="52.0,21.7 58.5,27.5 65.0,33.1 71.4,38.3 77.9,43.4 84.4,48.2 90.8,52.8 97.3,57.2 103.8,61.4 110.3,65.5 116.8,69.4 123.2,73.1 129.7,76.7 136.2,80.2 142.6,83.5 149.1,86.7 155.6,89.8 162.1,92.8 168.6,95.7 175.0,98.5 181.5,101.1 188.0,103.8 194.5,106.3 200.9,108.7 207.4,111.1 213.9,113.4 220.3,115.6 226.8,117.7 233.3,119.8 239.8,121.9 246.2,123.8 252.7,125.8 259.2,127.6 265.7,129.4 272.1,131.2 278.6,132.9 285.1,134.6 291.6,136.2 298.0,137.8 304.5,139.4 311.0,140.9 317.5,142.3 323.9,143.8 330.4,145.2 336.9,146.5 343.4,147.9 349.8,149.2 356.3,150.4 362.8,151.7 369.3,152.9 375.8,154.1 382.2,155.3 388.7,156.4 395.2,157.5 401.7,158.6 408.1,159.7 414.6,160.7 421.1,161.7 427.6,162.7 434.0,163.7 440.5,164.7 447.0,165.6 453.4,166.6 459.9,167.5 466.4,168.4 472.9,169.2 479.3,170.1 485.8,170.9 492.3,171.7 498.8,172.6 505.2,173.4 511.7,174.1 518.2,174.9 524.7,175.7 531.2,176.4 537.6,177.1 544.1,177.8 550.6,178.5 557.0,179.2 563.5,179.9 570.0,180.6" fill="none" stroke="#eda100" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="570.0" cy="180.6" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"/>
+<text x="578.0" y="184.6" font-size="11" fill="#0b0b0b">MISS ±75t</text>
+</svg>
+<figcaption>Figure 1. Half-width of each judgement window in milliseconds as a function of tempo, for the
+default windows after the engine's +3-tick widening (KOOL ±9, COOL ±27, GOOD ±39, MISS ±75 ticks).
+Each curve is <code>ticks × 312.5 / BPM</code>; Table 2 lists the same values.</figcaption>
+</figure>
+<div class="tablewrap">
+<table><thead><tr><th>Window</th><th>90 BPM</th><th>120 BPM</th><th>150 BPM</th><th>180 BPM</th><th>200 BPM</th><th>240 BPM</th></tr></thead><tbody><tr><th>KOOL (±9 ticks)</th><td>±31</td><td>±23</td><td>±19</td><td>±16</td><td>±14</td><td>±12</td></tr><tr><th>COOL (±27 ticks)</th><td>±94</td><td>±70</td><td>±56</td><td>±47</td><td>±42</td><td>±35</td></tr><tr><th>GOOD (±39 ticks)</th><td>±135</td><td>±102</td><td>±81</td><td>±68</td><td>±61</td><td>±51</td></tr><tr><th>MISS (±75 ticks)</th><td>±260</td><td>±195</td><td>±156</td><td>±130</td><td>±117</td><td>±98</td></tr><tr><th>1 tick (ms)</th><td>3.47</td><td>2.60</td><td>2.08</td><td>1.74</td><td>1.56</td><td>1.30</td></tr></tbody></table>
+<p class="tcap">Table 2. The data of Figure 1, in milliseconds. Shipped charts often override the defaults;
+the most common set (6/24/50/70) covers only 45% of charts.</p>
+</div>
+<p><b>Hold notes.</b> A hold is graded at its head and at its tail, by the same function against the same
+windows, but it is counted once: neither end emits the ordinary judgement. The engine computes the
+average of the two grades and then discards it. A held note pays out in instalments while it is held,
+on a step chosen by a "kind" byte in the note record. A trace of one chart with 31 holds shows exactly
+309 instalment payments, which equals <code>Σ(length/12 − 1)</code>; its 551 judged notes are 242 heads
+plus those 309 instalments. For one kind, the function that counts notes towards the maximum and the
+function that pays instalments disagree, which would make a perfect score unreachable. No shipped
+chart contains such a note.</p>
+<p><b>Scoring.</b> In the key modes each note is worth a flat 300 / 150 / 41 points for KOOL / COOL /
+GOOD, against a maximum of 300 per note. Ez2Catch accumulates a logarithmic combo term instead, with
+truncation (not rounding) and a single-precision constant; both details change totals from the third
+note onwards.</p>
+<p><b>The gauge.</b> The gauge rates are read from the <code>.ini</code> by position, so the rate named
+<code>Fail</code> is what an unpressed note costs, and the rate named <code>Miss</code> is what a press in
+the outermost window costs. Once the gauge reaches zero it stays there.</p>
+
+<h2>5. Bringing BMS into the game</h2>
+<h3>5.1 Song select at 55 times its design size</h3>
+<p>Song select was designed around the shipped list:</p>
+<ul>
+<li>every category's rows are gathered into a 436-entry table, so 436 is the per-category limit;</li>
+<li>each id is found by a linear, case-insensitive search of the whole song list;</li>
+<li>every title is a picture that must exist before it can be shown;</li>
+<li>the wheel has 47 category slots, of which only 16 hold songs of their own (the game's versions);
+the rest are views of the same songs sorted by level and alphabet.</li>
+</ul>
+<p>The extension enlarges the list structures and the category machinery to 23,587 songs in 106
+categories (up to 872 songs each). It keeps the 19 native categories that present the game's own
+songs, renders song-title pictures on demand on a background thread, and keeps graphics resources
+inside a fixed budget (Section 6). The original semantics are kept wherever they can be observed. In
+particular, song select keeps publishing counts exactly as the original does, because other parts of
+the program depend on them.</p>
+
+<h3>5.2 A finer grid</h3>
+<p>Shipped charts use 192 ticks per measure. Measured over 45,707 notes from 80 BMS charts, the dominant
+BMS subdivision is 1/384 of a measure, so on a 192 grid <b>24% of notes fall between two ticks and are
+displaced by a mean of 4.17 ms</b>, almost always by a full half-tick. At the tightest window (about
+±14–23 ms, Table 2) that is a large share of the timing budget, and players reported that converted
+charts felt harder to time than native charts of the same level. The engine honours a chart's
+declared resolution, so the converter writes 384 ticks per measure: the dominant case becomes exact
+and the worst case for every other subdivision is halved. Positions are converted through an integer
+grid of 57,657,600 per measure, which every BMS subdivision in use divides exactly.</p>
+
+<h3>5.3 Repairing long notes</h3>
+<p>One of BMS's two long-note encodings marks a hold with a head event and a tail event on a dedicated
+channel, and players pair them by alternation. A single missing or extra event inverts every hold
+after it on that lane; an audit found this in hundreds of charts. Because a head and its tail are
+always consecutive events on their lane, we pair each lane with a small dynamic programme: each event
+is either paired with the next or played alone as a tap, with a penalty for a pair that would swallow
+an ordinary note (1,000) and for a lone event (1,500). A well-formed lane decodes exactly as
+alternation would, and a broken lane loses one event instead of everything after it.</p>
+
+<h3>5.4 Folding onto five keys and generating other modes</h3>
+<p>Packs ship 7-key, pop'n and double charts alongside 5-key ones. For the 5-key mode, every chart is
+folded onto five keys: lanes keep their left-to-right order, larger layouts map proportionally, and
+notes landing on a busy key move to the nearest free one. Notes that fit nowhere keep sounding as
+background. Native 5-key charts contain no scratch notes at all (0 of 168,643), so scratch lanes in
+5-key charts take the free key nearest key 1. Charts written for another layout are played as written
+in the matching mode: 503 songs carry 7-key charts, 97 carry 5+5 doubles and 51 carry 7-key doubles.</p>
+<p>For the remaining modes, <b>AutoChart</b> generates charts from the 5-key source, using statistics
+learned at start-up from up to 192 of the game's own charts per mode:</p>
+<ul>
+<li>which physical tracks each mode really uses, ranked by share of notes;</li>
+<li>the share of scratch, pedal and second-side notes;</li>
+<li>a 16-position histogram of where in the beat scratch and pedal notes fall;</li>
+<li>the mean gaps between consecutive scratch notes and between pedal notes;</li>
+<li>how often those notes take part in chords and holds.</li>
+</ul>
+<p>The learned track usage corrected several hand-written layouts: one mode uses five lanes, not four,
+and two use a second side. Generation is deterministic. It chooses scratch and pedal ticks from the
+learned distributions and from the keysound's name, redistributes the remaining notes over the mode's
+lanes, locks a lane until its hold ends, and sends leftover simultaneous sounds to background tracks.
+The library expands to 212,283 catalogue entries.</p>
+
+<h3>5.5 Rating charts from their notes</h3>
+<p>Declared levels saturate at the top: <b>46% of songs called their hardest chart 18</b>, and within that
+level the busiest two seconds ranged from 13 to 83 notes per second. We rate each chart from its notes:</p>
+<pre>score = 0.8 × peak + 0.2 × (2.6 × average)</pre>
+<ul>
+<li><b>peak</b> is the busiest two seconds and <b>average</b> the mean density, in notes per second;</li>
+<li>the factor 2.6 aligns the two (their ratio holds at 2.58–2.62 from level 5 to 18);</li>
+<li>the peak ranks songs well across the library, and the average separates a song's own charts,
+which usually share the same climax.</li>
+</ul>
+<p>The score maps onto levels 1–20 through a monotone curve fitted to the mean peak of 1,379 charts that
+declared levels 2–17. Level 18 is excluded from the fit, because it is where packs put everything they
+consider hard. One level is added for heavy jacks (repeated notes in one lane), whose rate climbs
+from 0% at level 2 to 15.5% at level 18. Over 400 songs, the hardest-chart level that piled 45.8% of
+songs onto 18 now spreads over 14 levels, with 14.0% in the fullest one; a peak-only rating left 45
+songs with two or more charts on the same level, the blend 23. At start-up, 84,210 of 84,291 charts
+are rated this way, and the rest keep their declared level.</p>
+
+<h2>6. Performance on the original hardware</h2>
+<p>The cabinet's start-up timeline (Figure 2) shows where 26.9 seconds went before the game window
+appeared. The two longest steps, verifying the catalogue order and sizing song select (7.5 s and
+7.2 s), spent most of their time building sorted per-mode copies of a 212,283-entry catalogue. The
+sort's comparator located category ranks by a linear string search, twice per comparison, and moved
+whole song records on every swap. Sorting (rank, index) pairs with ranks from a hash map, and copying
+each record once, gives the identical order (checked on 300 random catalogues) at a fraction of the
+cost.</p>
+<figure>
+<svg viewBox="0 0 640 246" role="img" aria-label="Start-up timeline of the cabinet">
+<line x1="230.0" x2="230.0" y1="8" y2="216" stroke="#e2e1dc" stroke-width="1"/>
+<text x="230.0" y="232" text-anchor="middle" font-size="11" fill="#52514e">0 s</text>
+<line x1="293.3" x2="293.3" y1="8" y2="216" stroke="#e2e1dc" stroke-width="1"/>
+<text x="293.3" y="232" text-anchor="middle" font-size="11" fill="#52514e">5 s</text>
+<line x1="356.5" x2="356.5" y1="8" y2="216" stroke="#e2e1dc" stroke-width="1"/>
+<text x="356.5" y="232" text-anchor="middle" font-size="11" fill="#52514e">10 s</text>
+<line x1="419.8" x2="419.8" y1="8" y2="216" stroke="#e2e1dc" stroke-width="1"/>
+<text x="419.8" y="232" text-anchor="middle" font-size="11" fill="#52514e">15 s</text>
+<line x1="483.0" x2="483.0" y1="8" y2="216" stroke="#e2e1dc" stroke-width="1"/>
+<text x="483.0" y="232" text-anchor="middle" font-size="11" fill="#52514e">20 s</text>
+<line x1="546.3" x2="546.3" y1="8" y2="216" stroke="#e2e1dc" stroke-width="1"/>
+<text x="546.3" y="232" text-anchor="middle" font-size="11" fill="#52514e">25 s</text>
+<text x="222" y="25" text-anchor="end" font-size="11" fill="#0b0b0b">Load scan cache (23,587 songs)</text>
+<rect x="230.0" y="13" width="13.4" height="16" rx="3" fill="#2a78d6"/>
+<text x="249.4" y="25" font-size="11" fill="#52514e">1.1 s</text>
+<text x="222" y="51" text-anchor="end" font-size="11" fill="#0b0b0b">Load AutoChart model</text>
+<rect x="243.4" y="39" width="2.0" height="16" rx="3" fill="#2a78d6"/>
+<text x="249.6" y="51" font-size="11" fill="#52514e">0.0 s</text>
+<text x="222" y="77" text-anchor="end" font-size="11" fill="#0b0b0b">Rate 84,210 charts from notes</text>
+<rect x="243.6" y="65" width="44.1" height="16" rx="3" fill="#2a78d6"/>
+<text x="293.7" y="77" font-size="11" fill="#52514e">3.5 s</text>
+<text x="222" y="103" text-anchor="end" font-size="11" fill="#0b0b0b">AutoChart: 188,696 virtual charts</text>
+<rect x="287.7" y="91" width="29.1" height="16" rx="3" fill="#2a78d6"/>
+<text x="322.8" y="103" font-size="11" fill="#52514e">2.3 s</text>
+<text x="222" y="129" text-anchor="end" font-size="11" fill="#0b0b0b">Verify catalogue order</text>
+<rect x="316.8" y="117" width="94.7" height="16" rx="3" fill="#2a78d6"/>
+<text x="417.5" y="129" font-size="11" fill="#52514e">7.5 s</text>
+<text x="222" y="155" text-anchor="end" font-size="11" fill="#0b0b0b">Index catalogue</text>
+<rect x="411.5" y="143" width="13.8" height="16" rx="3" fill="#2a78d6"/>
+<text x="431.3" y="155" font-size="11" fill="#52514e">1.1 s</text>
+<text x="222" y="181" text-anchor="end" font-size="11" fill="#0b0b0b">Size song select</text>
+<rect x="425.3" y="169" width="91.1" height="16" rx="3" fill="#2a78d6"/>
+<text x="522.4" y="181" font-size="11" fill="#52514e">7.2 s</text>
+<text x="222" y="207" text-anchor="end" font-size="11" fill="#0b0b0b">Remaining set-up, window released</text>
+<rect x="516.4" y="195" width="53.6" height="16" rx="3" fill="#2a78d6"/>
+<text x="576.0" y="207" font-size="11" fill="#52514e">4.2 s</text>
+</svg>
+<figcaption>Figure 2. Start-up timeline from the cabinet's log of 2026-10-19 (version 36.0.0). Bars are the
+consecutive steps between log timestamps; labels give each step's duration.</figcaption>
+</figure>
+<p>Two freezes in song select were found only on the cabinet:</p>
+<ul>
+<li><b>Category changes (0.7–1.7 s).</b> Every category change produced a slow frame of 0.7–1.7 s,
+independent of the category's size. On every change, a preparation step rebuilt the full sorted
+catalogue only to find that the custom songs were already in place. Checking that first removed the
+cost from category changes entirely.</li>
+<li><b>Resting on a song (0.4–0.6 s).</b> The game starts a song's audio preview half a second after
+the cursor stops. For a custom song the preview had to be cut from an MP3 first, on the game's own
+thread, which froze the game for 0.4–0.6 s, 86 times in one session, and also stopped the turntable
+being read. The cut now runs in the background from the moment the cursor settles, and the game's
+preview countdown is held until the file is ready.</li>
+</ul>
+<p>Graphics resources needed a budget of their own. The game frees no texture while a screen is alive,
+and every texture costs one of the 10,000 GDI objects Windows grants a process:</p>
+<ul>
+<li>loading whole categories exhausted that budget after about 25 categories;</li>
+<li>loading only a window around the cursor still grew the process from 840 MB to 2,551 MB over 110
+categories;</li>
+<li>at about 251 KB of surface per texture, walking every category would need 1,979 MB, almost all of
+XP's address space.</li>
+</ul>
+<p>A fixed ring of reusable textures for song titles and discs makes browsing cost constant; sessions
+now sit near 2,200 GDI objects.</p>
+
+<h2>7. Discussion</h2>
+<p><b>Reading fails; mechanical checks do not.</b> The most expensive errors of the project were
+confident readings of correct-looking disassembly. The differential trace, parse-to-end sweeps and
+checks by redundant quantities caught what re-reading missed. We recommend building such checks before
+relying on any reading of scoring or timing code.</p>
+<p><b>The tail defines the format.</b> Every format rule in Section 4.3 that was wrong in its first draft
+held for the sample files and failed somewhere in the long tail of the library. A format parser is not
+done until it has seen everything the game ships.</p>
+<p><b>Measure on the target.</b> Both freezes of Section 6 were invisible on a development PC and cost a
+second each on the cabinet. Legacy hardware is a different machine, not a slower one: work that is
+negligible on one becomes the dominant cost on the other.</p>
+<p><b>Keep the original's semantics, including the odd ones.</b> Several of the game's behaviours look
+like mistakes: the crossed gauge names, a discarded average, counts that disagree. Changing them changes
+the game, and in one case an attempt to "correct" what song select counts broke an unrelated part of the
+program. A faithful extension reproduces them.</p>
+<p><b>Limitations.</b> The work was validated on one cabinet. The differential traces cover the key
+modes and one or two players, not Ez2Catch or every option. CV2Mix has no single lane layout and is
+generated rather than characterised. The AutoChart generator is statistical: it reproduces how native
+charts use scratch and pedal, not how a human charter would arrange a song.</p>
+<p><b>Ethics and legality.</b> The game is a commercial product whose rights holder is active, with a
+current title on another platform. The work is private: it distributes no part of the game, no keys
+and no assets; it modifies no game file; and it is described here for interoperability and
+preservation. It relies on an unpacked executable that is already part of the community's
+installations, and it documents the licence protection only at the level of analysis. Anyone building
+on it should take legal advice before publishing.</p>
+
+<h2>8. Related work</h2>
+<ul>
+<li><b>Matching decompilation.</b> Recent projects such as the LEGO Island decompilation and its
+<code>reccmp</code> tool [3] reconstruct game source that recompiles byte-identically. EZ2DECOMP [1]
+applies that method to this game; our work consumes its results and adds run-time evidence and
+whole-library sweeps.</li>
+<li><b>Engine reimplementation.</b> ScummVM and OpenMW reimplement game engines and ask users to supply
+the original data. Our work instead extends the original program in place, which keeps its exact
+behaviour at the cost of working within its limits.</li>
+<li><b>BMS players.</b> Community BMS players such as Lunatic Rave 2 and beatoraja [4] play BMS natively
+with their own timing models. Our aim was the opposite: the original game's timing and scoring
+applied to BMS charts.</li>
+<li><b>Community tools.</b> freem's format notes and tools [2] and the 2EZConfig launcher [5] are the
+foundation every modern EZ2 installation stands on.</li>
+</ul>
+
+<h2>9. Conclusion</h2>
+<p>A dormant arcade game can be given a living library without modifying it and without leaving its
+original hardware. Doing so required a characterisation deep enough to reproduce its judgement and
+scoring exactly, a conversion that respects both BMS conventions and the engine's constraints, and
+performance work grounded in measurements on the cabinet itself. The method behind the results is
+general: combine independent evidence, verify mechanically, sweep the whole data set, and measure on
+the target machine.</p>
+
+<h2>References</h2>
+<ol class="refs">
+<li>EZ2DECOMP: a byte-matching decompilation of EZ2AC. Private project, 2026.</li>
+<li>freem. <i>ez2stuff</i>: EZ2DJ/EZ2AC tools and file-format notes (<code>formats.md</code>).</li>
+<li>isledecomp contributors. <i>LEGO Island decompilation</i> and <i>reccmp</i>. https://github.com/isledecomp/isle</li>
+<li>exch. <i>beatoraja</i>, a cross-platform BMS player. https://github.com/exch-bms2/beatoraja</li>
+<li>kasaski. <i>2EZConfig V2</i> (GPL-3.0), a rewrite of ben-rnd's 2EZConfig. https://github.com/ben-rnd/2EZConfig</li>
+<li>lieff. <i>minimp3</i>. https://github.com/lieff/minimp3 · S. Barrett. <i>stb_vorbis</i>. https://github.com/nothings/stb</li>
+<li>Microsoft. <i>DirectX 7.0 SDK documentation</i>: Direct3D texture stages and DirectDraw surfaces, 1999.</li>
+</ol>
+
+<p class="note">This report summarises the project's research documentation (<code>docs/RESEARCH.md</code> and
+<code>docs/research/</code>), where each claim is given with its addresses and evidence.</p>
+
+</body>
+</html>
