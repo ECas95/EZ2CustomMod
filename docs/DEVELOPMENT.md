@@ -134,6 +134,17 @@ every change is an in-memory patch, an import-table hook or a file redirect.
 - The lane cover is drawn from the keys panel's overlay call, and `getState` is replaced so that
   holding E1 does not trigger bass boost.
 
+Each feature's design, the constraints behind it and the bugs it went through are documented in the
+research chapters:
+
+| Feature | Chapter |
+|---|---|
+| Categories and their split, RANDOM row, FAVORITES / RECENT / MOST PLAYED, sort and jumps, custom Top-5, EZ column, notice card, detail panels, constant speed, custom courses, category backgrounds | [9. Song select: what the mod adds](research/09-song-select-extras.md) |
+| Lane cover, its picker, judge offset and `TraceJudge`, `FpsLimit` | [10. Lane cover and play options](research/10-lane-cover-and-play-options.md) |
+| BGA selection, DirectShow and ffmpeg playback, image BGA, disc and audio previews, keysound decoding and prefetch | [11. Backgrounds, previews and audio](research/11-bga-previews-and-audio.md) |
+| Generated art, title layout, encoding detection and the CJK font, art thread, RAM store, texture ring, panel rendering, English textures | [12. Generated art, text and graphics resources](research/12-art-text-and-resources.md) |
+| Start-up order, scan cache, `idmap.txt`, every `BMSMod.ini` key, memory tiers, window, log, diagnostics, tools | [13. Scan, cache, configuration and diagnostics](research/13-scan-cache-config-diagnostics.md) |
+
 ## Source map
 
 | File | Contents |
@@ -168,6 +179,12 @@ the English textures (`texture_translate.py`, driven by `translation/spec.py` an
 | `[assets] lazy …` | art rendered for one song and role |
 | `[cache] preview …` | a hover preview cut, with how long it took |
 | `[lanecover]` | lane cover hooks, texture, size changes and menu choices |
+| `[category]` | categories built, split into `NAME 1/N` parts, or truncated |
+| `[artprefetch]` | the art thread: how many assets it rendered, and how long it took |
+| `[preview]` | the disc's video preview: decodes, surface rebuilds |
+| `[bga-direct]`, `[bgpool]` | the background chosen for a song, its start time and backend (DirectShow, ffmpeg, image BGA, pool clip) |
+| `[speed]`, `[judge]` | constant speed's change at each chart load; the judge offset in ticks and, with `TraceJudge=1`, the per-song statistics |
+| `[favorites]`, `[sort]`, `[ez]` | favorites marked, sort orders chosen, the EZ column's chart picked |
 | `RENDER FAILED`, `TRUNCATED`, `FAILED` | problems worth reading first |
 
 ## Ground rules

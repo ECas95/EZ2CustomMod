@@ -10,10 +10,13 @@ Replace them with your own.
 - [4. Making a category look nice](#4-making-a-category-look-nice)
 - [5. Controls](#5-controls)
 - [6. Lane cover](#6-lane-cover)
-- [7. Changing settings](#7-changing-settings)
-- [8. Updating and going back](#8-updating-and-going-back)
-- [9. When something goes wrong](#9-when-something-goes-wrong)
-- [10. Glossary](#10-glossary)
+- [7. What song select shows](#7-what-song-select-shows)
+- [8. Backgrounds and previews](#8-backgrounds-and-previews)
+- [9. Custom courses](#9-custom-courses)
+- [10. Changing settings](#10-changing-settings)
+- [11. Updating and going back](#11-updating-and-going-back)
+- [12. When something goes wrong](#12-when-something-goes-wrong)
+- [13. Glossary](#13-glossary)
 
 ## 1. What you need
 
@@ -120,7 +123,7 @@ charts from easiest to hardest and fills them in that order:
 | 5 charts | the easiest goes to the extra **EZ** column (far left), the other four to NM–EX |
 
 The level shown is worked out from the notes themselves, not copied from the chart's `#PLAYLEVEL`, so
-levels are comparable across packs. To use the chart's own number, set `LevelFromNotes=0` (section 7).
+levels are comparable across packs. To use the chart's own number, set `LevelFromNotes=0` (section 10).
 
 ### AutoChart: your songs in every mode
 
@@ -133,13 +136,17 @@ If a song also ships a chart made for 7 keys, or a double chart, that one is pla
 
 ### Example: a category that is too big
 
-A single category shows at most **872 songs**. With 1,500 songs in one folder, the log shows
-`TRUNCATED` and the rest are missing. Split the folder:
+A category holds up to **800 songs**. A bigger folder is split on its own into several categories,
+in title order, with the same name and a part number:
 
 ```text
-5KeyMix\Big Pack\  (1,500 songs)   →   5KeyMix\Big Pack.1\  (750 songs)
-                                       5KeyMix\Big Pack.2\  (750 songs)
+5KeyMix\Big Pack\  (1,500 songs)   →   on the wheel:  Big Pack 1/2  (750 songs)
+                                                      Big Pack 2/2  (750 songs)
 ```
+
+Nothing has to be moved, and `details.txt`, `bg.png` and `ico.png` apply to every part. If you prefer
+your own split (by artist, by year), split the folder yourself; parts are only made for folders over
+800 songs.
 
 ### Example: removing or renaming songs
 
@@ -207,7 +214,7 @@ names the order you are on.
 every mode. PEDAL + E1 on the same song again says "REMOVED".
 
 **When you choose a difficulty**, a card shows the speed the mod will set so that every song scrolls
-at the same visual speed (constant speed). It can be turned off (section 7).
+at the same visual speed (constant speed). It can be turned off (section 10).
 
 ### During a song
 
@@ -235,7 +242,88 @@ on. Turn it all the way up to remove the cover.
 The wheel does not move while the menu is open. The lane cover is not shown in the scratch modes or
 in Ez2Catch.
 
-## 7. Changing settings
+## 7. What song select shows
+
+Besides the wheel, custom songs get a few extra read-outs. Native songs look exactly as before.
+
+**Above the disc**, the chart under the cursor:
+
+| Figure | Meaning |
+|---|---|
+| NOTES | how many notes to play (a long note counts once) |
+| NPS | notes per second, on average |
+| PEAK | notes per second in the busiest two seconds |
+| CHORD | how many notes come together with another one |
+| JACK | how many notes repeat the same lane quickly (within 0.15 s) |
+
+**Along the bottom**, a **density graph**: 64 bars from the start of the chart to its end. Tall,
+orange bars are the hard bursts; a long low stretch is a breather. The chart's length is in the corner.
+
+**The disc** of the song under the cursor plays a few seconds of its background video after you
+stop on it for a moment (section 8), and its music preview starts shortly after.
+
+**The ranking** (E4 toggles it, as in the original) shows the Top-5 of custom songs too. Scores are kept
+in `CustomCache\rank\`.
+
+**A fifth difficulty.** Songs with five charts show the easiest one in an extra **EZ** column, to the
+left of NM. Move the difficulty cursor all the way left to choose it.
+
+**Notice cards.** A small card near the top confirms what the extra keys did: the new sort order, the
+category you jumped to, a song added to or removed from FAVORITES, and the speed constant speed will
+set. Each card fades after a couple of seconds.
+
+**Example: comparing two hard songs.** Both say level 15. The first has PEAK 18 and a flat graph: it
+is steady all the way through. The second has PEAK 31 and one tall orange spike near the end: it is
+easy until a short, very dense burst. Pick the one that suits you.
+
+## 8. Backgrounds and previews
+
+**During a song**, the background (BGA) is chosen in this order:
+
+1. the video the chart itself starts (its `#BMP` and channel 04 lines), at the moment the chart starts
+   it;
+2. any video in the song folder (`.mp4`, `.avi`, `.wmv`, `.mpg`, `.mpeg`, `.mov`), from the start;
+3. the chart's **pictures**, if it shows pictures instead of a video (a still image, or a sequence),
+   each at its own time;
+4. otherwise a random clip from `Video\_spv\` in the game folder, repeated until the song ends.
+
+Wide (16:9) videos and pictures fill the screen's height and lose a little at the sides. Other shapes
+are fitted whole, with black bars, so nothing is squashed.
+
+**Most videos play through Windows.** Formats Windows XP cannot play (for example old `.mpg` files)
+are played through the bundled `ffmpeg.exe` instead, kept in time with the music.
+
+**In song select**, two previews start when you stop on a song:
+
+| Preview | What it is |
+|---|---|
+| **Video on the disc** | 12 seconds of the song's own video, starting 10 seconds in, looped inside the disc. Songs without their own video show their disc picture instead (never a random clip). |
+| **Music** | 20 seconds taken from the first 40 seconds of the song's music, so it usually starts past the intro. The song folder needs a full music file (the biggest audio file is used). Songs made only of keysounds have no music preview. |
+
+On a slow PC, lower the video preview's frame rate with `PreviewFps` (section 10), or turn it off:
+
+```ini
+[Visuals]
+BgaPreview=0
+```
+
+**Example: a song with no background.** Copy any video file into the song's folder and restart the
+game; it will play from the start of the song. To make it start at a given moment, add a `#BMP` line
+and a channel 04 event to the chart, as BMS editors do.
+
+## 9. Custom courses
+
+The Radio Mix modes play **courses**: four songs in a row on one life gauge. The mod adds courses made
+from your songs after the game's own channels, as **CUSTOM COURSE 1, 2, …**:
+
+- each course takes four songs from one level band (1–4, 5–8, 9–12, 13–16 or 17–20), easiest first;
+- 5RadioMix uses your 5-key songs; the other Radio Mix modes use 7-key, ClubMix and SpaceMix songs;
+- the courses stay the same from one start to the next as long as you do not add or remove songs, so
+  their rankings stay meaningful.
+
+`CustomCourses` sets how many per mode (12 by default, 0 for none). 5RadioMix has room for 14 at most.
+
+## 10. Changing settings
 
 All settings are in `BMSMod.ini`, in the game folder. Open it with Notepad, change a value, save, and
 restart the game. Every option has a comment above it explaining what it does. Values are `1` for on
@@ -282,6 +370,11 @@ LaneCoverStep=4      ; smaller = slower. A negative number reverses the directio
 | `[Gameplay] CustomCourses=0` | no custom courses in Radio Mix |
 | `[Gameplay] PreviewFps=10` | a smoother-running song select on slow PCs (fewer frames in the video preview) |
 | `[Gameplay] EnglishTextures=0` | the game's menus in their original language |
+| `[Gameplay] DetailPanels=0` | hide the figures and the density graph |
+| `[Gameplay] CategorySort=0` | no sort order or category jumps with the pedal |
+| `[Gameplay] HudPanel=0` | no notice cards |
+| `[Visuals] BgaPreview=0` | no video on the song-select disc |
+| `[Visuals] CategoryOverlay=0` | ignore every category's `bg.png` and `ico.png` |
 | `[CustomSongs] LevelFromNotes=0` | show the level written in the chart instead of the computed one |
 | `[AutoChart] Enable=0` | only use the charts you provide; no generated charts for other modes |
 
@@ -299,7 +392,7 @@ The mod writes everything it needs into `CustomCache\` in the game folder.
 | `rank\` | the Top-5 scores of your custom songs | no |
 | `native_model.cache` | what AutoChart learned from the game's own charts | yes; it is learned again |
 
-## 8. Updating and going back
+## 11. Updating and going back
 
 **To update:**
 1. Rename the current `EZ2CustomMod.dll` to keep it, for example to
@@ -314,7 +407,7 @@ The mod writes everything it needs into `CustomCache\` in the game folder.
 **To remove the mod:** delete `EZ2CustomMod.dll` from the Extra DLLs setting in 2EZConfig. The game
 is exactly as it was, because the mod never changes the game's own files.
 
-## 9. When something goes wrong
+## 12. When something goes wrong
 
 The log, `logs\EZ2CustomMod.log`, is recreated on every start. Each line begins with the number of
 milliseconds since the mod loaded. Searching it for the words below usually finds the cause.
@@ -323,7 +416,7 @@ milliseconds since the mod loaded. Searching it for the words below usually find
 |---|---|
 | No custom songs and no log file | 2EZConfig's Extra DLLs setting; on XP, that `gdiplus.dll` is in the game folder |
 | A category is missing | the folder layout (section 3); the log line `skip first-level folder` means the mode folder name is wrong |
-| A song is missing from its category | `TRUNCATED` (more than 872 songs) or `missing=` in a `[filter]` line |
+| A song is missing from its category | `missing=` in a `[filter]` line, or `TRUNCATED` in a `[category]` line |
 | A song shows no difficulties or will not start | its folder must contain the `.bms` files directly, not inside another folder |
 | A title shows strange characters | the font file `wqy-microhei.ttc` must be in the game folder |
 | A song name or disc picture is blank | `RENDER FAILED` in the log |
@@ -339,7 +432,7 @@ On an old cabinet PC, the disk and the processor limit the mod much more than th
 **SSD** speeds up start-up, song pictures and previews the most. On Windows XP, more than 4 GB of RAM
 makes no difference.
 
-## 10. Glossary
+## 13. Glossary
 
 | Term | Meaning |
 |---|---|

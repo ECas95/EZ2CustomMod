@@ -1,6 +1,6 @@
 # 8. Performance on the cabinet
 
-[← From BMS to FNEX](07-bms-to-fnex.md) · [Index](../RESEARCH.md)
+[← From BMS to FNEX](07-bms-to-fnex.md) · [Index](../RESEARCH.md) · [Next: song select, what the mod adds →](09-song-select-extras.md)
 
 The game was built for its own hardware and about 430 songs. The mod runs on the same class of
 hardware with 23,587 songs. This chapter collects what the cabinet's logs showed about time, memory

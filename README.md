@@ -30,7 +30,7 @@ modern PCs.
 |---|---|
 | [docs/GUIDE.md](docs/GUIDE.md) | User guide: installing, adding songs, controls, lane cover and settings, with examples |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in every version, from the v3 prototypes to today |
-| [docs/RESEARCH.md](docs/RESEARCH.md) | Research in eight chapters: the binary, engine, file formats, judgement and scoring, song select, BMS conversion and performance on the cabinet |
+| [docs/RESEARCH.md](docs/RESEARCH.md) | Research in thirteen chapters: the binary, engine, file formats, judgement and scoring, song select, BMS conversion, performance on the cabinet, and every feature the mod adds (song-select extras, lane cover, backgrounds and previews, generated art, scan and diagnostics) |
 | [docs/paper/paper.pdf](docs/paper/paper.pdf) | The research condensed into a 10-page technical report ([HTML](docs/paper/paper.html)) |
 | [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) | A backlog of 750 ideas: new features, optimizations, fixes, enhancements and adjustments, each graded feasible, medium or out of reach |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, tests, architecture, the log and troubleshooting |

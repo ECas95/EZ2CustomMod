@@ -47,7 +47,7 @@ Numbers quoted below come from the [research](RESEARCH.md) and the cabinet's log
 17. **Sort by date added.** Use the time each song folder first appeared in the scan cache.
 18. **NEW badge.** Mark songs added since a recent scan, for a configurable number of days.
 19. **Scan report.** After each scan, write the new, removed and rejected songs (with the reason for each rejection) to a text file.
-20. **`category.ini`.** An optional file in a category folder that sets its display name.
+20. **Category colour.** A line in `details.txt` that tints the category's generated labels.
 21. **Custom category order.** A list file that fixes the wheel order instead of the alphabetical one.
 22. **Hidden categories.** An ini list of categories to leave out without moving their folders.
 23. **`song.ini` overrides.** An optional per-song file that forces the title, artist, level, offset or preview start.
@@ -104,8 +104,8 @@ Numbers quoted below come from the [research](RESEARCH.md) and the cabinet's log
 21. **Playlists.** User-defined song lists that appear as virtual categories.
 22. **Song queue.** A list of songs played in order, for events.
 23. **Event mode.** A fixed set of songs, a timer and no menus, for tournaments.
-24. **Dan courses.** Grade courses defined in text, with the gauge carried between songs.
-25. **Gauge carry-over in custom courses.**
+24. **Dan courses.** Grade courses defined in text, with a pass mark per course.
+25. **Courses across modes.** Custom courses that mix songs from several modes' libraries.
 26. **AutoChart variants.** Easy, normal and hard versions of each generated chart.
 27. **Pattern-aware AutoChart.** Learn short note patterns from native charts, not only distributions.
 28. **AutoChart doubles from singles.** Generate charts that use both sides musically.
@@ -208,7 +208,7 @@ Numbers quoted below come from the [research](RESEARCH.md) and the cabinet's log
 15. **Larger buffered reads** for BMS parsing.
 16. **Sequential-scan hints** when opening large files.
 17. **Buffer log writes** and flush them every second and on a crash.
-18. **Check that disabled tracing costs nothing** on its fast path.
+18. **Check that disabled diagnostics cost nothing** (`TraceGameLog`, `TraceFileApi`, `TraceBMSScan`) on their fast paths.
 19. **Lower background-thread priority during play.**
 20. **Pause the art and preview workers during play.**
 21. **Prefetch keysounds** while the cursor rests on a song.
@@ -415,7 +415,7 @@ that case, the fix is a regression test that keeps it that way.
 3. **Charts with more than 2,048 keysounds.** Merge identical samples by hash.
 4. **Titles misread between Shift-JIS, EUC-KR and GBK.**
 5. **Catalogue-key collisions** between packs.
-6. **Categories over the 872-song limit.** Split them into pages automatically.
+6. **Split categories and play data.** A folder split into `NAME 1/N` parts re-balances when songs are added; check that favorites and scores follow the songs, not the parts.
 7. **Memory growth in long sessions.** Leak audit with a soak test.
 8. **GDI objects creeping up** over many plays.
 9. **Display device loss** after the screen saver or a display change on XP.
@@ -683,12 +683,12 @@ that case, the fix is a regression test that keeps it that way.
 
 ### 5.1 Feasible
 
-1. **`EnableFunctionTrace=0`** in the production configuration.
+1. **Rename `EnableFunctionTrace`.** It is not a diagnostic: it installs the song-select integration, and 0 disables the mod. A name such as `SongSelectHooks` would stop anyone switching it off by mistake.
 2. **Confirm `ShowProgressPopup=1`** as the default.
 3. **`PreviewFps=15`** automatically on the XP memory tier.
 4. **A finer `LaneCoverStep`** while the button is held.
 5. **`LaneCoverSize` defaults per mode.**
-6. **Review `PageSize=400`** against the 872-song category limit.
+6. **Review `PageSize=400`** against the 800-song split size of large categories.
 7. **Try `NativeModelMaxChartsPerMode=256`.**
 8. **AutoChart `Intensity` per mode.**
 9. **Document `Seed`** as user-changeable.
@@ -763,7 +763,7 @@ that case, the fix is a regression test that keeps it that way.
 25. **Pedal frequency** in the modes that use it.
 26. **The 4.17 ms displacement**, re-measured on the whole library.
 27. **Long-note penalties**, refitted on the full audit set.
-28. **The 872-song category limit.**
+28. **The 800-song split size** of large categories.
 29. **Organisation of the 106 categories**: merge the smallest packs.
 30. **Duplicate cleanup** guided by the duplicate finder.
 31. **Loudness normalisation** across packs, done offline.

@@ -60,7 +60,8 @@ flat per-tier in the key modes and logarithmic in Ez2Catch. Second, a conversion
 game's format: a finer tick grid that removes a 4.17 ms mean displacement affecting 24% of notes,
 repair of malformed long notes, an AutoChart generator that learns lane usage and timing statistics
 from the game's own charts, and a note-based difficulty rating that spreads a library in which 46%
-of songs claimed the top level. Third, a performance study on the original hardware, which found
+of songs claimed the top level, together with the navigation, lane cover, background and text
+machinery a list of this size needs. Third, a performance study on the original hardware, which found
 and removed two freezes, of 0.7–1.7 s and 0.4–0.6 s, that no development PC could reproduce.</p>
 </div>
 <p class="keywords"><b>Keywords:</b> reverse engineering, rhythm games, game preservation, file formats,
@@ -370,6 +371,36 @@ from 0% at level 2 to 15.5% at level 18. Over 400 songs, the hardest-chart level
 songs onto 18 now spreads over 14 levels, with 14.0% in the fullest one; a peak-only rating left 45
 songs with two or more charts on the same level, the blend 23. At start-up, 84,210 of 84,291 charts
 are rated this way, and the rest keep their declared level.</p>
+
+<h3>5.6 Features for a library of this size</h3>
+<p>A list fifty-five times longer than the original needs tools for finding and preparing songs.
+Every addition below reuses a mechanism the game already has, and every new control is a pedal chord,
+which the game ignores.</p>
+<ul>
+<li><b>Navigation.</b> A RANDOM row heads every category; it is a byte copy of a real row, so the
+game loads the rolled song through its normal path. FAVORITES, RECENT and MOST PLAYED are ordinary
+categories whose lists come from a play-data file, keyed by song folder so that a song counts once
+across modes. Folders over 800 songs are split into parts. Six sort orders and ten-category jumps
+reproduce the native pager's side effects.</li>
+<li><b>Information.</b> Two panels show each chart's notes, mean and peak density, chord and jack
+shares, and a 64-bar density profile, all measured at scan time. They are drawn with the game's own
+two-texture panel recipe (a multiplying mask, then additive art), so no alpha channel is needed.</li>
+<li><b>Lane cover.</b> A SUDDEN+ cover is drawn in the keys panel's overlay step. Its input shares
+the E1 button with bass boost by showing the effector routine a "held" state and replaying the tap on
+release. Two defects appeared only on the cabinet. The engine's turntable total is zeroed at a
+per-screen limit of 5–20 counts, so a steady turn read as +3, −3; the fix reads the raw 8-bit position.
+Texture uploads could fail or be lost under the XP driver, so each one is now verified and retried.</li>
+<li><b>Backgrounds.</b> A background is chosen from the chart's BGA events, the song folder, picture
+sequences, or a shared pool. Videos the system cannot decode are piped from a 2008 ffmpeg build. Its
+frames arrived at decode speed, several times real time, until a reader thread paced them against the
+30 fps stream and gated the first frame on the chart's BGA time.</li>
+<li><b>Text and art.</b> A BMS file declares no encoding. Titles are decoded by scoring byte pairs:
+kana and kanji leads for Shift-JIS, the 2,350 common Hangul syllables for EUC-KR. They are drawn with a
+bundled CJK font loaded privately, because XP performs no font fallback for it. Song art lives in a
+fixed ring of textures per role. The game rebuilds its texture pool after every song, recycling
+objects at the same addresses, so each slot is validated by checking that its texture still points at
+the surface it filled.</li>
+</ul>
 
 <h2>6. Performance on the original hardware</h2>
 <p>The cabinet's start-up timeline (Figure 2) shows where 26.9 seconds went before the game window

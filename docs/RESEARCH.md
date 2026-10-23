@@ -3,7 +3,8 @@
 A study of the arcade rhythm game **EZ2AC FNEX** (Final EX): its executable, engine, file formats,
 timing and scoring rules, and song select. The study is what made EZ2CustomMod possible: loading a
 library of 23,587 BMS songs into the game, on its original Windows XP hardware, without modifying
-the game's files.
+the game's files. Chapters 1–8 characterise the game and the conversion; chapters 9–13 document
+every feature the mod adds and the machinery behind it.
 
 > **Private material.** Parts of this study draw on the private EZ2DECOMP project and on analysis of
 > a commercial game. Keep this repository private. The study reproduces no bytes of the original
@@ -23,6 +24,11 @@ the game's files.
 | 6 | [Song select](research/06-song-select.md) | The song-select object and its 884-byte song entry, titles as pictures, the 47 categories, the category seed, per-mode input and the hover preview |
 | 7 | [From BMS to FNEX](research/07-bms-to-fnex.md) | Channel mapping, the 384-tick grid, long notes, folding charts onto five keys, AutoChart's learned model, rating charts from their notes, difficulties, text, audio and video |
 | 8 | [Performance on the cabinet](research/08-performance-on-xp.md) | The cabinet's limits, the start-up timeline, the two song-select freezes and their causes, graphics-resource budgets and the rules that came out of it |
+| 9 | [Song select: what the mod adds](research/09-song-select-extras.md) | Categories for 23,587 songs and their automatic split, the RANDOM row, FAVORITES / RECENT / MOST PLAYED, sorting and jumps, custom Top-5, the EZ column, the notice card, the detail panels, constant speed, custom courses, category backgrounds |
+| 10 | [Lane cover and play options](research/10-lane-cover-and-play-options.md) | The SUDDEN+ cover: where it is drawn, the sliding picture, sharing E1 with bass boost, the turntable and upload bugs found on the cabinet, the picker; the judge offset and its statistics; the frame limiter |
+| 11 | [Backgrounds, previews and audio](research/11-bga-previews-and-audio.md) | Choosing a background, DirectShow and ffmpeg playback, frame pacing, image BGA, the disc and audio previews, keysound decoding and prefetch |
+| 12 | [Generated art, text and graphics resources](research/12-art-text-and-resources.md) | The art roles, titles on one or two lines, Shift-JIS / EUC-KR detection and the bundled CJK font, the art thread, the RAM store, the texture ring, panel rendering rules, English menus |
+| 13 | [Scan, cache, configuration and diagnostics](research/13-scan-cache-config-diagnostics.md) | Start-up, the scan and its cache, permanent ids, every configuration key and the memory tiers, the window, the log, the diagnostics, the maintenance tools and the tests |
 
 A condensed version is available as a technical report: [paper.pdf](paper/paper.pdf)
 ([HTML](paper/paper.html); rebuilt with `py -3 docs/paper/build_paper.py --pdf`).
@@ -54,6 +60,16 @@ A condensed version is available as a technical report: [paper.pdf](paper/paper.
   rating charts from peak and average density spreads them over 14 levels.
 - **On the cabinet, start-up and song select were dominated by work invisible on a development PC**;
   every fix in chapter 8 came from a cabinet log.
+- **The texture pool is a bump allocator keyed by file name, rebuilt silently after every song.**
+  Everything the mod draws in song select (the texture ring, the panels, the disc preview, the lane
+  cover) follows from that: fixed budgets, unique names, and a check that each texture still points
+  at the mod's own surface.
+- **The engine's derived input is shaped for its own screens.** The turntable's running total is
+  zeroed at a per-screen limit, so the lane cover reads the raw 8-bit position instead.
+- **A background needs its own clock.** Frames from ffmpeg arrive at decode speed. Pacing them against
+  the 30 fps stream, and gating the first frame on the chart's BGA time, is what keeps them in sync.
+- **A BMS title's encoding can be inferred from what its bytes spell**: kana and kanji for Shift-JIS,
+  the 2,350 common Hangul syllables for EUC-KR.
 
 ## Conventions
 
