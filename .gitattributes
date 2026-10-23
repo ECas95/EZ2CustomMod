@@ -1,0 +1,2 @@
+# Keep sources byte-for-byte as they are on disk: the Windows build and the cabinet never see LF.
+* -text

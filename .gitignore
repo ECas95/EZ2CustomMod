@@ -1,0 +1,28 @@
+# Whitelist: nothing is tracked unless it is named here. This folder also holds the game's own
+# binaries, decompiled code, sample songs and backups, none of which belong in the repository.
+/*
+
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/BMSMod.ini
+!/CMakeLists.txt
+!/build_mingw_direct.py
+!/build_mingw_direct_msys2_cmd.bat
+!/deploy_to_cabinet.bat
+
+!/docs/
+!/src/
+!/tests/
+!/tools/
+!/tracer/
+!/third_party/
+!/translation/
+
+# Inside the whitelisted folders
+*.bak*
+*.dll
+*.exe
+__pycache__/
+*.pyc
+/translation/*/
