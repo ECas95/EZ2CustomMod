@@ -39,7 +39,7 @@ modern PCs.
 ## Quick start
 
 1. Download the ZIP from the latest [release](../../releases).
-2. Copy its contents into the game folder (next to `EZ2B.exe`).
+2. Copy its contents into the game folder (next to `EZ2AC.exe`).
 3. Put your BMS songs in `BMSData\5KeyMix\<Category>\<Song>\`.
 4. In **2EZConfig → Settings → Extra DLLs**, enter `EZ2CustomMod.dll`.
 
