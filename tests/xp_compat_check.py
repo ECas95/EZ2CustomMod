@@ -9,6 +9,7 @@
 # ffmpeg fallback, so its absence degrades rather than blocks.
 #
 #   py -3 tests/xp_compat_check.py [path\to\EZ2CustomMod.dll]
+import re
 import struct
 import sys
 import os
@@ -125,6 +126,14 @@ def main():
             if "thread_local" in code or "__thread" in code or "declspec(thread)" in code:
                 tls.append("%s:%d" % (name, n))
     check(not tls, "no implicit TLS in src/" + ("" if not tls else ": " + ", ".join(tls)))
+
+    # The same in the binary, which also covers libraries linked in (libstdc++ keeps its exception
+    # bookkeeping in a thread_local; mod_main.cpp replaces it): no read of the TEB's TLS array,
+    # mov r32, fs:[0x2c] (64 A1 2C000000, or 64 8B /r with a disp32 modrm).
+    image = open(path, "rb").read()
+    pat = re.compile(rb"\x64(?:\xA1|\x8B[\x05\x0D\x15\x1D\x25\x2D\x35\x3D])\x2C\x00\x00\x00")
+    hits = len(pat.findall(image))
+    check(hits == 0, "no implicit TLS access (fs:[0x2c]) in the binary" + ("" if not hits else ": %d" % hits))
 
     print()
     print("xp compat: ok" if not failures else "XP COMPATIBILITY BROKEN")

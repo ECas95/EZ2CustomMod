@@ -4060,6 +4060,34 @@ static DWORD WINAPI InitThread(LPVOID) {
     return 0;
 }
 
+// libstdc++ keeps each thread's exception bookkeeping (__cxa_eh_globals: the caught-exception
+// chain and the uncaught count) in a thread_local of its own, and every throw and catch reads it.
+// On XP that faults like our own thread_locals did (MaybeRedirectCustomPath), so a bad_alloc would
+// crash instead of being caught. Defining the two accessors here keeps libstdc++'s eh_globals.o out
+// of the link, and these use the TLS API, which works in a LoadLibrary'd DLL on XP.
+// ponytail: a thread's block is not freed when the thread ends; only threads that ever throw get one.
+static volatile LONG g_ehGlobalsTls = (LONG)TLS_OUT_OF_INDEXES;
+
+extern "C" void* __cxa_get_globals() noexcept {
+    const DWORD lastError = GetLastError();      // a throw must not disturb what the caller reads next
+    if (g_ehGlobalsTls == (LONG)TLS_OUT_OF_INDEXES) {
+        const DWORD index = TlsAlloc();
+        if (InterlockedCompareExchange(&g_ehGlobalsTls, (LONG)index, (LONG)TLS_OUT_OF_INDEXES) !=
+            (LONG)TLS_OUT_OF_INDEXES)
+            TlsFree(index);                      // another thread got there first
+    }
+    void* globals = TlsGetValue((DWORD)g_ehGlobalsTls);
+    if (!globals) {
+        // Two pointers' worth is the whole struct on x86; 64 zeroed bytes leaves margin.
+        globals = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 64);
+        TlsSetValue((DWORD)g_ehGlobalsTls, globals);
+    }
+    SetLastError(lastError);
+    return globals;
+}
+
+extern "C" void* __cxa_get_globals_fast() noexcept { return __cxa_get_globals(); }
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);

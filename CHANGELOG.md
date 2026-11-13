@@ -15,8 +15,15 @@ running: `[version] EZ2CustomMod_v…`.
   variables, and Windows XP does not set up implicit TLS for a DLL loaded after the process starts:
   the game's main thread has no TLS array, so its first file open through the mod read a null
   pointer. It had worked until then only because another module's TLS slot happened to be in the
-  way. The values are now passed as parameters, the remaining per-thread guard uses
-  `TlsAlloc`/`TlsGetValue`, and `tests/xp_compat_check.py` fails if `thread_local` comes back.
+  way. The values are now passed as parameters, and the remaining per-thread guard uses
+  `TlsAlloc`/`TlsGetValue`.
+- libstdc++ kept its exception bookkeeping in implicit TLS too, so any C++ exception thrown inside the
+  mod (a `bad_alloc`, for one) would have crashed on XP instead of being caught. The mod now provides
+  `__cxa_get_globals` itself, on the TLS API.
+- `tests/xp_compat_check.py` now fails on `thread_local` in `src/` and on any implicit TLS access
+  (`fs:[0x2c]`) in the built DLL. Every import of the release DLL was also checked against the export
+  tables of the cabinet's own XP DLLs, and its code against the cabinet CPU's instruction set (nothing
+  past SSSE3 that runs unconditionally).
 
 ## v36.2.0 — 2026-10-22
 
