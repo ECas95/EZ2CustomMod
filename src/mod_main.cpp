@@ -553,10 +553,13 @@ static std::string MaybeRedirectCustomDirectory(LPCSTR name) {
 // Legacy random BGA pool: DirectShow opens SPV through quartz.dll, whose IAT is redirected below.
 // This path is disabled entirely when the native direct-BGA profile is active.
 
-// Bytes an in-RAM redirect hands back through MaybeRedirectCustomPath: the marker "\x01ram" as the
-// path, the content here, turned into a virtual handle by the CreateFileA hook.
-static thread_local std::vector<unsigned char> g_pendingVirtualBytes;
-static thread_local bool g_redirectForCrt = false;   // the caller is fopen: no memory handles
+// An in-RAM redirect comes back from MaybeRedirectCustomPath as the marker "\x01ram" for the path,
+// with the content in *ramBytes, which the CreateFileA hook turns into a virtual handle. forCrt says
+// the caller is fopen, which needs a real file: no memory handles then.
+//
+// Both used to be thread_local. Implicit TLS is not set up for a DLL loaded with LoadLibrary on XP:
+// the game's main thread has no TLS array, and the first fopen faulted reading fs:[0x2c] = null
+// (cabinet, 2026-11-09). Plain parameters need no TLS at all.
 
 // The shipped one-second silent preview, and the reason a custom preview request must never come
 // back empty. On a failed load the game replaces m_sndPreview with a sample created FROM 0Blank
@@ -579,7 +582,7 @@ static bool PathIsUnderDirectory(const std::string& path, const std::string& dir
     return sep == '\\' || sep == '/';
 }
 
-static std::string MaybeRedirectCustomPath(LPCSTR name) {
+static std::string MaybeRedirectCustomPath(LPCSTR name, bool forCrt, std::vector<unsigned char>* ramBytes) {
     if (!name) return std::string();
     std::string p = name;
 
@@ -685,7 +688,7 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
             std::string fn = FileNameOnly(p);
             if (Config().assetsInMemory) {
                 // The preview is opened through the CRT (openSample -> fopen), which needs a file.
-                if (g_redirectForCrt && !s.cacheDir.empty() && fn == s.id + ".ssf") {
+                if (forCrt && !s.cacheDir.empty() && fn == s.id + ".ssf") {
                     const std::string file = SongPreviewFileForCrt(s);
                     // Only a failure is worth a line: this runs on every hover, and a preview that
                     // works was logging four of them per song.
@@ -703,8 +706,8 @@ static std::string MaybeRedirectCustomPath(LPCSTR name) {
                 }
                 // Art from the RAM store: the caller turns the bytes into a handle.
                 std::vector<unsigned char> bytes;
-                if (!g_redirectForCrt && SongVisualAssetBytes(s, p, bytes)) {
-                    g_pendingVirtualBytes.swap(bytes);
+                if (!forCrt && ramBytes && SongVisualAssetBytes(s, p, bytes)) {
+                    ramBytes->swap(bytes);
                     return std::string("\x01ram");
                 }
             }
@@ -2930,10 +2933,8 @@ static bool InstallDirectBmsHook() {
 static void* __cdecl HookGameFsOpen(const char* name, const char* mode) {
     std::string overrideHold;
     name = GameFileOverride(name, overrideHold);
-    g_redirectForCrt = true;
-    std::string redirected = MaybeRedirectCustomPath(name);
-    g_redirectForCrt = false;
-    if (redirected == "\x01ram") { g_pendingVirtualBytes.clear(); redirected.clear(); }
+    std::string redirected = MaybeRedirectCustomPath(name, true, nullptr);
+    if (redirected == "\x01ram") redirected.clear();
 
     // v10.6 hybrid mode: support both native encrypted .ezi and already-plaintext .ezz.
     // If the cache .ezz is plaintext EZI-map text, protect it from FNEX's encrypted-.ezi
@@ -3607,10 +3608,10 @@ static HANDLE WINAPI HookCreateFileABody(LPCSTR name, DWORD access, DWORD share,
     }
     std::string overrideHold;
     name = GameFileOverride(name, overrideHold);
-    std::string redirected = MaybeRedirectCustomPath(name);
+    std::vector<unsigned char> ramBytes;
+    std::string redirected = MaybeRedirectCustomPath(name, false, &ramBytes);
     if (redirected == "\x01ram") {
-        HANDLE vh = OpenVirtualBytes(std::move(g_pendingVirtualBytes));
-        g_pendingVirtualBytes.clear();
+        HANDLE vh = OpenVirtualBytes(std::move(ramBytes));
         if (vh != INVALID_HANDLE_VALUE) return vh;
         redirected.clear();
     }
@@ -4022,7 +4023,7 @@ static DWORD WINAPI InitThread(LPVOID) {
                 Config().autoGenerateTargetModes.c_str(), Config().autoGenerateIntensity,
                 Config().autoGenerateSeed, Config().learnNativeCharts ? 1 : 0,
                 Config().nativeChartRoot.c_str(), Config().nativeModelMaxChartsPerMode);
-        LogLine("[version] EZ2CustomMod_v36_2_0_lanecover_picker");
+        LogLine("[version] EZ2CustomMod_v36_2_1_xp_tls_fix");
         LogLine("[log] reset_on_start=1");
 
     // FUN_00402880 logger. RVA 0x2880. Original is logger stub in this executable.

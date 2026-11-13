@@ -2127,9 +2127,11 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
     const bool isJudge = (std::strstr(h->name, "Judge") || std::strstr(h->name, "Miss sweep") || std::strstr(h->name, "Tap judge") || std::strstr(h->name, "LN/release"));
     if (isJudge && !Config().traceJudge) return;
 
-    static thread_local bool inTrace = false;
-    if (inTrace) return;
-    inTrace = true;
+    // Per-thread re-entry guard through the TLS API: implicit TLS (thread_local) is not set up for a
+    // DLL loaded with LoadLibrary on XP (see MaybeRedirectCustomPath in mod_main.cpp).
+    static const DWORD s_inTraceTls = TlsAlloc();
+    if (s_inTraceTls == TLS_OUT_OF_INDEXES || TlsGetValue(s_inTraceTls)) return;
+    TlsSetValue(s_inTraceTls, reinterpret_cast<LPVOID>(1));
 
     // The judge sample is per SONG, not per session. hitCount is cumulative, so with one budget of
     // 20 the first song played consumed all of them and the second -- the one being compared
@@ -2168,7 +2170,7 @@ static void EZ2TraceHitBody(TraceHook* h, PushadRegs* regs) {
         LogKnownFunctionArgs(h, regs, n);
     }
 
-    inTrace = false;
+    TlsSetValue(s_inTraceTls, nullptr);
 }
 
 static void* AllocExec(size_t size) {

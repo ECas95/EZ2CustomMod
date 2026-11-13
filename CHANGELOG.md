@@ -3,9 +3,20 @@
 Newest first. Dates are when the change was made. Every version's first log line says which build is
 running: `[version] EZ2CustomMod_v…`.
 
-- [v36.2.0](#v3620--2026-10-22) · [v36.1.1](#v3611--2026-10-22) · [v36.1.0](#v3610--2026-10-22)
+- [v36.2.1](#v3621--2026-11-13) · [v36.2.0](#v3620--2026-10-22) · [v36.1.1](#v3611--2026-10-22) · [v36.1.0](#v3610--2026-10-22)
 - [v36.0.0](#v3600--2026-09-26) and its development builds
 - [v35.4.0](#v3540--2026-07-12) · [v3 – v25](#v3--v25--june-and-july-2026)
+
+## v36.2.1 — 2026-11-13
+
+**Fixed**
+- The game closed at start-up on the cabinet ("EZ2B.exe has encountered a problem and needs to
+  close") while the custom-songs window was still showing. The mod kept two values in `thread_local`
+  variables, and Windows XP does not set up implicit TLS for a DLL loaded after the process starts:
+  the game's main thread has no TLS array, so its first file open through the mod read a null
+  pointer. It had worked until then only because another module's TLS slot happened to be in the
+  way. The values are now passed as parameters, the remaining per-thread guard uses
+  `TlsAlloc`/`TlsGetValue`, and `tests/xp_compat_check.py` fails if `thread_local` comes back.
 
 ## v36.2.0 — 2026-10-22
 

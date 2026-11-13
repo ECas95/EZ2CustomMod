@@ -113,6 +113,19 @@ def main():
     total = sum(len(v) for v in imports.values())
     check(True, "%d imports across %d DLLs, all available on XP" % (total, len(imports)))
 
+    # Implicit TLS is not set up for a DLL loaded with LoadLibrary on XP: a thread_local read
+    # faults on the game's main thread (cabinet, 2026-11-09). Use TlsAlloc/TlsGetValue instead.
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    tls = []
+    for name in sorted(os.listdir(src)) if os.path.isdir(src) else []:
+        if not name.endswith((".cpp", ".h")):
+            continue
+        for n, line in enumerate(open(os.path.join(src, name), encoding="utf-8", errors="replace"), 1):
+            code = line.split("//")[0]
+            if "thread_local" in code or "__thread" in code or "declspec(thread)" in code:
+                tls.append("%s:%d" % (name, n))
+    check(not tls, "no implicit TLS in src/" + ("" if not tls else ": " + ", ".join(tls)))
+
     print()
     print("xp compat: ok" if not failures else "XP COMPATIBILITY BROKEN")
     return 1 if failures else 0
